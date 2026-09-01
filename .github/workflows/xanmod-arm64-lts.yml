@@ -3,469 +3,310 @@ name: Build XanMod ARM64 LTS
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 4 * * 1"
+    - cron: "30 */6 * * *"
 
 permissions:
   contents: write
 
-concurrency:
-  group: xanmod-arm64-lts
-  cancel-in-progress: false
-
 env:
   XANMOD_REPO: https://gitlab.com/xanmod/linux.git
-  ORACLE_CONFIG: https://raw.githubusercontent.com/oracle/kconfigs/gh-pages/out/Oracle%20Linux%2010%20%28UEK%208%29%20aarch64/config
-  ARCH: arm64
-  CROSS_COMPILE: aarch64-linux-gnu-
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      tag: ${{ steps.check.outputs.tag }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check latest XanMod
+        id: check
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y curl python3 git
+
+          SERIES="$(
+            curl -fsSL --retry 5 --retry-delay 2 \
+              https://www.kernel.org/releases.json |
+            python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          v=[x["version"] for x in d["releases"] if x.get("moniker")=="longterm"]
+          v.sort(key=lambda x:tuple(map(int,x.split("."))),reverse=True)
+          print(v[0].rsplit(".",1)[0])
+          '
+          )"
+
+          test -n "$SERIES"
+
+          ESCAPED="${SERIES//./\\.}"
+
+          TAG="$(
+            git ls-remote --tags --refs "$XANMOD_REPO" |
+            sed 's#.*refs/tags/##' |
+            grep -E "^${ESCAPED}-[0-9]+-xanmod[0-9]+$" |
+            sort -V |
+            tail -n1
+          )"
+
+          test -n "$TAG"
+
+          echo "Latest LTS series: $SERIES"
+          echo "Latest XanMod tag: $TAG"
+
+          if git ls-remote --tags --refs \
+            "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${TAG}-arm64" |
+            grep -q .; then
+            echo "Already released: ${TAG}-arm64"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version detected"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           set -euo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
-            build-essential bc bison flex \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            libelf-dev libssl-dev libncurses-dev \
-            fakeroot dpkg-dev ccache curl jq git \
-            xz-utils zstd rsync kmod python3
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            gcc-aarch64-linux-gnu \
+            fakeroot \
+            dpkg-dev \
+            ccache \
+            git \
+            curl \
+            rsync \
+            xz-utils \
+            kmod \
+            python3
+
+      - name: Setup ccache
+        run: |
+          echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: xanmod-arm64-${{ runner.os }}-${{ github.sha }}
+          key: ${{ runner.os }}-xanmod-arm64-${{ needs.check.outputs.tag }}
           restore-keys: |
-            xanmod-arm64-${{ runner.os }}-
-
-      - name: Detect LTS
-        id: lts
-        run: |
-          set -euo pipefail
-
-          curl -fsSL --retry 5 \
-            https://www.kernel.org/releases.json \
-            -o releases.json
-
-          SERIES="$(
-            jq -r '
-              .releases[]
-              | select(.moniker == "longterm")
-              | .version
-            ' releases.json |
-            sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/' |
-            sort -Vu |
-            tail -1
-          )"
-
-          test -n "$SERIES"
-          echo "series=$SERIES" >> "$GITHUB_OUTPUT"
-
-      - name: Detect XanMod LTS
-        id: xanmod
-        run: |
-          set -euo pipefail
-
-          SERIES="${{ steps.lts.outputs.series }}"
-
-          TAG="$(
-            git ls-remote --tags --refs "$XANMOD_REPO" |
-            awk -F/ '{print $3}' |
-            grep -E "^${SERIES//./\\.}\.[0-9]+-xanmod[0-9]+$" |
-            sort -V |
-            tail -1
-          )"
-
-          test -n "$TAG"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            ${{ runner.os }}-xanmod-arm64-
 
       - name: Clone XanMod
         run: |
           set -euo pipefail
 
           git clone \
-            --depth 1 \
-            --branch "${{ steps.xanmod.outputs.tag }}" \
+            --depth=1 \
+            --branch "${{ needs.check.outputs.tag }}" \
             "$XANMOD_REPO" \
             linux
 
-          cd linux
-
-          KERNEL_SERIES="$(make kernelversion | cut -d. -f1-2)"
-          test "$KERNEL_SERIES" = "${{ steps.lts.outputs.series }}"
-
-      - name: Fetch Oracle config
-        run: |
-          set -euo pipefail
-
-          curl -fsSL --retry 5 \
-            "$ORACLE_CONFIG" \
-            -o oracle.config
-
-          test -s oracle.config
-          grep -q '^CONFIG_ARM64=y$' oracle.config
-          grep -q '^CONFIG_64BIT=y$' oracle.config
-          grep -q '^CONFIG_ARM64_4K_PAGES=y$' oracle.config
-          ! grep -q '^CONFIG_ARM64_64K_PAGES=y$' oracle.config
-
-      - name: Create ARM64 base
+      - name: Build ARM64 configuration
         working-directory: linux
         run: |
           set -euo pipefail
 
-          make ARCH=arm64 defconfig
-          cp .config ../arm64-defconfig
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
 
-      - name: Generate Oracle performance fragment
-        run: |
-          set -euo pipefail
+          make defconfig
+          cp .config /tmp/arm64-defconfig
+
+          curl -fsSL --retry 5 --retry-delay 2 \
+            "${XANMOD_REPO%/}/-/raw/${{ needs.check.outputs.tag }}/CONFIGS/x86_64" \
+            -o /tmp/xanmod-x86_64.config
+
+          test -s /tmp/xanmod-x86_64.config
+
+          make allmodconfig >/dev/null
+          cp .config /tmp/arm64-symbols
 
           python3 <<'PY'
           import re
+          from pathlib import Path
 
-          src = open("oracle.config").read().splitlines()
-          base = {
-              re.match(r'^(?:# )?(CONFIG_[A-Za-z0-9_]+)', x).group(1)
-              for x in open("arm64-defconfig")
-              .read()
-              .splitlines()
-              if re.match(r'^(?:# )?(CONFIG_[A-Za-z0-9_]+)', x)
-          }
+          SRC = Path("/tmp/xanmod-x86_64.config")
+          ARM = Path("/tmp/arm64-symbols")
+          OUT = Path("/tmp/xanmod-arm64.fragment")
 
-          exact = {
-              "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE",
-              "CONFIG_PREEMPT",
-              "CONFIG_PREEMPT_VOLUNTARY",
-              "CONFIG_PREEMPT_DYNAMIC",
-              "CONFIG_NO_HZ",
-              "CONFIG_NO_HZ_IDLE",
-              "CONFIG_NO_HZ_FULL",
-              "CONFIG_HIGH_RES_TIMERS",
-              "CONFIG_HZ_100",
-              "CONFIG_HZ_250",
-              "CONFIG_HZ_300",
-              "CONFIG_HZ_1000",
-              "CONFIG_HZ",
-              "CONFIG_SCHED_AUTOGROUP",
-              "CONFIG_SCHED_CORE",
-              "CONFIG_SCHED_CLASS_EXT",
-              "CONFIG_SCHED_MC",
-              "CONFIG_SCHED_CLUSTER",
-              "CONFIG_SCHED_SMT",
-              "CONFIG_SCHED_HRTICK",
-              "CONFIG_NUMA_BALANCING",
-              "CONFIG_NUMA_BALANCING_DEFAULT_ENABLED",
-              "CONFIG_RCU_NOCB_CPU",
-              "CONFIG_RCU_NOCB_CPU_DEFAULT_ALL",
-              "CONFIG_RCU_LAZY",
-              "CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE",
-              "CONFIG_CPU_FREQ_GOV_PERFORMANCE",
-              "CONFIG_CPU_FREQ_GOV_SCHEDUTIL",
-              "CONFIG_CPU_FREQ_GOV_ONDEMAND",
-              "CONFIG_CPU_FREQ_GOV_CONSERVATIVE",
-              "CONFIG_CPU_IDLE_GOV_MENU",
-              "CONFIG_CPU_IDLE_GOV_TEO",
-              "CONFIG_MGLRU",
-              "CONFIG_LRU_GEN",
-              "CONFIG_LRU_GEN_ENABLED",
-              "CONFIG_TRANSPARENT_HUGEPAGE",
-              "CONFIG_TRANSPARENT_HUGEPAGE_MADVISE",
-              "CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS",
-              "CONFIG_COMPACTION",
-              "CONFIG_KSM",
-              "CONFIG_ZSWAP",
-              "CONFIG_ZRAM",
-              "CONFIG_SLUB",
-              "CONFIG_SLUB_CPU_PARTIAL",
-              "CONFIG_SLUB_TINY",
-              "CONFIG_SLAB_FREELIST_HARDENED",
-              "CONFIG_SLAB_FREELIST_RANDOM",
-              "CONFIG_SLAB_MERGE_DEFAULT",
-              "CONFIG_BLK_MQ",
-              "CONFIG_MQ_IOSCHED_DEADLINE",
-              "CONFIG_MQ_IOSCHED_KYBER",
-              "CONFIG_IOSCHED_BFQ",
-              "CONFIG_NET_SCH_FQ",
-              "CONFIG_NET_SCH_FQ_CODEL",
-              "CONFIG_NET_SCH_DEFAULT",
-              "CONFIG_BPF_JIT",
-              "CONFIG_BPF_JIT_ALWAYS_ON",
-              "CONFIG_BPF_JIT_DEFAULT_ON",
-              "CONFIG_IO_URING",
-              "CONFIG_TCP_CONG_BBR",
-              "CONFIG_DEFAULT_TCP_CONG",
-          }
+          SET = re.compile(r"^(CONFIG_[A-Za-z0-9_]+)=(.*)$")
+          UNSET = re.compile(r"^# (CONFIG_[A-Za-z0-9_]+) is not set$")
 
-          prefixes = (
-              "CONFIG_SCHED_",
-              "CONFIG_RCU_",
-              "CONFIG_CPU_FREQ_",
-              "CONFIG_CPU_IDLE_GOV_",
-              "CONFIG_HZ_",
-              "CONFIG_BLK_MQ_",
-              "CONFIG_MQ_IOSCHED_",
-              "CONFIG_NET_SCH_",
-              "CONFIG_TCP_CONG_",
-          )
+          def parse(path):
+              result = {}
 
-          out = {}
+              for line in path.read_text().splitlines():
+                  m = SET.match(line)
 
-          for line in src:
-              m = re.match(r'^(CONFIG_[A-Za-z0-9_]+)(?:=(.*)| is not set)$', line)
-              if not m:
+                  if m:
+                      result[m.group(1)] = m.group(2)
+                      continue
+
+                  m = UNSET.match(line)
+
+                  if m:
+                      result[m.group(1)] = "n"
+
+              return result
+
+          xanmod = parse(SRC)
+          arm = parse(ARM)
+
+          changes = {}
+          skipped = []
+
+          for sym, value in xanmod.items():
+
+              if sym not in arm:
+                  skipped.append(sym)
                   continue
 
-              sym = m.group(1)
+              if arm[sym] != value:
+                  changes[sym] = value
 
-              if sym not in base:
-                  continue
+          with OUT.open("w") as f:
+              for sym in sorted(changes):
+                  value = changes[sym]
 
-              if sym not in exact and not sym.startswith(prefixes):
-                  continue
+                  if value == "n":
+                      f.write(f"# {sym} is not set\n")
+                  else:
+                      f.write(f"{sym}={value}\n")
 
-              if sym in {
-                  "CONFIG_TCP_CONG_BBR",
-                  "CONFIG_DEFAULT_TCP_CONG",
-              }:
-                  continue
+          print(f"XanMod symbols: {len(xanmod)}")
+          print(f"ARM64 symbols: {len(arm)}")
+          print(f"Compatible symbols: {len(xanmod)-len(skipped)}")
+          print(f"Changed symbols: {len(changes)}")
+          print(f"Skipped symbols: {len(skipped)}")
 
-              if sym.startswith("CONFIG_ARM64_"):
-                  continue
+          if skipped:
+              print("\nSkipped:")
+              for sym in skipped:
+                  print(sym)
 
-              out[sym] = line
-
-          with open("oracle.fragment", "w") as f:
-              for sym in sorted(out):
-                  f.write(out[sym] + "\n")
-
-          print(f"Oracle performance symbols: {len(out)}")
+          if not changes:
+              raise SystemExit(
+                  "No compatible XanMod ARM64 configuration changes found"
+              )
           PY
 
-          test -s oracle.fragment
+          test -s /tmp/xanmod-arm64.fragment
 
-      - name: Apply Oracle performance
-        working-directory: linux
-        run: |
-          set -euo pipefail
+          cp /tmp/arm64-defconfig .config
 
-          cp .config .config.before-oracle
-          scripts/kconfig/merge_config.sh \
+          ./scripts/kconfig/merge_config.sh \
             -m \
             .config \
-            ../oracle.fragment
+            /tmp/xanmod-arm64.fragment
 
-          make ARCH=arm64 olddefconfig
+          make olddefconfig
 
-      - name: Generate XanMod ARM64 fragment
-        working-directory: linux
+          mkdir -p ../configs
+          cp .config ../configs/xanmod-arm64.config
+
+      - name: Validate configuration
         run: |
           set -euo pipefail
 
-          test -f CONFIGS/x86_64/config
+          CFG="configs/xanmod-arm64.config"
 
-          python3 <<'PY'
-          import os
-          import re
-          import subprocess
-          from collections import defaultdict
+          test -s "$CFG"
 
-          cfg = open("CONFIGS/x86_64/config").read().splitlines()
+          grep -q '^CONFIG_ARM64=y$' "$CFG"
+          grep -q '^CONFIG_64BIT=y$' "$CFG"
 
-          defs = defaultdict(set)
-
-          for root in (".",):
-              for dp, dns, fns in os.walk(root):
-                  if "/.git" in dp:
-                      continue
-                  if "arch/x86" not in dp and dp != "./arch/x86":
-                      continue
-                  for fn in fns:
-                      if fn != "Kconfig" and not fn.startswith("Kconfig."):
-                          continue
-                      p = os.path.join(dp, fn)
-                      try:
-                          data = open(p, errors="ignore").read().splitlines()
-                      except:
-                          continue
-                      for line in data:
-                          m = re.match(r'^\s*(?:config|menuconfig)\s+([A-Za-z0-9_]+)', line)
-                          if m:
-                              defs[m.group(1)].add(p)
-
-          x86_only = {
-              s for s, files in defs.items()
-              if files and all("arch/x86/" in f or f.startswith("./arch/x86/") for f in files)
-          }
-
-          def parse(line):
-              m = re.match(r'^(CONFIG_[A-Za-z0-9_]+)(?:=(.*)| is not set)$', line)
-              if not m:
-                  return None
-              return m.group(1)
-
-          candidates = {}
-          for line in cfg:
-              sym = parse(line)
-              if not sym:
-                  continue
-
-              name = sym[7:]
-
-              if name in x86_only:
-                  continue
-
-              if name.startswith(("X86", "I386", "MCORE", "MNATIVE", "M486", "M586", "M686")):
-                  continue
-
-              if name.startswith(("X86_", "I386_")):
-                  continue
-
-              candidates[sym] = line
-
-          with open("xanmod.fragment", "w") as f:
-              for sym in sorted(candidates):
-                  f.write(candidates[sym] + "\n")
-
-          print(f"XanMod candidate symbols: {len(candidates)}")
-          print(f"X86-only symbols removed: {len(x86_only)}")
-          PY
-
-          test -s xanmod.fragment
-
-      - name: Validate XanMod ARM64 compatibility
-        working-directory: linux
-        run: |
-          set -euo pipefail
-
-          cp .config .config.before-xanmod
-
-          scripts/kconfig/merge_config.sh \
-            -m \
-            .config \
-            xanmod.fragment
-
-          make ARCH=arm64 olddefconfig
-
-          cp .config .config.after-xanmod
-
-      - name: Verify configuration
-        working-directory: linux
-        run: |
-          set -euo pipefail
-
-          make ARCH=arm64 olddefconfig
-
-          grep -q '^CONFIG_ARM64=y$' .config
-          grep -q '^CONFIG_64BIT=y$' .config
-          grep -q '^CONFIG_ARM64_4K_PAGES=y$' .config
-          ! grep -q '^CONFIG_ARM64_64K_PAGES=y$' .config
-
-          if grep -q '^CONFIG_X86' .config; then
-            echo "Unexpected X86 configuration detected"
-            grep '^CONFIG_X86' .config
+          if grep -q '^CONFIG_X86=y$' "$CFG"; then
+            echo "ERROR: CONFIG_X86 enabled"
             exit 1
           fi
 
-          python3 <<'PY'
-          import re
-          from collections import Counter
+          if grep -q '^CONFIG_X86_64=y$' "$CFG"; then
+            echo "ERROR: CONFIG_X86_64 enabled"
+            exit 1
+          fi
 
-          lines = open(".config").read().splitlines()
-          syms = []
-
-          for line in lines:
-              m = re.match(r'^(?:# )?(CONFIG_[A-Za-z0-9_]+)', line)
-              if m:
-                  syms.append(m.group(1))
-
-          dup = [x for x, n in Counter(syms).items() if n > 1]
-
-          if dup:
-              print("Duplicate CONFIG symbols:")
-              print("\n".join(sorted(dup)))
-              raise SystemExit(1)
-
-          print(f"CONFIG symbols: {len(syms)}")
-          print("No duplicate CONFIG symbols")
-          PY
-
-          echo
-          echo "Kernel: $(make kernelversion)"
-          echo "Page size: 4K"
-          echo
-          echo "BBR:"
-          grep '^CONFIG_TCP_CONG_BBR=' .config || true
-          grep '^CONFIG_DEFAULT_TCP_CONG=' .config || true
-          echo
-          echo "FQ:"
-          grep '^CONFIG_NET_SCH_FQ=' .config || true
-
-      - name: Build
+      - name: Build kernel
         working-directory: linux
         run: |
           set -euo pipefail
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            -j"$(nproc)"
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC="ccache gcc"
 
-      - name: Build Debian packages
-        working-directory: linux
+          ccache -z
+
+          make -j"$(nproc)"
+          make bindeb-pkg -j"$(nproc)"
+
+          ccache -s
+
+      - name: Generate checksums
         run: |
           set -euo pipefail
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            bindeb-pkg \
-            -j"$(nproc)" \
-            LOCALVERSION=-xanmod-arm64
+          sha256sum ./*.deb > SHA256SUMS.txt
 
-      - name: Package
-        run: |
-          set -euo pipefail
-
-          test -n "$(find linux -maxdepth 1 -name '*.deb' -print -quit)"
-
-          sha256sum linux/*.deb > SHA256SUMS.txt
-          cp linux/.config config-arm64
-
-          {
-            echo "XANMOD_TAG=${{ steps.xanmod.outputs.tag }}"
-            echo "XANMOD_COMMIT=$(cd linux && git rev-parse HEAD)"
-            echo "KERNEL_VERSION=$(cd linux && make kernelversion)"
-            echo "ARCH=arm64"
-            echo "PAGE_SIZE=4K"
-            echo "ORACLE_BASE=Oracle Linux 10 UEK8 ARM64"
-            echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } > BUILD-INFO.txt
-
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xanmod-arm64-lts-${{ steps.xanmod.outputs.tag }}
+          name: xanmod-arm64-${{ needs.check.outputs.tag }}
           path: |
-            linux/*.deb
+            ./*.deb
             SHA256SUMS.txt
-            config-arm64
-            BUILD-INFO.txt
-          if-no-files-found: error
+            configs/xanmod-arm64.config
 
-      - name: Release
+      - name: Commit configuration
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add configs/xanmod-arm64.config
+
+          if git diff --cached --quiet; then
+            echo "No configuration changes."
+            exit 0
+          fi
+
+          git commit \
+            -m "Update XanMod ARM64 config ${{ needs.check.outputs.tag }}"
+
+          git push
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.xanmod.outputs.tag }}-arm64
-          name: XanMod ARM64 LTS ${{ steps.xanmod.outputs.tag }}
+          tag_name: ${{ needs.check.outputs.tag }}-arm64
+          name: XanMod ARM64 ${{ needs.check.outputs.tag }}
           generate_release_notes: true
           files: |
-            linux/*.deb
+            ./*.deb
             SHA256SUMS.txt
-            config-arm64
-            BUILD-INFO.txt
+            configs/xanmod-arm64.config
