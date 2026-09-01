@@ -201,7 +201,7 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fetch XanMod only from GitLab
+      - name: Fetch XanMod from GitLab
         if: steps.existing.outputs.exists != 'true'
         env:
           TAG: ${{ steps.xanmod.outputs.tag }}
