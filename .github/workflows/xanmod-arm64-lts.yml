@@ -1,9 +1,9 @@
-name: XanMod ARM64 LTS
+name: xanmod-arm64
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: '17 3 * * *'
 
 permissions:
   contents: write
@@ -18,476 +18,333 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install build requirements
+      - name: Checkout workflow
+        uses: actions/checkout@v5
+
+      - name: Discover latest XanMod LTS release
+        id: xanmod
         shell: bash
+        env:
+          GITLAB_API: https://gitlab.com/api/v4/projects/xanmod%2Flinux
+        run: |
+          set -euo pipefail
+
+          tag=""
+          for page in $(seq 1 50); do
+            releases="$(curl -fsSL --retry 5 --retry-all-errors \
+              "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page")"
+
+            tag="$(jq -r '
+              .[]
+              | select(.upcoming_release == false)
+              | select(any(.assets.links[]?; (.url // "") | contains("/releases/lts/")))
+              | .tag_name
+            ' <<<"$releases" | head -n1)"
+
+            [[ -n "$tag" ]] && break
+            [[ "$(jq 'length' <<<"$releases")" -lt 100 ]] && break
+          done
+
+          [[ -n "$tag" ]] || {
+            echo "No XanMod LTS release found"
+            exit 1
+          }
+
+          release="$(curl -fsSL --retry 5 --retry-all-errors \
+            "$GITLAB_API/releases/$tag")"
+
+          jq -e --arg tag "$tag" '
+            .tag_name == $tag
+            and (.upcoming_release == false)
+            and any(.assets.links[]?; (.url // "") | contains("/releases/lts/"))
+          ' <<<"$release" >/dev/null
+
+          commit="$(jq -r '.commit.id' <<<"$release")"
+          released_at="$(jq -r '.released_at' <<<"$release")"
+
+          {
+            echo "tag=$tag"
+            echo "commit=$commit"
+            echo "released_at=$released_at"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Skip published release
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.xanmod.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build dependencies
+        if: steps.published.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
           sudo apt-get update
-
-          packages=(
-            bc
-            binutils
-            bison
-            build-essential
-            ca-certificates
-            ccache
-            cpio
-            curl
-            debhelper
-            dpkg-dev
-            dwarves
-            fakeroot
-            flex
-            git
-            jq
-            kmod
-            libdw-dev
-            libelf-dev
-            libssl-dev
-            libzstd-dev
-            lld
-            llvm
-            clang
-            openssl
-            perl
-            pkg-config
-            python3
-            rsync
-            tar
-            xz-utils
-            zstd
-          )
-
-          sudo apt-get install -y "${packages[@]}"
-
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-
-          required_commands=(
-            bc
-            bison
-            clang
-            ccache
-            dpkg-buildpackage
-            dpkg-deb
-            fakeroot
-            flex
-            git
-            jq
-            ld.lld
-            llvm-ar
-            llvm-nm
-            llvm-objcopy
-            llvm-objdump
-            llvm-readelf
-            make
-            pahole
-            perl
-            python3
-            rsync
-            tar
-            xz
-            zstd
-          )
-
-          for command in "${required_commands[@]}"; do
-            command -v "$command"
-          done
-
-          dpkg-query \
-            -W \
-            -f='${Package} ${Version} ${Status}\n' \
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            clang-19 \
             debhelper \
-            debhelper-compat \
-            2>/dev/null || true
+            dpkg-dev \
+            dwarves \
+            fakeroot \
+            flex \
+            gcc-aarch64-linux-gnu \
+            kmod \
+            libdw-dev \
+            libelf-dev \
+            libssl-dev \
+            lld-19 \
+            llvm-19 \
+            openssl \
+            pkg-config \
+            python3 \
+            rsync \
+            xz-utils
 
-          dh --version
-          clang --version
-          ld.lld --version
-          pahole --version
-          ccache --version
+          command -v clang-19
+          command -v ld.lld-19
+          clang-19 --version
+          ld.lld-19 --version | head -n1
 
-      - name: Detect XanMod official LTS release
-        id: xanmod
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          api="https://gitlab.com/api/v4/projects/xanmod%2Flinux/releases"
-          page=1
-          tmp="$(mktemp)"
-
-          while :; do
-            data="$(
-              curl \
-                --fail \
-                --silent \
-                --show-error \
-                --location \
-                --get \
-                "$api" \
-                --data-urlencode "per_page=100" \
-                --data-urlencode "page=$page"
-            )"
-
-            count="$(jq 'length' <<<"$data")"
-
-            if [ "$count" -eq 0 ]; then
-              break
-            fi
-
-            printf '%s\n' "$data" >> "$tmp"
-
-            if [ "$count" -lt 100 ]; then
-              break
-            fi
-
-            page=$((page + 1))
-          done
-
-          tag="$(
-            jq -s -r '
-              .[][]
-              | select(
-                  any(
-                    .assets.links[]?.url;
-                    contains("/releases/lts/")
-                  )
-                )
-              | .tag_name
-            ' "$tmp" |
-            sort -V |
-            tail -n1
-          )"
-
-          rm -f "$tmp"
-
-          test -n "$tag"
-          test "$tag" != "null"
-
-          release="$(
-            curl \
-              --fail \
-              --silent \
-              --show-error \
-              --location \
-              "https://gitlab.com/api/v4/projects/xanmod%2Flinux/releases/$tag"
-          )"
-
-          jq -e --arg tag "$tag" '
-            .tag_name == $tag
-            and
-            (
-              any(
-                .assets.links[]?.url;
-                contains("/releases/lts/")
-              )
-            )
-          ' <<<"$release" >/dev/null
-
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Check GitHub Release
-        id: existing
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.xanmod.outputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Clone exact XanMod release from GitLab
-        if: steps.existing.outputs.exists != 'true'
-        env:
-          TAG: ${{ steps.xanmod.outputs.tag }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git ls-remote \
-            --exit-code \
-            --refs \
-            https://gitlab.com/xanmod/linux.git \
-            "refs/tags/$TAG"
-
-          git clone \
-            --depth=1 \
-            --branch "$TAG" \
-            https://gitlab.com/xanmod/linux.git \
-            linux
-
-          cd linux
-
-          test "$(git remote get-url origin)" = \
-            "https://gitlab.com/xanmod/linux.git"
-
-          git rev-parse HEAD > ../source-commit
-          git show -s --format=%cI HEAD > ../source-date
-          git show -s --format=%ct HEAD > ../source-epoch
-
-          required_files=(
-            ".gitlab-ci.yml"
-            "CONFIGS/x86_64/config"
-            "Documentation/process/changes.rst"
-            "Kconfig"
-            "Makefile"
-            "arch/arm64/Kconfig"
-            "scripts/config"
-            "scripts/diffconfig"
-            "scripts/kconfig/merge_config.sh"
-          )
-
-          for file in "${required_files[@]}"; do
-            test -f "$file"
-          done
-
-          git describe --tags --exact-match HEAD
-
-      - name: Generate XanMod x86-v3 optimization fragment
-        if: steps.existing.outputs.exists != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p x86-build audit
-
-          make \
-            -C linux \
-            O="$GITHUB_WORKSPACE/x86-build" \
-            ARCH=x86 \
-            LLVM=1 \
-            x86_64_defconfig
-
-          cp \
-            x86-build/.config \
-            audit/x86-64-defconfig.config
-
-          cp \
-            linux/CONFIGS/x86_64/config \
-            audit/xanmod-x86-v3.config
-
-          linux/scripts/diffconfig \
-            -m \
-            audit/x86-64-defconfig.config \
-            audit/xanmod-x86-v3.config \
-            > audit/xanmod-x86-v3.fragment
-
-          test -s audit/xanmod-x86-v3.fragment
-
-      - name: Resolve optimization fragment through ARM64 Kconfig
-        if: steps.existing.outputs.exists != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p arm64-build
-
-          make \
-            -C linux \
-            O="$GITHUB_WORKSPACE/arm64-build" \
-            ARCH=arm64 \
-            LLVM=1 \
-            defconfig
-
-          cp \
-            arm64-build/.config \
-            audit/arm64-defconfig.config
-
-          KCONFIG_CONFIG="$GITHUB_WORKSPACE/arm64-build/.config" \
-            linux/scripts/kconfig/merge_config.sh \
-            -m \
-            "$GITHUB_WORKSPACE/arm64-build/.config" \
-            "$GITHUB_WORKSPACE/audit/xanmod-x86-v3.fragment"
-
-          KCONFIG_WARN_UNKNOWN_SYMBOLS=1 \
-          KCONFIG_WARN_CHANGED_INPUT=1 \
-          KCONFIG_CONFIG="$GITHUB_WORKSPACE/arm64-build/.config" \
-            make \
-            -C linux \
-            O="$GITHUB_WORKSPACE/arm64-build" \
-            ARCH=arm64 \
-            LLVM=1 \
-            olddefconfig \
-            2>&1 | tee audit/kconfig.log
-
-          cp \
-            arm64-build/.config \
-            audit/arm64-after-olddefconfig.config
-
-          linux/scripts/diffconfig \
-            audit/arm64-defconfig.config \
-            audit/arm64-after-olddefconfig.config \
-            > audit/arm64-final-delta.config
-
-          linux/scripts/diffconfig \
-            audit/xanmod-x86-v3.fragment \
-            audit/arm64-after-olddefconfig.config \
-            > audit/x86-v3-to-arm64-resolution.config
-
-          test -s audit/arm64-after-olddefconfig.config
-
-      - name: Configure final ARM64 build
-        if: steps.existing.outputs.exists != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          linux/scripts/config \
-            --file arm64-build/.config \
-            --set-str LOCALVERSION "-xanmod-arm64"
-
-          KCONFIG_WARN_UNKNOWN_SYMBOLS=1 \
-          KCONFIG_WARN_CHANGED_INPUT=1 \
-          KCONFIG_CONFIG="$GITHUB_WORKSPACE/arm64-build/.config" \
-            make \
-            -C linux \
-            O="$GITHUB_WORKSPACE/arm64-build" \
-            ARCH=arm64 \
-            LLVM=1 \
-            olddefconfig \
-            2>&1 | tee -a audit/kconfig.log
-
-          cp \
-            arm64-build/.config \
-            audit/final.config
-
-          test -s audit/final.config
-
-      - name: Configure ccache
-        if: steps.existing.outputs.exists != 'true'
-        id: ccache
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$HOME/.cache/ccache"
-
-          ccache --set-config=cache_dir="$HOME/.cache/ccache"
-          ccache --set-config=max_size=2G
-          ccache --set-config=compression=true
-
-          compiler_hash="$(
-            {
-              clang --version
-              ld.lld --version
-              llvm-ar --version
-            } |
-            sha256sum |
-            cut -d' ' -f1
-          )"
-
-          echo "compiler_hash=$compiler_hash" >> "$GITHUB_OUTPUT"
-          echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
-          echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
-          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
-
-      - name: Restore ccache
-        if: steps.existing.outputs.exists != 'true'
+      - name: Cache ccache
+        if: steps.published.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
-          path: ~/.cache/ccache
-          key: xanmod-arm64-${{ steps.ccache.outputs.compiler_hash }}-${{ github.run_id }}
-          restore-keys: |
-            xanmod-arm64-${{ steps.ccache.outputs.compiler_hash }}-
+          path: .ccache
+          key: ${{ runner.os }}-${{ runner.arch }}-xanmod-${{ steps.xanmod.outputs.tag }}-clang19-${{ hashFiles('.github/workflows/xanmod-arm64.yml') }}
 
-      - name: Build and package
-        if: steps.existing.outputs.exists != 'true'
-        shell: bash
+      - name: Fetch XanMod source
+        if: steps.published.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.xanmod.outputs.tag }}
+          EXPECTED_COMMIT: ${{ steps.xanmod.outputs.commit }}
         run: |
           set -euo pipefail
 
-          export KBUILD_BUILD_TIMESTAMP="$(cat source-date)"
-          export SOURCE_DATE_EPOCH="$(cat source-epoch)"
+          git clone --depth 1 --branch "$TAG" \
+            https://gitlab.com/xanmod/linux.git kernel
 
-          make \
-            -C linux \
-            O="$GITHUB_WORKSPACE/arm64-build" \
-            ARCH=arm64 \
-            LLVM=1 \
-            CC="ccache clang" \
-            KBUILD_BUILD_TIMESTAMP="$KBUILD_BUILD_TIMESTAMP" \
-            -j"$(nproc)" \
+          cd kernel
+
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          test -f CONFIGS/x86_64/config
+          test -f arch/arm64/configs/defconfig
+          test -x scripts/kconfig/merge_config.sh
+          test -f scripts/package/mkdebian
+          test -f scripts/package/builddeb
+
+      - name: Build ARM64 configuration through Kconfig
+        if: steps.published.outputs.skip != 'true'
+        id: config
+        run: |
+          set -euo pipefail
+
+          cd kernel
+
+          export ARCH=arm64
+          export LLVM=-19
+          export KCONFIG_CONFIG="$PWD/.config"
+
+          cp arch/arm64/configs/defconfig "$KCONFIG_CONFIG"
+          cp CONFIGS/x86_64/config "$GITHUB_WORKSPACE/x86-candidate.config"
+
+          awk '
+            /^CONFIG_[A-Za-z0-9_]+=/
+            {
+              split($0, a, "=")
+              print a[1]
+            }
+            /^# CONFIG_[A-Za-z0-9_]+ is not set$/
+            {
+              print $2
+            }
+          ' "$KCONFIG_CONFIG" | sort -u > "$GITHUB_WORKSPACE/arm64.symbols"
+
+          awk '
+            BEGIN {
+              while ((getline < "'"$GITHUB_WORKSPACE/arm64.symbols"'") > 0)
+                base[$1] = 1
+            }
+            /^CONFIG_[A-Za-z0-9_]+=/
+            {
+              split($0, a, "=")
+              if (!base[a[1]])
+                print
+              next
+            }
+            /^# CONFIG_[A-Za-z0-9_]+ is not set$/
+            {
+              if (!base[$2])
+                print
+            }
+          ' "$GITHUB_WORKSPACE/x86-candidate.config" \
+            > "$GITHUB_WORKSPACE/x86-candidate.fragment"
+
+          scripts/kconfig/merge_config.sh -m \
+            "$KCONFIG_CONFIG" \
+            "$GITHUB_WORKSPACE/x86-candidate.fragment"
+
+          make ARCH=arm64 LLVM=-19 olddefconfig
+
+          test -s .config
+          grep -q '^CONFIG_MODULES=y$' .config
+
+          duplicates="$(
+            awk '
+              /^CONFIG_[A-Za-z0-9_]+=/
+              {
+                split($0, a, "=")
+                print a[1]
+              }
+              /^# CONFIG_[A-Za-z0-9_]+ is not set$/
+              {
+                print $2
+              }
+            ' .config | sort | uniq -d
+          )"
+
+          [[ -z "$duplicates" ]]
+
+          config_hash="$(sha256sum .config | cut -d' ' -f1)"
+          echo "config_hash=$config_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Verify kernel packaging prerequisites
+        if: steps.published.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+
+          cd kernel
+
+          export ARCH=arm64
+          export LLVM=-19
+          export KCONFIG_CONFIG="$PWD/.config"
+
+          make ARCH=arm64 LLVM=-19 olddefconfig
+          make ARCH=arm64 LLVM=-19 -s kernelversion
+          make ARCH=arm64 LLVM=-19 -s image_name
+
+          test -x scripts/package/mkdebian
+          test -x scripts/package/builddeb
+
+      - name: Build kernel modules and Debian packages
+        if: steps.published.outputs.skip != 'true'
+        env:
+          KBUILD_BUILD_USER: github-actions
+          KBUILD_BUILD_HOST: github-arm64
+          DEBFULLNAME: github-actions
+          DEBEMAIL: github-actions@users.noreply.github.com
+          KDEB_CHANGELOG_DIST: noble
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+        run: |
+          set -euo pipefail
+
+          cd kernel
+
+          export ARCH=arm64
+          export LLVM=-19
+          export CCACHE_DIR="$CCACHE_DIR"
+          export CC="ccache clang-19"
+          export HOSTCC="ccache clang-19"
+
+          ccache --zero-stats
+
+          jobs="$(( $(nproc) + 1 ))"
+
+          make ARCH=arm64 LLVM=-19 \
+            CC="$CC" \
+            HOSTCC="$HOSTCC" \
+            -j"$jobs" \
             bindeb-pkg
 
           ccache --show-stats
 
-      - name: Validate packages
-        if: steps.existing.outputs.exists != 'true'
-        shell: bash
+      - name: Validate Debian packages
+        if: steps.published.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.xanmod.outputs.tag }}
         run: |
           set -euo pipefail
 
-          test -s arm64-build/arch/arm64/boot/Image
+          mkdir -p dist
 
-          mkdir -p artifacts
+          shopt -s nullglob
+          packages=(*.deb)
 
-          find "$GITHUB_WORKSPACE" \
-            -type f \
-            -name '*.deb' \
-            -not -path "$GITHUB_WORKSPACE/artifacts/*" \
-            -exec cp -f {} artifacts/ \;
+          ((${#packages[@]} > 0)) || {
+            echo "No .deb files produced"
+            exit 1
+          }
 
-          compgen -G "artifacts/*.deb" >/dev/null
+          image_pkg=""
+          headers_pkg=""
+          libc_pkg=""
 
-          image_package=0
+          for deb in "${packages[@]}"; do
+            dpkg-deb --info "$deb" >/dev/null
+            dpkg-deb --contents "$deb" >/dev/null
 
-          for package in artifacts/*.deb; do
-            dpkg-deb --info "$package" >/dev/null
-            dpkg-deb --contents "$package" >/dev/null
+            arch="$(dpkg-deb --field "$deb" Architecture)"
+            [[ "$arch" == "arm64" ]] || {
+              echo "Unexpected package architecture: $deb -> $arch"
+              exit 1
+            }
 
-            name="$(dpkg-deb -f "$package" Package)"
-            arch="$(dpkg-deb -f "$package" Architecture)"
-
-            test "$arch" = "arm64"
+            name="$(dpkg-deb --field "$deb" Package)"
 
             case "$name" in
               linux-image-*)
-                image_package=1
+                image_pkg="$deb"
+                ;;
+              linux-headers-*)
+                headers_pkg="$deb"
+                ;;
+              linux-libc-dev)
+                libc_pkg="$deb"
                 ;;
             esac
           done
 
-          test "$image_package" -eq 1
+          [[ -n "$image_pkg" ]]
+          [[ -n "$headers_pkg" ]]
+          [[ -n "$libc_pkg" ]]
 
-          tar \
-            -C audit \
-            -cJf \
-            "$GITHUB_WORKSPACE/artifacts/xanmod-arm64-config-audit.tar.xz" \
-            .
+          dpkg-deb --contents "$image_pkg" | grep -q '/boot/vmlinuz-'
+          dpkg-deb --contents "$image_pkg" | grep -q '/lib/modules/'
+          dpkg-deb --contents "$headers_pkg" | grep -q '/usr/src/linux-headers-'
 
-          sha256sum artifacts/* > artifacts/SHA256SUMS
+          cp "${packages[@]}" dist/
 
-      - name: Upload artifacts
-        if: steps.existing.outputs.exists != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: xanmod-arm64-${{ steps.xanmod.outputs.tag }}
-          path: artifacts/*
-          if-no-files-found: error
-          compression-level: 0
+          sha256sum dist/*.deb > dist/SHA256SUMS
+
+          {
+            echo "XanMod LTS: $TAG"
+            echo
+            echo "Source: https://gitlab.com/xanmod/linux"
+            echo "GitLab release: https://gitlab.com/xanmod/linux/-/releases/$TAG"
+            echo
+            cat dist/SHA256SUMS
+          } > dist/RELEASE.md
 
       - name: Publish GitHub Release
-        if: steps.existing.outputs.exists != 'true'
+        if: steps.published.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.xanmod.outputs.tag }}
-        shell: bash
         run: |
           set -euo pipefail
 
-          gh release create \
-            "$TAG" \
-            artifacts/* \
-            --title "XanMod ARM64 $TAG" \
-            --notes "XanMod official LTS ARM64 build
-          Source: XanMod GitLab
-          Architecture: arm64
-          Toolchain: LLVM
-          Configuration: ARM64 Kconfig + olddefconfig"
+          gh release create "$TAG" \
+            dist/*.deb \
+            dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "XanMod $TAG ARM64" \
+            --notes-file dist/RELEASE.md
