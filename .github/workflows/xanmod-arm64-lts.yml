@@ -34,6 +34,7 @@ jobs:
             ccache
             cpio
             curl
+            debhelper
             dpkg-dev
             dwarves
             fakeroot
@@ -59,6 +60,7 @@ jobs:
           )
 
           sudo apt-get install -y "${packages[@]}"
+
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
@@ -67,6 +69,7 @@ jobs:
             bison
             clang
             ccache
+            dpkg-buildpackage
             dpkg-deb
             fakeroot
             flex
@@ -92,7 +95,14 @@ jobs:
             command -v "$command"
           done
 
-          make --version
+          dpkg-query \
+            -W \
+            -f='${Package} ${Version} ${Status}\n' \
+            debhelper \
+            debhelper-compat \
+            2>/dev/null || true
+
+          dh --version
           clang --version
           ld.lld --version
           pahole --version
@@ -115,7 +125,8 @@ jobs:
                 --silent \
                 --show-error \
                 --location \
-                --get "$api" \
+                --get \
+                "$api" \
                 --data-urlencode "per_page=100" \
                 --data-urlencode "page=$page"
             )"
@@ -139,21 +150,15 @@ jobs:
             jq -s -r '
               .[][]
               | select(
-                  (
-                    any(.assets.links[]?.url;
-                      contains("/releases/lts/")
-                    )
-                  )
-                  or
-                  (
-                    (.description // "")
-                    | contains("/releases/lts/")
+                  any(
+                    .assets.links[]?.url;
+                    contains("/releases/lts/")
                   )
                 )
               | .tag_name
-            ' "$tmp" \
-            | sort -V \
-            | tail -n1
+            ' "$tmp" |
+            sort -V |
+            tail -n1
           )"
 
           rm -f "$tmp"
@@ -172,14 +177,11 @@ jobs:
 
           jq -e --arg tag "$tag" '
             .tag_name == $tag
-            and (
-              any(.assets.links[]?.url;
+            and
+            (
+              any(
+                .assets.links[]?.url;
                 contains("/releases/lts/")
-              )
-              or
-              (
-                (.description // "")
-                | contains("/releases/lts/")
               )
             )
           ' <<<"$release" >/dev/null
@@ -201,7 +203,7 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fetch XanMod from GitLab
+      - name: Clone exact XanMod release from GitLab
         if: steps.existing.outputs.exists != 'true'
         env:
           TAG: ${{ steps.xanmod.outputs.tag }}
@@ -237,7 +239,6 @@ jobs:
             "Kconfig"
             "Makefile"
             "arch/arm64/Kconfig"
-            "arch/x86/configs/x86_64_defconfig"
             "scripts/config"
             "scripts/diffconfig"
             "scripts/kconfig/merge_config.sh"
@@ -247,9 +248,9 @@ jobs:
             test -f "$file"
           done
 
-          test "$(cat localversion)" = "-xanmod1"
+          git describe --tags --exact-match HEAD
 
-      - name: Generate XanMod x86-v3 delta
+      - name: Generate XanMod x86-v3 optimization fragment
         if: steps.existing.outputs.exists != 'true'
         shell: bash
         run: |
@@ -280,7 +281,7 @@ jobs:
 
           test -s audit/xanmod-x86-v3.fragment
 
-      - name: Generate ARM64 configuration
+      - name: Resolve optimization fragment through ARM64 Kconfig
         if: steps.existing.outputs.exists != 'true'
         shell: bash
         run: |
@@ -330,9 +331,17 @@ jobs:
             audit/arm64-after-olddefconfig.config \
             > audit/x86-v3-to-arm64-resolution.config
 
+          test -s audit/arm64-after-olddefconfig.config
+
+      - name: Configure final ARM64 build
+        if: steps.existing.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
           linux/scripts/config \
             --file arm64-build/.config \
-            --set-str LOCALVERSION "-arm64"
+            --set-str LOCALVERSION "-xanmod-arm64"
 
           KCONFIG_WARN_UNKNOWN_SYMBOLS=1 \
           KCONFIG_WARN_CHANGED_INPUT=1 \
@@ -369,7 +378,9 @@ jobs:
               clang --version
               ld.lld --version
               llvm-ar --version
-            } | sha256sum | cut -d' ' -f1
+            } |
+            sha256sum |
+            cut -d' ' -f1
           )"
 
           echo "compiler_hash=$compiler_hash" >> "$GITHUB_OUTPUT"
@@ -388,21 +399,19 @@ jobs:
 
       - name: Build and package
         if: steps.existing.outputs.exists != 'true'
-        env:
-          TAG: ${{ steps.xanmod.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
 
           export KBUILD_BUILD_TIMESTAMP="$(cat source-date)"
           export SOURCE_DATE_EPOCH="$(cat source-epoch)"
-          export CC="ccache clang"
 
           make \
             -C linux \
             O="$GITHUB_WORKSPACE/arm64-build" \
             ARCH=arm64 \
             LLVM=1 \
+            CC="ccache clang" \
             KBUILD_BUILD_TIMESTAMP="$KBUILD_BUILD_TIMESTAMP" \
             -j"$(nproc)" \
             bindeb-pkg
@@ -420,9 +429,9 @@ jobs:
           mkdir -p artifacts
 
           find "$GITHUB_WORKSPACE" \
-            -maxdepth 2 \
             -type f \
             -name '*.deb' \
+            -not -path "$GITHUB_WORKSPACE/artifacts/*" \
             -exec cp -f {} artifacts/ \;
 
           compgen -G "artifacts/*.deb" >/dev/null
@@ -436,14 +445,10 @@ jobs:
             name="$(dpkg-deb -f "$package" Package)"
             arch="$(dpkg-deb -f "$package" Architecture)"
 
-            printf '%s %s %s\n' \
-              "$name" \
-              "$arch" \
-              "$(basename "$package")"
+            test "$arch" = "arm64"
 
             case "$name" in
               linux-image-*)
-                [ "$arch" = "arm64" ]
                 image_package=1
                 ;;
             esac
@@ -454,7 +459,7 @@ jobs:
           tar \
             -C audit \
             -cJf \
-            artifacts/xanmod-arm64-config-audit.tar.xz \
+            "$GITHUB_WORKSPACE/artifacts/xanmod-arm64-config-audit.tar.xz" \
             .
 
           sha256sum artifacts/* > artifacts/SHA256SUMS
