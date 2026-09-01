@@ -1,5 +1,3 @@
-".github/workflows/xanmod-arm64-lts.yml"
-
 name: Auto Build XanMod ARM64 LTS
 
 on:
