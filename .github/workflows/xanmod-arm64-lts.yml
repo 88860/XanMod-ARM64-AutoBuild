@@ -25,9 +25,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo apt-get update
-          sudo apt-get install -y git python3
-
           TAG="$(
             python3 - <<'PY'
           import subprocess
@@ -55,7 +52,7 @@ jobs:
 
           if not tags:
               raise SystemExit(
-                  f"No XanMod {series} LTS tags found"
+                  f"No XanMod {series} tags found"
               )
 
           def key(tag):
@@ -71,19 +68,19 @@ jobs:
 
           test -n "$TAG"
 
-          echo "XanMod LTS: $TAG"
+          echo "Selected XanMod LTS: $TAG"
 
           if git ls-remote --tags --refs \
             "https://github.com/${GITHUB_REPOSITORY}.git" \
             "refs/tags/${TAG}-arm64" |
             grep -q .; then
 
-            echo "Already released: ${TAG}-arm64"
+            echo "Release already exists: ${TAG}-arm64"
             echo "build=false" >> "$GITHUB_OUTPUT"
 
           else
 
-            echo "New build required: ${TAG}"
+            echo "New XanMod LTS detected: $TAG"
             echo "build=true" >> "$GITHUB_OUTPUT"
 
           fi
@@ -103,7 +100,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo apt-get update
+          sudo apt-get update -qq
 
           sudo apt-get install -y \
             build-essential \
@@ -124,7 +121,17 @@ jobs:
             kmod \
             python3
 
-          gcc-aarch64-linux-gnu-gcc --version
+      - name: Verify build environment
+        run: |
+          set -euo pipefail
+
+          command -v make
+          command -v python3
+          command -v git
+          command -v curl
+          command -v aarch64-linux-gnu-gcc
+
+          aarch64-linux-gnu-gcc --version
           make --version
           python3 --version
 
@@ -171,8 +178,6 @@ jobs:
             -o /tmp/xanmod-x86_64.config
 
           test -s /tmp/xanmod-x86_64.config
-
-          head -n 5 /tmp/xanmod-x86_64.config
 
       - name: Build ARM64 configuration
         working-directory: linux
@@ -258,19 +263,19 @@ jobs:
 
           print(f"XanMod symbols: {len(xanmod)}")
           print(f"ARM64 symbols: {len(arm64)}")
-          print(f"Compatible: {len(xanmod) - len(skipped)}")
-          print(f"Changed: {len(changes)}")
-          print(f"Skipped: {len(skipped)}")
+          print(f"Compatible symbols: {len(xanmod) - len(skipped)}")
+          print(f"Changed symbols: {len(changes)}")
+          print(f"Skipped symbols: {len(skipped)}")
 
           if skipped:
-              print("\nSkipped symbols:")
+              print("Skipped symbols:")
 
               for symbol in skipped:
                   print(symbol)
 
           if not changes:
               raise SystemExit(
-                  "No compatible XanMod changes found"
+                  "No compatible XanMod configuration changes found"
               )
           PY
 
@@ -296,7 +301,7 @@ jobs:
           test -s "$CFG"
 
           grep -q '^CONFIG_ARM64=y$' "$CFG"
-          grep -q '^CONFIG_64BIT=y$' "$CFG"
+          grep -q '^CONFIG_64BIT=y$'
 
           if grep -q '^CONFIG_X86=y$' "$CFG"; then
             echo "ERROR: CONFIG_X86 enabled"
