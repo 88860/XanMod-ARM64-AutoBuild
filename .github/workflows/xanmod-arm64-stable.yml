@@ -1,0 +1,46 @@
+name: Auto Build XanMod ARM64 Kernel
+
+on:
+  release:
+    types: [published]   # XanMod 官方发布新版本时触发
+  workflow_dispatch:      # 支持手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential flex bison libncurses5-dev \
+            libssl-dev libelf-dev bc git curl wget \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            ccache jq
+
+      - name: Detect latest XanMod tag
+        id: tag
+        run: |
+          TAG=$(curl -s https://api.github.com/repos/xanmod/linux/releases/latest | jq -r .tag_name)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Clone XanMod Kernel
+        run: |
+          git clone https://github.com/xanmod/linux
+          cd linux
+          git checkout ${{ steps.tag.outputs.tag }}
+
+      - name: Build ARM64 Kernel
+        run: |
+          cd linux
+          make ARCH=arm64 defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xanmod-arm64-kernel
+          path: linux/arch/arm64/boot/Image
