@@ -1,9 +1,8 @@
-name: Auto Build XanMod ARM64 LTS
+name: Build XanMod ARM64 LTS
 
 on:
   workflow_dispatch:
   schedule:
-    # 每周一 04:00 UTC 检查
     - cron: "0 4 * * 1"
 
 permissions:
@@ -15,12 +14,7 @@ concurrency:
 
 env:
   XANMOD_REPO: https://gitlab.com/xanmod/linux.git
-
-  # Oracle official production UEKR8 ARM64 repository.
-  # We use the actual Oracle-distributed RPM configuration,
-  # not a guessed config file from the source tree.
-  ORACLE_REPO: https://yum.oracle.com/repo/OracleLinux/OL10/UEKR8/aarch64/
-
+  ORACLE_KCONFIGS: https://raw.githubusercontent.com/oracle/kconfigs/gh-pages
   ARCH: arm64
   CROSS_COMPILE: aarch64-linux-gnu-
 
@@ -29,162 +23,69 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - uses: actions/checkout@v4
 
-      # ============================================================
-      # 1. Checkout
-      # ============================================================
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-
-      # ============================================================
-      # 2. Dependencies
-      # ============================================================
-
-      - name: Install dependencies
-        shell: bash
+      - name: Dependencies
         run: |
           set -euo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y \
-            build-essential \
-            bc \
-            bison \
-            flex \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            libelf-dev \
-            libssl-dev \
-            libncurses-dev \
-            fakeroot \
-            dpkg-dev \
-            ccache \
-            curl \
-            jq \
-            git \
-            xz-utils \
-            zstd \
-            rsync \
-            kmod \
-            python3 \
-            rpm \
-            rpm2cpio \
-            cpio
+            build-essential bc bison flex \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libelf-dev libssl-dev libncurses-dev \
+            fakeroot dpkg-dev ccache curl jq git \
+            xz-utils zstd rsync kmod python3
 
-
-      # ============================================================
-      # 3. ccache
-      # ============================================================
-
-      - name: Setup ccache
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
-          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
-
-      - name: Cache ccache
+      - name: Cache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: arm64-xanmod-lts-${{ runner.os }}-${{ github.sha }}
+          key: xanmod-arm64-lts-${{ runner.os }}-${{ github.sha }}
           restore-keys: |
-            arm64-xanmod-lts-${{ runner.os }}-
+            xanmod-arm64-lts-${{ runner.os }}-
 
-
-      # ============================================================
-      # 4. Detect latest Linux LTS
-      #
-      # Use official kernel.org JSON.
-      # Never parse HTML.
-      # ============================================================
-
-      - name: Detect latest Linux Longterm series
+      - name: Detect Linux LTS
         id: lts
-        shell: bash
         run: |
           set -euo pipefail
 
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --retry 5 \
-            --retry-delay 2 \
+          curl -fsSL --retry 5 \
             https://www.kernel.org/releases.json \
-            -o kernel-releases.json
+            -o releases.json
 
-          LTS_SERIES="$(
+          SERIES="$(
             jq -r '
               .releases[]
               | select(.moniker == "longterm")
               | .version
-            ' kernel-releases.json |
-            sed -E 's/^([0-9]+\.[0-9]+)\..*$/\1/' |
-            sort -V |
-            uniq |
-            tail -n1
+            ' releases.json |
+            sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/' |
+            sort -Vu |
+            tail -1
           )"
 
-          if [[ -z "$LTS_SERIES" ]]; then
-            echo "ERROR: Cannot determine Linux LTS series."
-            exit 1
-          fi
+          test -n "$SERIES"
+          echo "series=$SERIES" >> "$GITHUB_OUTPUT"
 
-          echo "Linux LTS series: $LTS_SERIES"
-
-          echo "series=$LTS_SERIES" >> "$GITHUB_OUTPUT"
-
-
-      # ============================================================
-      # 5. Detect latest normal XanMod release
-      #
-      # Exclude RT.
-      # ============================================================
-
-      - name: Detect latest XanMod LTS tag
+      - name: Detect XanMod LTS
         id: xanmod
-        shell: bash
         run: |
           set -euo pipefail
 
           SERIES="${{ steps.lts.outputs.series }}"
 
-          echo "Searching XanMod for series ${SERIES}..."
-
           TAG="$(
-            git ls-remote \
-              --tags \
-              --refs \
-              "$XANMOD_REPO" |
+            git ls-remote --tags --refs "$XANMOD_REPO" |
             awk -F/ '{print $3}' |
             grep -E "^${SERIES//./\\.}\.[0-9]+-xanmod[0-9]+$" |
-            grep -v -- '-rt-xanmod' |
             sort -V |
-            tail -n1
+            tail -1
           )"
 
-          if [[ -z "$TAG" ]]; then
-            echo "ERROR: No normal XanMod release found for ${SERIES}."
-            exit 1
-          fi
-
-          echo "Selected XanMod tag: $TAG"
-
+          test -n "$TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-
-      # ============================================================
-      # 6. Clone XanMod
-      # ============================================================
-
       - name: Clone XanMod
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -196,622 +97,102 @@ jobs:
 
           cd linux
 
-          echo "XanMod commit:"
-          git rev-parse HEAD
+          VERSION="$(make kernelversion | cut -d. -f1-2)"
+          test "$VERSION" = "${{ steps.lts.outputs.series }}"
 
-          echo
-          echo "Kernel version:"
-          make kernelversion
+      - name: Fetch Oracle ARM64 4K config
+        run: |
+          set -euo pipefail
 
+          mkdir -p oracle
 
-      # ============================================================
-      # 7. Verify XanMod version
-      # ============================================================
+          curl -fsSL --retry 5 \
+            "$ORACLE_KCONFIGS/ol10uek8/aarch64/config" \
+            -o oracle/config
 
-      - name: Verify XanMod version
+          test -s oracle/config
+          grep -q '^CONFIG_ARM64=y$' oracle/config
+
+      - name: Prepare Oracle ARM64 4K base
         working-directory: linux
-        shell: bash
         run: |
           set -euo pipefail
 
-          EXPECTED="${{ steps.lts.outputs.series }}"
+          cp ../oracle/config .config
+          make ARCH=arm64 olddefconfig
 
-          ACTUAL="$(
-            make kernelversion |
-            sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/'
-          )"
+          grep -q '^CONFIG_ARM64=y$' .config
+          grep -q '^CONFIG_64BIT=y$' .config
 
-          echo "Expected: $EXPECTED"
-          echo "Actual:   $ACTUAL"
-
-          if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-            echo "ERROR: XanMod kernel series mismatch."
-            exit 1
-          fi
-
-          echo "XanMod version check: PASS"
-
-
-      # ============================================================
-      # 8. Detect latest Oracle UEKR8 ARM64 RPM
-      #
-      # We intentionally use Oracle's actual binary package.
-      #
-      # This gives us the exact production configuration Oracle
-      # ships for ARM64.
-      #
-      # Exclude:
-      #   debug
-      #   devel
-      #   modules
-      #   core
-      #   64k
-      #
-      # We want the normal 4K-page ARM64 kernel.
-      # ============================================================
-
-      - name: Detect latest Oracle UEKR8 ARM64 kernel
-        id: oracle
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Fetching Oracle UEKR8 ARM64 repository..."
-
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --retry 5 \
-            --retry-delay 2 \
-            "${ORACLE_REPO}" \
-            -o oracle-repo.html
-
-          RPM="$(
-            grep -oE \
-              'kernel-uek-[0-9][^"]*\.aarch64\.rpm' \
-              oracle-repo.html |
-            grep -vE \
-              '(-debug|-devel|-modules|-core|-64k)' |
-            sort -V |
-            tail -n1
-          )"
-
-          if [[ -z "$RPM" ]]; then
-            echo "ERROR: Cannot find Oracle UEKR8 ARM64 kernel RPM."
-            exit 1
-          fi
-
-          echo "Selected Oracle RPM:"
-          echo "$RPM"
-
-          echo "rpm=$RPM" >> "$GITHUB_OUTPUT"
-
-
-      # ============================================================
-      # 9. Download Oracle kernel RPM
-      # ============================================================
-
-      - name: Download Oracle ARM64 kernel RPM
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          RPM="${{ steps.oracle.outputs.rpm }}"
-
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --retry 5 \
-            --retry-delay 2 \
-            "${ORACLE_REPO}${RPM}" \
-            -o oracle-kernel.rpm
-
-          test -s oracle-kernel.rpm
-
-          echo
-          echo "RPM information:"
-          rpm -qip oracle-kernel.rpm
-
-
-      # ============================================================
-      # 10. Extract Oracle production .config
-      # ============================================================
-
-      - name: Extract Oracle ARM64 configuration
-        id: oracle_config
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p oracle-root
-
-          cd oracle-root
-
-          rpm2cpio ../oracle-kernel.rpm |
-            cpio -idm --quiet './boot/config-*'
-
-          CONFIG="$(
-            find boot \
-              -maxdepth 1 \
-              -type f \
-              -name 'config-*' |
-            sort -V |
-            tail -n1
-          )"
-
-          if [[ -z "$CONFIG" ]]; then
-            echo "ERROR: Oracle RPM did not contain /boot/config-*."
-            exit 1
-          fi
-
-          echo "Oracle config:"
-          echo "$CONFIG"
-
-          grep '^CONFIG_ARM64=y$' "$CONFIG" || {
-            echo "ERROR: Extracted config is not ARM64."
-            exit 1
-          }
-
-          cp "$CONFIG" "$GITHUB_WORKSPACE/oracle-arm64.config"
-
-          echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
-
-          echo
-          echo "Oracle config version:"
-          grep '^CONFIG_LOCALVERSION=' "$CONFIG" || true
-
-
-      # ============================================================
-      # 11. Show Oracle baseline
-      # ============================================================
-
-      - name: Audit Oracle baseline configuration
-        run: |
-          set -euo pipefail
-
-          echo "================================================"
-          echo "ORACLE UEKR8 ARM64 BASELINE"
-          echo "================================================"
-
-          grep -E \
-            '^(CONFIG_ARM64|CONFIG_64BIT|CONFIG_HZ|CONFIG_PREEMPT|CONFIG_TCP_CONG_BBR|CONFIG_DEFAULT_TCP_CONG|CONFIG_NET_SCH_FQ)=' \
-            oracle-arm64.config || true
-
-
-      # ============================================================
-      # 12. Use Oracle config as ARM64 BASE
-      #
-      # IMPORTANT:
-      #
-      # There is NO:
-      #
-      #   make arm64 defconfig
-      #
-      # Oracle config is the starting point.
-      # ============================================================
-
-      - name: Initialize XanMod from Oracle ARM64 config
+      - name: Apply XanMod compatible optimization
         working-directory: linux
-        shell: bash
         run: |
           set -euo pipefail
 
-          cp \
-            "$GITHUB_WORKSPACE/oracle-arm64.config" \
-            .config
-
-          make \
-            ARCH=arm64 \
-            olddefconfig
-
-
-      # ============================================================
-      # 13. Locate XanMod x86_64 config
-      #
-      # CONFIGS/x86_64 is a directory in the XanMod tree.
-      # Do not assume a fixed filename.
-      # ============================================================
-
-      - name: Locate XanMod x86_64 configuration
-        id: x86config
-        working-directory: linux
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! -d CONFIGS/x86_64 ]]; then
-            echo "ERROR: CONFIGS/x86_64 directory not found."
-            exit 1
-          fi
-
-          X86_CONFIG="$(
-            find CONFIGS/x86_64 \
-              -maxdepth 1 \
-              -type f |
-            sort |
-            head -n1
-          )"
-
-          if [[ -z "$X86_CONFIG" ]]; then
-            echo "ERROR: No file found under CONFIGS/x86_64."
-            exit 1
-          fi
-
-          echo "Selected XanMod x86_64 config:"
-          echo "$X86_CONFIG"
-
-          echo "path=$X86_CONFIG" >> "$GITHUB_OUTPUT"
-
-
-      # ============================================================
-      # 14. Generate compatible XanMod ARM64 optimization fragment
-      #
-      # Strategy:
-      #
-      #   XanMod x86 config
-      #          ↓
-      #   remove x86 architecture/CPU tuning
-      #          ↓
-      #   keep symbols which exist in current Kconfig
-      #          ↓
-      #   ARM64 Kconfig resolves dependencies
-      #
-      # This deliberately does NOT blindly copy the x86 config.
-      # ============================================================
-
-      - name: Generate ARM64 compatible XanMod optimization fragment
-        working-directory: linux
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          X86_CONFIG="${{ steps.x86config.outputs.path }}"
-
-          echo "Generating ARM64-compatible XanMod fragment..."
-
-          # ----------------------------------------------------------
-          # Build a list of all Kconfig symbols known to this kernel.
-          # ----------------------------------------------------------
+          test -f CONFIGS/x86_64/config
 
           git grep -h -E \
-            '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' \
-            -- \
-            ':(exclude)Documentation/**' \
-            ':(exclude)samples/**' \
-            ':(exclude)tools/**' \
-          2>/dev/null |
-          sed -E \
-            's/^[[:space:]]*(menu)?config[[:space:]]+//' |
-          awk '{print $1}' |
-          sort -u > available-kconfig-symbols.txt
-
-          symbol_exists() {
-            grep -qx "$1" available-kconfig-symbols.txt
-          }
+            '^[[:space:]]*config[[:space:]]+[A-Za-z0-9_]+' \
+            -- ':!Documentation' ':!samples' ':!tools' |
+            sed -E 's/^[[:space:]]*config[[:space:]]+//' |
+            awk '{print $1}' |
+            sort -u > ksymbols
 
           : > xanmod-arm64.fragment
 
           while IFS= read -r line; do
+            [[ "$line" =~ ^CONFIG_ ]] || continue
 
-            # Empty / comments.
-            [[ -z "$line" ]] && continue
-            [[ "$line" == \#* ]] && continue
+            symbol="${line%%=*}"
+            name="${symbol#CONFIG_}"
 
-            SYMBOL="${line%%=*}"
-
-            [[ "$SYMBOL" == CONFIG_* ]] || continue
-
-            NAME="${SYMBOL#CONFIG_}"
-
-            # --------------------------------------------------------
-            # Explicit x86 architecture exclusions.
-            # --------------------------------------------------------
-
-            case "$SYMBOL" in
-              CONFIG_X86_*|
-              CONFIG_I386_*|
-              CONFIG_X86_64*)
-                continue
-                ;;
+            case "$symbol" in
+              CONFIG_X86_*|CONFIG_I386_*|CONFIG_X86_64*)
+                continue ;;
+              CONFIG_MCORE*|CONFIG_MNATIVE|CONFIG_MK8*|CONFIG_MK9*)
+                continue ;;
+              CONFIG_MK10*|CONFIG_MZEN*|CONFIG_MATOM*)
+                continue ;;
+              CONFIG_M486*|CONFIG_M586*|CONFIG_M686*)
+                continue ;;
+              CONFIG_CPU_*|CONFIG_ARM64_*|CONFIG_ARM_*)
+                continue ;;
             esac
 
-            # --------------------------------------------------------
-            # Explicit x86 CPU/ISA tuning exclusions.
-            # --------------------------------------------------------
+            grep -qx "$name" ksymbols || continue
+            echo "$line" >> xanmod-arm64.fragment
 
-            case "$SYMBOL" in
-              CONFIG_MCORE*|
-              CONFIG_MNATIVE|
-              CONFIG_MK8*|
-              CONFIG_MK9*|
-              CONFIG_MK10*|
-              CONFIG_MATOM*|
-              CONFIG_MZEN*|
-              CONFIG_MZEN2*|
-              CONFIG_MZEN3*|
-              CONFIG_MZEN4*|
-              CONFIG_MZEN5*|
-              CONFIG_MCYRIX*|
-              CONFIG_MELAN*|
-              CONFIG_MGEODE*|
-              CONFIG_MWINCHIP*|
-              CONFIG_M486*|
-              CONFIG_M586*|
-              CONFIG_M686*)
-                continue
-                ;;
-            esac
+          done < CONFIGS/x86_64/config
 
-            # --------------------------------------------------------
-            # ARM architecture selection must remain controlled by
-            # Oracle ARM64 base + current Kconfig.
-            # --------------------------------------------------------
+          sort -u xanmod-arm64.fragment -o xanmod-arm64.fragment
+          cat xanmod-arm64.fragment >> .config
 
-            case "$SYMBOL" in
-              CONFIG_CPU_*|
-              CONFIG_ARM64_*|
-              CONFIG_ARM_*)
-                continue
-                ;;
-            esac
+          make ARCH=arm64 olddefconfig
 
-            # --------------------------------------------------------
-            # Symbols that don't exist in this XanMod version are
-            # ignored rather than causing an accidental configuration.
-            # --------------------------------------------------------
-
-            if ! symbol_exists "$NAME"; then
-              continue
-            fi
-
-            printf '%s\n' "$line" >> xanmod-arm64.fragment
-
-          done < "$X86_CONFIG"
-
-          sort -u \
-            xanmod-arm64.fragment \
-            -o xanmod-arm64.fragment
-
-          echo
-          echo "Compatible XanMod symbols:"
-          wc -l xanmod-arm64.fragment
-
-          echo
-          echo "Networking:"
-          grep -E \
-            '^CONFIG_(TCP_CONG_BBR|DEFAULT_TCP_CONG|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_FQ_PIE)=' \
-            xanmod-arm64.fragment || true
-
-
-      # ============================================================
-      # 15. Merge XanMod ARM64-compatible optimization
-      # ============================================================
-
-      - name: Merge XanMod ARM64 optimizations
+      - name: Configuration audit
         working-directory: linux
-        shell: bash
         run: |
           set -euo pipefail
 
-          if [[ -s xanmod-arm64.fragment ]]; then
-            cat xanmod-arm64.fragment >> .config
-          fi
+          make ARCH=arm64 olddefconfig
 
-          make \
-            ARCH=arm64 \
-            olddefconfig
+          grep -q '^CONFIG_ARM64=y$' .config
+          grep -q '^CONFIG_64BIT=y$' .config
 
-
-      # ============================================================
-      # 16. Mandatory BBRv3
-      #
-      # HARD REQUIREMENT:
-      #
-      #   CONFIG_TCP_CONG_BBR=y
-      #   CONFIG_DEFAULT_TCP_CONG="bbr"
-      #
-      # This cannot be disabled by Oracle config or XanMod config.
-      # ============================================================
-
-      - name: Force mandatory BBRv3
-        working-directory: linux
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Forcing mandatory BBR..."
-
-          scripts/config \
-            --enable CONFIG_TCP_CONG_BBR
-
-          scripts/config \
-            --set-str CONFIG_DEFAULT_TCP_CONG bbr
-
-          make \
-            ARCH=arm64 \
-            olddefconfig
+          echo "Kernel:"
+          make kernelversion
 
           echo
-          echo "Final BBR settings:"
-
-          grep -E \
-            '^CONFIG_(TCP_CONG_BBR|DEFAULT_TCP_CONG)=' \
-            .config
-
-
-      # ============================================================
-      # 17. FQ policy
-      #
-      # Do NOT blindly force FQ.
-      #
-      # If XanMod x86 configuration enables FQ and the current
-      # ARM64 Kconfig supports it, keep it.
-      #
-      # Otherwise leave the Kconfig/default decision untouched.
-      # ============================================================
-
-      - name: Audit FQ policy
-        working-directory: linux
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "XanMod x86 FQ setting:"
-
-          X86_CONFIG="${{ steps.x86config.outputs.path }}"
-
-          grep -E \
-            '^CONFIG_NET_SCH_FQ=' \
-            "$X86_CONFIG" || true
+          echo "BBR:"
+          grep '^CONFIG_TCP_CONG_BBR=' .config || true
+          grep '^CONFIG_DEFAULT_TCP_CONG=' .config || true
 
           echo
-          echo "Final ARM64 FQ setting:"
+          echo "FQ:"
+          grep '^CONFIG_NET_SCH_FQ=' .config || true
 
-          grep -E \
-            '^CONFIG_NET_SCH_FQ=' \
-            .config || true
-
-
-      # ============================================================
-      # 18. Final Kconfig audit
-      # ============================================================
-
-      - name: Final configuration audit
+      - name: Build kernel
         working-directory: linux
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo
-          echo "================================================"
-          echo "FINAL ARM64 CONFIGURATION"
-          echo "================================================"
-
-          grep -E \
-            '^(CONFIG_ARM64|CONFIG_64BIT|CONFIG_HZ|CONFIG_PREEMPT|CONFIG_PREEMPT_DYNAMIC|CONFIG_TCP_CONG_BBR|CONFIG_DEFAULT_TCP_CONG|CONFIG_NET_SCH_FQ)=' \
-            .config || true
-
-          echo
-          echo "Mandatory checks..."
-
-          # ARM64
-          grep -q '^CONFIG_ARM64=y$' .config || {
-            echo "ERROR: CONFIG_ARM64=y missing."
-            exit 1
-          }
-
-          # BBR built-in
-          grep -q '^CONFIG_TCP_CONG_BBR=y$' .config || {
-            echo "ERROR: CONFIG_TCP_CONG_BBR=y missing."
-            exit 1
-          }
-
-          # BBR default
-          grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr"$' .config || {
-            echo "ERROR: BBR is not the default TCP congestion controller."
-            exit 1
-          }
-
-          echo
-          echo "ARM64: PASS"
-          echo "BBR built-in: PASS"
-          echo "BBR default: PASS"
-
-
-  # 19. BBRv3 implementation audit
-      #
-      # XanMod has historically carried the BBRv3 patch series.
-      #
-      # We verify the implementation contains BBRv3-specific state
-      # instead of merely checking CONFIG_TCP_CONG_BBR.
-      # ============================================================
-
-      - name: Audit BBRv3 implementation
-        working-directory: linux
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          FILE="net/ipv4/tcp_bbr.c"
-
-          test -f "$FILE" || {
-            echo "ERROR: $FILE not found."
-            exit 1
-          }
-
-          echo "Checking BBR source for v3 implementation markers..."
-
-          # BBRv3 has state which is not present in the old upstream
-          # BBR implementation, including inflight_hi/inflight_lo and
-          # BBR version reporting.
-          #
-          # We require multiple independent markers to avoid a false
-          # positive.
-
-          MARKER_COUNT=0
-
-          grep -Eq \
-            'inflight_hi|inflight_lo' \
-            "$FILE" && MARKER_COUNT=$((MARKER_COUNT + 1))
-
-          grep -Eq \
-            'BBR_VERSION|bbr_version' \
-            "$FILE" && MARKER_COUNT=$((MARKER_COUNT + 1))
-
-          grep -Eq \
-            'BW_PROBE_UP|PROBE_BW_UP|bw_probe_up' \
-            "$FILE" && MARKER_COUNT=$((MARKER_COUNT + 1))
-
-          grep -Eq \
-            'ecn_alpha|startup_ecn_rounds|ecn_eligible' \
-            "$FILE" && MARKER_COUNT=$((MARKER_COUNT + 1))
-
-          echo "BBRv3 marker groups detected: $MARKER_COUNT"
-
-          if [[ "$MARKER_COUNT" -lt 3 ]]; then
-            echo
-            echo "ERROR: BBRv3 implementation could not be positively verified."
-            echo
-            echo "This build will NOT be released."
-            exit 1
-          fi
-
-          echo "BBRv3 source audit: PASS"
-
-
-      # ============================================================
-      # 20. Kernel configuration sanity
-      # ============================================================
-
-      - name: Run kernel config sanity check
-        working-directory: linux
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            olddefconfig
-
-          # Ensure olddefconfig did not change mandatory BBR settings.
-          grep -q '^CONFIG_TCP_CONG_BBR=y$' .config
-          grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr"$' .config
-
-          echo "Kconfig sanity: PASS"
-
-
-      # ============================================================
-      # 21. Build kernel
-      # ============================================================
-
-      - name: Build ARM64 kernel
-        working-directory: linux
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -820,14 +201,8 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             -j"$(nproc)"
 
-
-      # ============================================================
-      # 22. Build Debian packages
-      # ============================================================
-
       - name: Build Debian packages
         working-directory: linux
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -838,74 +213,26 @@ jobs:
             -j"$(nproc)" \
             LOCALVERSION=-xanmod-arm64
 
-
-      # ============================================================
-      # 23. Verify package output
-      # ============================================================
-
-      - name: Verify Debian packages
-        shell: bash
+      - name: Package
         run: |
           set -euo pipefail
 
-          echo "Generated packages:"
+          test -n "$(find linux -maxdepth 1 -name '*.deb' -print -quit)"
 
-          find linux \
-            -maxdepth 1 \
-            -type f \
-            -name '*.deb' \
-            -print
-
-          COUNT="$(
-            find linux \
-              -maxdepth 1 \
-              -type f \
-              -name '*.deb' |
-            wc -l
-          )"
-
-          if [[ "$COUNT" -eq 0 ]]; then
-            echo "ERROR: No Debian packages were generated."
-            exit 1
-          fi
-
-          sha256sum \
-            linux/*.deb \
-            > SHA256SUMS.txt
-
-
-      # ============================================================
-      # 24. Save final config + build information
-      # ============================================================
-
-      - name: Save build metadata
-        working-directory: linux
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cp \
-            .config \
-            ../config-arm64
+          sha256sum linux/*.deb > SHA256SUMS.txt
+          cp linux/.config config-arm64
 
           {
             echo "XANMOD_TAG=${{ steps.xanmod.outputs.tag }}"
-            echo "XANMOD_COMMIT=$(git rev-parse HEAD)"
-            echo "KERNEL_VERSION=$(make kernelversion)"
-            echo "LINUX_LTS_SERIES=${{ steps.lts.outputs.series }}"
-            echo "ORACLE_REPO=${ORACLE_REPO}"
-            echo "ORACLE_RPM=${{ steps.oracle.outputs.rpm }}"
-            echo "ORACLE_CONFIG=${{ steps.oracle_config.outputs.config }}"
-            echo "BUILD_ARCH=arm64"
+            echo "XANMOD_COMMIT=$(cd linux && git rev-parse HEAD)"
+            echo "KERNEL_VERSION=$(cd linux && make kernelversion)"
+            echo "ARCH=arm64"
+            echo "PAGE_SIZE=4K"
+            echo "ORACLE_BASE=Oracle Linux 10 UEK8 ARM64"
             echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } > ../BUILD-INFO.txt
+          } > BUILD-INFO.txt
 
-
-      # ============================================================
-      # 25. Upload artifact
-      # ============================================================
-
-      - name: Upload build artifacts
+      - name: Artifact
         uses: actions/upload-artifact@v4
         with:
           name: xanmod-arm64-lts-${{ steps.xanmod.outputs.tag }}
@@ -914,22 +241,13 @@ jobs:
             SHA256SUMS.txt
             config-arm64
             BUILD-INFO.txt
-            oracle-arm64.config
           if-no-files-found: error
 
-
-      # ============================================================
-      # 26. GitHub Release
-      #
-      # Only reached if ALL audits passed.
-      # ============================================================
-
-      - name: Create GitHub Release
+      - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.xanmod.outputs.tag }}-arm64
           name: XanMod ARM64 LTS ${{ steps.xanmod.outputs.tag }}
-          prerelease: false
           generate_release_notes: true
           files: |
             linux/*.deb
