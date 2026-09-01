@@ -53,6 +53,7 @@ jobs:
       - name: Setup ccache
         run: |
           set -euo pipefail
+
           echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
 
@@ -70,52 +71,60 @@ jobs:
           set -euo pipefail
 
           SERIES="$(
-            curl -fsSL --retry 5 --retry-delay 2 "$KERNEL_RELEASES" |
+            curl -fsSL \
+              --retry 5 \
+              --retry-delay 2 \
+              "$KERNEL_RELEASES" |
             python3 -c '
-          import json,sys
+          import json
+          import sys
 
-          d=json.load(sys.stdin)
+          data = json.load(sys.stdin)
+          releases = []
 
-          versions=[]
-
-          for r in d["releases"]:
-              if r.get("moniker") != "longterm":
+          for item in data.get("releases", []):
+              if item.get("moniker") != "longterm":
                   continue
 
-              v=r["version"]
+              version = item.get("version", "")
 
               try:
-                  p=tuple(map(int,v.split(".")))
+                  parts = tuple(map(int, version.split(".")))
               except ValueError:
                   continue
 
-              versions.append((p,v))
+              releases.append((parts, version))
 
-          if not versions:
+          if not releases:
               raise SystemExit("No Linux LTS release found")
 
-          versions.sort(reverse=True)
+          releases.sort(reverse=True)
 
-          print(".".join(versions[0][1].split(".")[:2]))
+          version = releases[0][1]
+          print(".".join(version.split(".")[:2]))
           '
           )"
 
           test -n "$SERIES"
 
           echo "series=$SERIES" >> "$GITHUB_OUTPUT"
-          echo "Linux LTS series: $SERIES"
+          echo "Latest LTS series: $SERIES"
 
-      - name: Detect latest XanMod LTS tag
+      - name: Detect latest XanMod LTS
         id: xanmod
         run: |
           set -euo pipefail
 
           SERIES="${{ steps.lts.outputs.series }}"
+          PREFIX="${SERIES//./\\.}"
 
           TAG="$(
-            git ls-remote --tags --refs "$XANMOD_REPO" |
+            git ls-remote \
+              --tags \
+              --refs \
+              "$XANMOD_REPO" |
             awk -F/ '{print $NF}' |
-            grep -E "^${SERIES//./\\.}\.[0-9]+-xanmod[0-9]+$" |
+            grep -E "^${PREFIX}\.[0-9]+-xanmod[0-9]+$" |
             sort -V |
             tail -n1
           )"
@@ -135,6 +144,8 @@ jobs:
             "$XANMOD_REPO" \
             linux
 
+          test -s linux/CONFIGS/x86_64
+
       - name: Build ARM64 configuration
         working-directory: linux
         run: |
@@ -145,27 +156,18 @@ jobs:
 
           make defconfig
 
-          cp .config ../configs-arm64-default.config
+          mkdir -p ../configs
 
-          curl -fsSL \
-            --retry 5 \
-            --retry-delay 2 \
-            "${XANMOD_REPO%/}/-/raw/${{ steps.xanmod.outputs.tag }}/CONFIGS/x86_64" \
-            -o ../xanmod-x86_64.config
+          cp .config \
+            ../configs/arm64-defconfig.config
+
+          cp CONFIGS/x86_64 \
+            ../xanmod-x86_64.config
 
           test -s ../xanmod-x86_64.config
 
-          cp .config ../arm64-base.config
-
-          ./scripts/kconfig/merge_config.sh \
-            -m \
-            .config \
-            ../xanmod-x86_64.config \
-            >/tmp/xanmod-probe.log 2>&1 || true
-
-          cp .config ../xanmod-probe.config
-
-          cp ../arm64-base.config .config
+          cp .config \
+            ../arm64-base.config
 
           python3 <<'PY'
           import re
@@ -201,22 +203,7 @@ jobs:
           changes = {}
           skipped = []
 
-          blocked = {
-              "CONFIG_X86",
-              "CONFIG_X86_64",
-              "CONFIG_X86_32",
-              "CONFIG_IA32",
-              "CONFIG_X86_5LEVEL",
-              "CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS",
-              "CONFIG_X86_SGX",
-              "CONFIG_X86_USER_SHADOW_STACK",
-          }
-
           for sym, value in xanmod.items():
-
-              if sym in blocked:
-                  skipped.append(sym)
-                  continue
 
               if sym not in arm:
                   skipped.append(sym)
@@ -243,12 +230,15 @@ jobs:
           print(f"Skipped symbols: {len(skipped)}")
 
           if skipped:
-              print("\nSkipped:")
+              print("\nSkipped symbols:")
+
               for sym in sorted(skipped):
                   print(sym)
 
           if not changes:
-              raise SystemExit("No compatible XanMod configuration changes found")
+              raise SystemExit(
+                  "No compatible XanMod ARM64 configuration changes found"
+              )
           PY
 
           test -s ../xanmod-arm64.fragment
@@ -262,12 +252,10 @@ jobs:
 
           make olddefconfig
 
-          mkdir -p ../configs
-
           cp .config \
             ../configs/xanmod-arm64.config
 
-      - name: Validate ARM64 configuration
+      - name: Validate configuration
         working-directory: linux
         run: |
           set -euo pipefail
@@ -319,7 +307,10 @@ jobs:
 
           mkdir -p release
 
-          find . -maxdepth 1 -type f -name "*.deb" \
+          find . \
+            -maxdepth 1 \
+            -type f \
+            -name "*.deb" \
             -exec cp {} release/ \;
 
           test -n "$(find release -type f -name '*.deb' -print -quit)"
