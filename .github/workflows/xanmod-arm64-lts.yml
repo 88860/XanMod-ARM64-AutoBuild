@@ -21,6 +21,18 @@ jobs:
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             ccache jq
 
+      - name: Setup ccache
+        run: |
+          echo 'export PATH="/usr/lib/ccache:$PATH"' >> $GITHUB_ENV
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
       - name: Detect latest LTS tag
         id: tag
         run: |
@@ -38,7 +50,6 @@ jobs:
           cd linux
           make ARCH=arm64 defconfig
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
-          # 打包成 deb
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bindeb-pkg -j$(nproc)
 
       - name: Generate SHA256 checksums
