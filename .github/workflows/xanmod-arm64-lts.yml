@@ -19,55 +19,114 @@ jobs:
       tag: ${{ steps.check.outputs.tag }}
 
     steps:
-      - name: Check latest XanMod
+      - name: Check XanMod LTS
         id: check
         run: |
           set -euo pipefail
 
           sudo apt-get update
-          sudo apt-get install -y curl python3 git
-
-          SERIES="$(
-            curl -fsSL --retry 5 --retry-delay 2 \
-              https://www.kernel.org/releases.json |
-            python3 -c '
-          import json,sys
-          d=json.load(sys.stdin)
-          v=[x["version"] for x in d["releases"] if x.get("moniker")=="longterm"]
-          v.sort(key=lambda x:tuple(map(int,x.split("."))),reverse=True)
-          print(v[0].rsplit(".",1)[0])
-          '
-          )"
-
-          test -n "$SERIES"
-
-          ESCAPED="${SERIES//./\\.}"
+          sudo apt-get install -y git python3
 
           TAG="$(
             git ls-remote --tags --refs "$XANMOD_REPO" |
-            sed 's#.*refs/tags/##' |
-            grep -E "^${ESCAPED}-[0-9]+-xanmod[0-9]+$" |
-            sort -V |
-            tail -n1
+            python3 <<'PY'
+          import sys
+          import re
+
+          tags = []
+
+          for line in sys.stdin:
+              tag = line.rsplit("/", 1)[-1].strip()
+
+              if re.fullmatch(
+                  r"[0-9]+\.[0-9]+\.[0-9]+-xanmod[0-9]+",
+                  tag
+              ):
+                  tags.append(tag)
+
+          if not tags:
+              raise SystemExit("No XanMod stable tags found")
+
+          def version(tag):
+              m = re.fullmatch(
+                  r"([0-9]+)\.([0-9]+)\.([0-9]+)-xanmod([0-9]+)",
+                  tag
+              )
+              return tuple(map(int, m.groups()))
+
+          tags.sort(key=version, reverse=True)
+
+          print(tags[0])
+          PY
           )"
 
           test -n "$TAG"
 
-          echo "Latest LTS series: $SERIES"
-          echo "Latest XanMod tag: $TAG"
+          SERIES="$(
+            printf '%s\n' "$TAG" |
+            sed -E 's/^([0-9]+\.[0-9]+)\.[0-9]+-.*/\1/'
+          )"
+
+          echo "Latest XanMod stable tag: $TAG"
+          echo "Detected series: $SERIES"
+
+          LTS_TAG="$(
+            git ls-remote --tags --refs "$XANMOD_REPO" |
+            python3 - "$SERIES" <<'PY'
+          import sys
+          import re
+
+          series = sys.argv[1]
+          tags = []
+
+          pattern = re.compile(
+              rf"^{re.escape(series)}\.[0-9]+-xanmod[0-9]+$"
+          )
+
+          for line in sys.stdin:
+              tag = line.rsplit("/", 1)[-1].strip()
+
+              if pattern.fullmatch(tag):
+                  tags.append(tag)
+
+          if not tags:
+              raise SystemExit(
+                  f"No XanMod tags found for series {series}"
+              )
+
+          def version(tag):
+              m = re.fullmatch(
+                  rf"{re.escape(series)}\.([0-9]+)-xanmod([0-9]+)",
+                  tag
+              )
+              return int(m.group(1)), int(m.group(2))
+
+          tags.sort(key=version, reverse=True)
+
+          print(tags[0])
+          PY
+          )"
+
+          test -n "$LTS_TAG"
+
+          echo "Selected XanMod LTS tag: $LTS_TAG"
 
           if git ls-remote --tags --refs \
             "https://github.com/${GITHUB_REPOSITORY}.git" \
-            "refs/tags/${TAG}-arm64" |
+            "refs/tags/${LTS_TAG}-arm64" |
             grep -q .; then
-            echo "Already released: ${TAG}-arm64"
+
+            echo "Already released: ${LTS_TAG}-arm64"
             echo "build=false" >> "$GITHUB_OUTPUT"
+
           else
-            echo "New version detected"
+
+            echo "New XanMod LTS detected"
             echo "build=true" >> "$GITHUB_OUTPUT"
+
           fi
 
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=$LTS_TAG" >> "$GITHUB_OUTPUT"
 
   build:
     needs: check
@@ -103,6 +162,10 @@ jobs:
             kmod \
             python3
 
+          gcc-aarch64-linux-gnu-gcc --version
+          make --version
+          python3 --version
+
       - name: Setup ccache
         run: |
           echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
@@ -137,21 +200,30 @@ jobs:
           make defconfig
           cp .config /tmp/arm64-defconfig
 
-          curl -fsSL --retry 5 --retry-delay 2 \
-            "${XANMOD_REPO%/}/-/raw/${{ needs.check.outputs.tag }}/CONFIGS/x86_64" \
+          CONFIG_URL="${XANMOD_REPO%/}/-/raw/${{ needs.check.outputs.tag }}/CONFIGS/x86_64"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 5 \
+            --retry-delay 2 \
+            "$CONFIG_URL" \
             -o /tmp/xanmod-x86_64.config
 
           test -s /tmp/xanmod-x86_64.config
 
           make allmodconfig >/dev/null
           cp .config /tmp/arm64-symbols
+          cp /tmp/arm64-defconfig .config
 
           python3 <<'PY'
           import re
           from pathlib import Path
 
-          SRC = Path("/tmp/xanmod-x86_64.config")
-          ARM = Path("/tmp/arm64-symbols")
+          XANMOD = Path("/tmp/xanmod-x86_64.config")
+          ARM64 = Path("/tmp/arm64-symbols")
           OUT = Path("/tmp/xanmod-arm64.fragment")
 
           SET = re.compile(r"^(CONFIG_[A-Za-z0-9_]+)=(.*)$")
@@ -174,50 +246,49 @@ jobs:
 
               return result
 
-          xanmod = parse(SRC)
-          arm = parse(ARM)
+          xanmod = parse(XANMOD)
+          arm64 = parse(ARM64)
 
           changes = {}
           skipped = []
 
-          for sym, value in xanmod.items():
+          for symbol, value in xanmod.items():
 
-              if sym not in arm:
-                  skipped.append(sym)
+              if symbol not in arm64:
+                  skipped.append(symbol)
                   continue
 
-              if arm[sym] != value:
-                  changes[sym] = value
+              if arm64[symbol] != value:
+                  changes[symbol] = value
 
           with OUT.open("w") as f:
-              for sym in sorted(changes):
-                  value = changes[sym]
+              for symbol in sorted(changes):
+                  value = changes[symbol]
 
                   if value == "n":
-                      f.write(f"# {sym} is not set\n")
+                      f.write(f"# {symbol} is not set\n")
                   else:
-                      f.write(f"{sym}={value}\n")
+                      f.write(f"{symbol}={value}\n")
 
           print(f"XanMod symbols: {len(xanmod)}")
-          print(f"ARM64 symbols: {len(arm)}")
-          print(f"Compatible symbols: {len(xanmod)-len(skipped)}")
+          print(f"ARM64 symbols: {len(arm64)}")
+          print(f"Compatible symbols: {len(xanmod) - len(skipped)}")
           print(f"Changed symbols: {len(changes)}")
           print(f"Skipped symbols: {len(skipped)}")
 
           if skipped:
-              print("\nSkipped:")
-              for sym in skipped:
-                  print(sym)
+              print("Skipped architecture-specific symbols:")
+
+              for symbol in skipped:
+                  print(symbol)
 
           if not changes:
               raise SystemExit(
-                  "No compatible XanMod ARM64 configuration changes found"
+                  "No compatible XanMod configuration changes found"
               )
           PY
 
           test -s /tmp/xanmod-arm64.fragment
-
-          cp /tmp/arm64-defconfig .config
 
           ./scripts/kconfig/merge_config.sh \
             -m \
@@ -250,6 +321,11 @@ jobs:
             exit 1
           fi
 
+          if grep -q '^CONFIG_X86_32=y$' "$CFG"; then
+            echo "ERROR: CONFIG_X86_32 enabled"
+            exit 1
+          fi
+
       - name: Build kernel
         working-directory: linux
         run: |
@@ -266,11 +342,28 @@ jobs:
 
           ccache -s
 
+      - name: Verify packages
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+
+          packages=(./*.deb)
+
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "ERROR: No Debian packages generated"
+            exit 1
+          fi
+
+          dpkg-deb --info "${packages[0]}"
+
       - name: Generate checksums
         run: |
           set -euo pipefail
 
           sha256sum ./*.deb > SHA256SUMS.txt
+
+          cat SHA256SUMS.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
