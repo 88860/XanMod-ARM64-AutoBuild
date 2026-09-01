@@ -25,9 +25,7 @@ jobs:
       - name: Install dependencies
         run: |
           set -euo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y \
             build-essential \
             bc \
@@ -48,12 +46,8 @@ jobs:
             kmod \
             python3
 
-          command -v aarch64-linux-gnu-gcc
-
       - name: Setup ccache
         run: |
-          set -euo pipefail
-
           echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
 
@@ -61,7 +55,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ${{ runner.os }}-xanmod-arm64-${{ github.run_id }}
+          key: ${{ runner.os }}-xanmod-arm64-${{ github.ref_name }}
           restore-keys: |
             ${{ runner.os }}-xanmod-arm64-
 
@@ -71,65 +65,48 @@ jobs:
           set -euo pipefail
 
           SERIES="$(
-            curl -fsSL \
-              --retry 5 \
-              --retry-delay 2 \
-              "$KERNEL_RELEASES" |
+            curl -fsSL --retry 5 --retry-delay 2 "$KERNEL_RELEASES" |
             python3 -c '
-          import json
-          import sys
-
-          data = json.load(sys.stdin)
-          releases = []
-
-          for item in data.get("releases", []):
-              if item.get("moniker") != "longterm":
-                  continue
-
-              version = item.get("version", "")
-
-              try:
-                  parts = tuple(map(int, version.split(".")))
-              except ValueError:
-                  continue
-
-              releases.append((parts, version))
-
-          if not releases:
-              raise SystemExit("No Linux LTS release found")
-
-          releases.sort(reverse=True)
-
-          version = releases[0][1]
-          print(".".join(version.split(".")[:2]))
+          import json,sys
+          d=json.load(sys.stdin)
+          v=[]
+          for x in d["releases"]:
+              if x.get("moniker")=="longterm":
+                  s=x["version"]
+                  try:
+                      k=tuple(map(int,s.split(".")))
+                      v.append((k,s))
+                  except:
+                      pass
+          v.sort(reverse=True)
+          print(v[0][1].rsplit(".",1)[0])
           '
           )"
 
           test -n "$SERIES"
 
           echo "series=$SERIES" >> "$GITHUB_OUTPUT"
-          echo "Latest LTS series: $SERIES"
+          echo "LTS series: $SERIES"
 
-      - name: Detect latest XanMod LTS
+      - name: Detect latest XanMod LTS tag
         id: xanmod
         run: |
           set -euo pipefail
 
           SERIES="${{ steps.lts.outputs.series }}"
-          PREFIX="${SERIES//./\\.}"
 
           TAG="$(
-            git ls-remote \
-              --tags \
-              --refs \
-              "$XANMOD_REPO" |
-            awk -F/ '{print $NF}' |
-            grep -E "^${PREFIX}\.[0-9]+-xanmod[0-9]+$" |
+            git ls-remote --tags --refs "$XANMOD_REPO" |
+            sed 's#.*refs/tags/##' |
+            grep -E "^${SERIES//./\\.}\.[0-9]+-xanmod[0-9]+$" |
             sort -V |
             tail -n1
           )"
 
-          test -n "$TAG"
+          if [ -z "$TAG" ]; then
+            echo "No XanMod LTS tag found for $SERIES"
+            exit 1
+          fi
 
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "XanMod tag: $TAG"
@@ -151,73 +128,65 @@ jobs:
         run: |
           set -euo pipefail
 
-          export ARCH="$ARCH"
-          export CROSS_COMPILE="$CROSS_COMPILE"
+          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" defconfig
+          cp .config ../arm64-base.config
 
-          make defconfig
-
-          mkdir -p ../configs
-
-          cp .config \
-            ../configs/arm64-defconfig.config
-
-          cp CONFIGS/x86_64 \
-            ../xanmod-x86_64.config
-
-          test -s ../xanmod-x86_64.config
-
-          cp .config \
-            ../arm64-base.config
+          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" allmodconfig >/dev/null
+          cp .config ../arm64-symbols.config
 
           python3 <<'PY'
           import re
           from pathlib import Path
 
-          XANMOD = Path("../xanmod-x86_64.config")
-          ARM = Path("../arm64-base.config")
-          OUT = Path("../xanmod-arm64.fragment")
+          XANMOD = Path("CONFIGS/x86_64")
+          ARM = Path("../arm64-symbols.config")
+          BASE = Path("../arm64-base.config")
+          FRAGMENT = Path("../xanmod-arm64.fragment")
 
           SET = re.compile(r"^(CONFIG_[A-Za-z0-9_]+)=(.*)$")
           UNSET = re.compile(r"^# (CONFIG_[A-Za-z0-9_]+) is not set$")
 
           def parse(path):
               result = {}
-
               for line in path.read_text().splitlines():
                   m = SET.match(line)
-
                   if m:
                       result[m.group(1)] = m.group(2)
                       continue
 
                   m = UNSET.match(line)
-
                   if m:
                       result[m.group(1)] = "n"
-
               return result
 
           xanmod = parse(XANMOD)
           arm = parse(ARM)
 
-          changes = {}
-          skipped = []
+          blocked = {
+              "CONFIG_X86",
+              "CONFIG_X86_64",
+              "CONFIG_X86_32",
+              "CONFIG_IA32",
+              "CONFIG_X86_5LEVEL",
+              "CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS",
+              "CONFIG_X86_SGX",
+              "CONFIG_X86_USER_SHADOW_STACK",
+          }
+
+          candidate = {}
 
           for sym, value in xanmod.items():
+              if sym in blocked:
+                  continue
 
               if sym not in arm:
-                  skipped.append(sym)
                   continue
 
-              if arm[sym] == value:
-                  continue
+              candidate[sym] = value
 
-              changes[sym] = value
-
-          with OUT.open("w") as f:
-              for sym in sorted(changes):
-                  value = changes[sym]
-
+          with FRAGMENT.open("w") as f:
+              for sym in sorted(candidate):
+                  value = candidate[sym]
                   if value == "n":
                       f.write(f"# {sym} is not set\n")
                   else:
@@ -225,20 +194,7 @@ jobs:
 
           print(f"XanMod symbols: {len(xanmod)}")
           print(f"ARM64 symbols: {len(arm)}")
-          print(f"Compatible symbols: {len(xanmod) - len(skipped)}")
-          print(f"Changed symbols: {len(changes)}")
-          print(f"Skipped symbols: {len(skipped)}")
-
-          if skipped:
-              print("\nSkipped symbols:")
-
-              for sym in sorted(skipped):
-                  print(sym)
-
-          if not changes:
-              raise SystemExit(
-                  "No compatible XanMod ARM64 configuration changes found"
-              )
+          print(f"Candidate symbols: {len(candidate)}")
           PY
 
           test -s ../xanmod-arm64.fragment
@@ -250,17 +206,96 @@ jobs:
             .config \
             ../xanmod-arm64.fragment
 
-          make olddefconfig
+          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
 
-          cp .config \
-            ../configs/xanmod-arm64.config
+          cp .config ../xanmod-arm64-tested.config
+
+          python3 <<'PY'
+          import re
+          from pathlib import Path
+
+          XANMOD = Path("CONFIGS/x86_64")
+          RESULT = Path("../xanmod-arm64-tested.config")
+          OUT = Path("../xanmod-arm64.fragment")
+
+          SET = re.compile(r"^(CONFIG_[A-Za-z0-9_]+)=(.*)$")
+          UNSET = re.compile(r"^# (CONFIG_[A-Za-z0-9_]+) is not set$")
+
+          def parse(path):
+              result = {}
+              for line in path.read_text().splitlines():
+                  m = SET.match(line)
+                  if m:
+                      result[m.group(1)] = m.group(2)
+                      continue
+
+                  m = UNSET.match(line)
+                  if m:
+                      result[m.group(1)] = "n"
+              return result
+
+          xanmod = parse(XANMOD)
+          tested = parse(RESULT)
+
+          blocked = {
+              "CONFIG_X86",
+              "CONFIG_X86_64",
+              "CONFIG_X86_32",
+              "CONFIG_IA32",
+              "CONFIG_X86_5LEVEL",
+              "CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS",
+              "CONFIG_X86_SGX",
+              "CONFIG_X86_USER_SHADOW_STACK",
+          }
+
+          final = {}
+
+          for sym, value in xanmod.items():
+              if sym in blocked:
+                  continue
+
+              if sym not in tested:
+                  continue
+
+              if tested[sym] != value:
+                  continue
+
+              final[sym] = value
+
+          with OUT.open("w") as f:
+              for sym in sorted(final):
+                  value = final[sym]
+                  if value == "n":
+                      f.write(f"# {sym} is not set\n")
+                  else:
+                      f.write(f"{sym}={value}\n")
+
+          print(f"Verified XanMod ARM64 symbols: {len(final)}")
+
+          if not final:
+              raise SystemExit("No verified XanMod ARM64 configuration changes")
+          PY
+
+          test -s ../xanmod-arm64.fragment
+
+          cp ../arm64-base.config .config
+
+          ./scripts/kconfig/merge_config.sh \
+            -m \
+            .config \
+            ../xanmod-arm64.fragment
+
+          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+
+          mkdir -p ../configs
+
+          cp .config ../configs/xanmod-arm64.config
 
       - name: Validate configuration
-        working-directory: linux
         run: |
           set -euo pipefail
 
-          CFG="../configs/xanmod-arm64.config"
+          CFG="configs/xanmod-arm64.config"
 
           test -s "$CFG"
 
@@ -282,7 +317,7 @@ jobs:
             exit 1
           fi
 
-          echo "ARM64 configuration validated."
+          echo "ARM64 configuration validation passed."
 
       - name: Build kernel
         working-directory: linux
@@ -291,12 +326,11 @@ jobs:
 
           export ARCH="$ARCH"
           export CROSS_COMPILE="$CROSS_COMPILE"
-          export CC="ccache aarch64-linux-gnu-gcc"
+          export CC="ccache ${CROSS_COMPILE}gcc"
 
           ccache -z
 
           make -j"$(nproc)"
-
           make bindeb-pkg -j"$(nproc)"
 
           ccache -s
@@ -307,37 +341,36 @@ jobs:
 
           mkdir -p release
 
-          find . \
-            -maxdepth 1 \
-            -type f \
-            -name "*.deb" \
+          find . -maxdepth 1 -type f \
+            -name '*.deb' \
             -exec cp {} release/ \;
 
-          test -n "$(find release -type f -name '*.deb' -print -quit)"
+          test -n "$(find release -name '*.deb' -type f)"
 
-          cd release
+          sha256sum release/*.deb > release/SHA256SUMS.txt
 
-          sha256sum ./*.deb > SHA256SUMS.txt
+          cp configs/xanmod-arm64.config release/
+
+          ls -lh release/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: xanmod-arm64-${{ steps.xanmod.outputs.tag }}
-          path: |
-            release/*.deb
-            release/SHA256SUMS.txt
-            configs/xanmod-arm64.config
+          path: release/*
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.xanmod.outputs.tag }}-arm64
-          name: XanMod ARM64 ${{ steps.xanmod.outputs.tag }}
-          generate_release_notes: true
-          files: |
-            release/*.deb
-            release/SHA256SUMS.txt
-            configs/xanmod-arm64.config
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.xanmod.outputs.tag }}-arm64"
+
+          gh release create "$TAG" \
+            release/* \
+            --title "XanMod ARM64 ${{ steps.xanmod.outputs.tag }}" \
+            --generate-notes
 
       - name: Commit configuration
         run: |
