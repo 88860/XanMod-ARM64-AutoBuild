@@ -19,7 +19,7 @@ jobs:
           sudo apt install -y build-essential flex bison libncurses5-dev \
             libssl-dev libelf-dev bc git curl wget \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            ccache jq
+            ccache jq fakeroot dpkg-dev
 
       - name: Setup ccache
         run: |
