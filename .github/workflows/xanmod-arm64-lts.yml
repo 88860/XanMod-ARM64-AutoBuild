@@ -16,10 +16,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y build-essential flex bison libncurses5-dev \
-            libssl-dev libelf-dev bc git curl wget \
+          sudo apt install -y build-essential flex bison bc git curl wget \
+            libncurses5-dev libssl-dev libelf-dev \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            ccache jq fakeroot dpkg-dev
+            fakeroot dpkg-dev ccache jq \
+            xz-utils rsync kmod python3
 
       - name: Setup ccache
         run: |
