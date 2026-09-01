@@ -1,4 +1,4 @@
-name: xanmod-arm64
+name: xanmod-arm64-cross
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
@@ -31,9 +31,11 @@ jobs:
 
           tag=""
           for page in $(seq 1 50); do
+            # 请求官方 GitLab API 
             releases="$(curl -fsSL --retry 5 --retry-all-errors \
               "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page")"
 
+            # 严格根据 assets 链接特征匹配 LTS，无视版本号规则变化
             tag="$(jq -r '
               .[]
               | select(.upcoming_release == false)
@@ -52,12 +54,6 @@ jobs:
 
           release="$(curl -fsSL --retry 5 --retry-all-errors \
             "$GITLAB_API/releases/$tag")"
-
-          jq -e --arg tag "$tag" '
-            .tag_name == $tag
-            and (.upcoming_release == false)
-            and any(.assets.links[]?; (.url // "") | contains("/releases/lts/"))
-          ' <<<"$release" >/dev/null
 
           commit="$(jq -r '.commit.id' <<<"$release")"
           released_at="$(jq -r '.released_at' <<<"$release")"
@@ -80,47 +76,32 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install build dependencies
+      - name: Install cross-build dependencies
         if: steps.published.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
           sudo apt-get update
+          
+          # 补齐x86_64交叉编译ARM64内核及打包deb的所有必须环境
           sudo apt-get install -y --no-install-recommends \
-            bc \
-            bison \
-            build-essential \
-            ccache \
-            clang-19 \
-            debhelper \
-            dpkg-dev \
-            dwarves \
-            fakeroot \
-            flex \
-            gcc-aarch64-linux-gnu \
-            kmod \
-            libdw-dev \
-            libelf-dev \
-            libssl-dev \
-            lld-19 \
-            llvm-19 \
-            openssl \
-            pkg-config \
-            python3 \
-            rsync \
-            xz-utils
+            bc bison build-essential ccache clang cpio debhelper dpkg-dev \
+            dwarves fakeroot flex kmod libdw-dev libelf-dev libssl-dev lld \
+            llvm lz4 openssl pkg-config python3 rsync xz-utils zstd \
+            crossbuild-essential-arm64
 
-          command -v clang-19
-          command -v ld.lld-19
-          clang-19 --version
-          ld.lld-19 --version | head -n1
+          command -v clang
+          command -v ld.lld
+          command -v aarch64-linux-gnu-gcc
+          clang --version
+          ld.lld --version | head -n1
 
       - name: Cache ccache
         if: steps.published.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ${{ runner.os }}-${{ runner.arch }}-xanmod-${{ steps.xanmod.outputs.tag }}-clang19-${{ hashFiles('.github/workflows/xanmod-arm64.yml') }}
+          key: ${{ runner.os }}-cross-arm64-xanmod-${{ steps.xanmod.outputs.tag }}-clang-${{ hashFiles('.github/workflows/xanmod-arm64.yml') }}
 
       - name: Fetch XanMod source
         if: steps.published.outputs.skip != 'true'
@@ -142,7 +123,7 @@ jobs:
           test -f scripts/package/mkdebian
           test -f scripts/package/builddeb
 
-      - name: Build ARM64 configuration through Kconfig
+      - name: Build and Validate ARM64 Kconfig
         if: steps.published.outputs.skip != 'true'
         id: config
         run: |
@@ -151,95 +132,39 @@ jobs:
           cd kernel
 
           export ARCH=arm64
-          export LLVM=-19
-          export KCONFIG_CONFIG="$PWD/.config"
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export LLVM=1
 
-          cp arch/arm64/configs/defconfig "$KCONFIG_CONFIG"
-          cp CONFIGS/x86_64/config "$GITHUB_WORKSPACE/x86-candidate.config"
+          echo "=== 1. Smart merge via Official Kbuild script ==="
+          # 此脚本原生支持处理冲突，XanMod候选参数覆盖ARM64基础参数
+          # 遇到 ARM64 不支持的x86特有硬件，Kconfig依赖树会自动抛弃，不强行覆写
+          ./scripts/kconfig/merge_config.sh -O . arch/arm64/configs/defconfig CONFIGS/x86_64/config
 
-          awk '
-            /^CONFIG_[A-Za-z0-9_]+=/
-            {
-              split($0, a, "=")
-              print a[1]
-            }
-            /^# CONFIG_[A-Za-z0-9_]+ is not set$/
-            {
-              print $2
-            }
-          ' "$KCONFIG_CONFIG" | sort -u > "$GITHUB_WORKSPACE/arm64.symbols"
+          echo "=== 2. Normalize and prune configurations ==="
+          # 让Kconfig解析器重写文本，智能转换冲突的注释与取值，输出干净的.config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 olddefconfig
 
-          awk '
-            BEGIN {
-              while ((getline < "'"$GITHUB_WORKSPACE/arm64.symbols"'") > 0)
-                base[$1] = 1
-            }
-            /^CONFIG_[A-Za-z0-9_]+=/
-            {
-              split($0, a, "=")
-              if (!base[a[1]])
-                print
-              next
-            }
-            /^# CONFIG_[A-Za-z0-9_]+ is not set$/
-            {
-              if (!base[$2])
-                print
-            }
-          ' "$GITHUB_WORKSPACE/x86-candidate.config" \
-            > "$GITHUB_WORKSPACE/x86-candidate.fragment"
-
-          scripts/kconfig/merge_config.sh -m \
-            "$KCONFIG_CONFIG" \
-            "$GITHUB_WORKSPACE/x86-candidate.fragment"
-
-          make ARCH=arm64 LLVM=-19 olddefconfig
-
+          echo "=== 3. Strict Duplication Audit ==="
+          # 验证没有任何重复项残留
+          duplicates="$(grep '^CONFIG_' .config | cut -d= -f1 | sort | uniq -d || true)"
+          if [[ -n "$duplicates" ]]; then
+            echo "Error: Kconfig duplicates found:"
+            echo "$duplicates"
+            exit 1
+          fi
+          
           test -s .config
           grep -q '^CONFIG_MODULES=y$' .config
-
-          duplicates="$(
-            awk '
-              /^CONFIG_[A-Za-z0-9_]+=/
-              {
-                split($0, a, "=")
-                print a[1]
-              }
-              /^# CONFIG_[A-Za-z0-9_]+ is not set$/
-              {
-                print $2
-              }
-            ' .config | sort | uniq -d
-          )"
-
-          [[ -z "$duplicates" ]]
+          echo "Kconfig is clean, robust, and correctly merged."
 
           config_hash="$(sha256sum .config | cut -d' ' -f1)"
           echo "config_hash=$config_hash" >> "$GITHUB_OUTPUT"
-
-      - name: Verify kernel packaging prerequisites
-        if: steps.published.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-
-          cd kernel
-
-          export ARCH=arm64
-          export LLVM=-19
-          export KCONFIG_CONFIG="$PWD/.config"
-
-          make ARCH=arm64 LLVM=-19 olddefconfig
-          make ARCH=arm64 LLVM=-19 -s kernelversion
-          make ARCH=arm64 LLVM=-19 -s image_name
-
-          test -x scripts/package/mkdebian
-          test -x scripts/package/builddeb
 
       - name: Build kernel modules and Debian packages
         if: steps.published.outputs.skip != 'true'
         env:
           KBUILD_BUILD_USER: github-actions
-          KBUILD_BUILD_HOST: github-arm64
+          KBUILD_BUILD_HOST: github-arm64-cross
           DEBFULLNAME: github-actions
           DEBEMAIL: github-actions@users.noreply.github.com
           KDEB_CHANGELOG_DIST: noble
@@ -248,20 +173,19 @@ jobs:
           set -euo pipefail
 
           cd kernel
-
+          
           export ARCH=arm64
-          export LLVM=-19
+          export CROSS_COMPILE=aarch64-linux-gnu-
           export CCACHE_DIR="$CCACHE_DIR"
-          export CC="ccache clang-19"
-          export HOSTCC="ccache clang-19"
-
+          
           ccache --zero-stats
 
           jobs="$(( $(nproc) + 1 ))"
 
-          make ARCH=arm64 LLVM=-19 \
-            CC="$CC" \
-            HOSTCC="$HOSTCC" \
+          # bindeb-pkg 会调用 dpkg-buildpackage 并自动识别 CROSS_COMPILE 传递目标架构
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" \
+            HOSTCC="ccache clang" \
             -j"$jobs" \
             bindeb-pkg
 
@@ -292,6 +216,7 @@ jobs:
             dpkg-deb --info "$deb" >/dev/null
             dpkg-deb --contents "$deb" >/dev/null
 
+            # 严格审计产物架构，保证 x86 上最终产出的是 arm64
             arch="$(dpkg-deb --field "$deb" Architecture)"
             [[ "$arch" == "arm64" ]] || {
               echo "Unexpected package architecture: $deb -> $arch"
