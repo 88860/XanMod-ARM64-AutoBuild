@@ -10,6 +10,7 @@ permissions:
 
 env:
   XANMOD_REPO: https://gitlab.com/xanmod/linux.git
+  XANMOD_LTS: "6.18"
 
 jobs:
   check:
@@ -28,105 +29,66 @@ jobs:
           sudo apt-get install -y git python3
 
           TAG="$(
-            git ls-remote --tags --refs "$XANMOD_REPO" |
-            python3 <<'PY'
-          import sys
+            python3 - <<'PY'
+          import subprocess
           import re
 
-          tags = []
+          repo = "https://gitlab.com/xanmod/linux.git"
+          series = "6.18"
 
-          for line in sys.stdin:
-              tag = line.rsplit("/", 1)[-1].strip()
-
-              if re.fullmatch(
-                  r"[0-9]+\.[0-9]+\.[0-9]+-xanmod[0-9]+",
-                  tag
-              ):
-                  tags.append(tag)
-
-          if not tags:
-              raise SystemExit("No XanMod stable tags found")
-
-          def version(tag):
-              m = re.fullmatch(
-                  r"([0-9]+)\.([0-9]+)\.([0-9]+)-xanmod([0-9]+)",
-                  tag
-              )
-              return tuple(map(int, m.groups()))
-
-          tags.sort(key=version, reverse=True)
-
-          print(tags[0])
-          PY
-          )"
-
-          test -n "$TAG"
-
-          SERIES="$(
-            printf '%s\n' "$TAG" |
-            sed -E 's/^([0-9]+\.[0-9]+)\.[0-9]+-.*/\1/'
-          )"
-
-          echo "Latest XanMod stable tag: $TAG"
-          echo "Detected series: $SERIES"
-
-          LTS_TAG="$(
-            git ls-remote --tags --refs "$XANMOD_REPO" |
-            python3 - "$SERIES" <<'PY'
-          import sys
-          import re
-
-          series = sys.argv[1]
-          tags = []
+          data = subprocess.check_output(
+              ["git", "ls-remote", "--tags", "--refs", repo],
+              text=True
+          )
 
           pattern = re.compile(
               rf"^{re.escape(series)}\.[0-9]+-xanmod[0-9]+$"
           )
 
-          for line in sys.stdin:
-              tag = line.rsplit("/", 1)[-1].strip()
+          tags = []
+
+          for line in data.splitlines():
+              tag = line.rsplit("/", 1)[-1]
 
               if pattern.fullmatch(tag):
                   tags.append(tag)
 
           if not tags:
               raise SystemExit(
-                  f"No XanMod tags found for series {series}"
+                  f"No XanMod {series} LTS tags found"
               )
 
-          def version(tag):
+          def key(tag):
               m = re.fullmatch(
                   rf"{re.escape(series)}\.([0-9]+)-xanmod([0-9]+)",
                   tag
               )
               return int(m.group(1)), int(m.group(2))
 
-          tags.sort(key=version, reverse=True)
-
-          print(tags[0])
+          print(max(tags, key=key))
           PY
           )"
 
-          test -n "$LTS_TAG"
+          test -n "$TAG"
 
-          echo "Selected XanMod LTS tag: $LTS_TAG"
+          echo "XanMod LTS: $TAG"
 
           if git ls-remote --tags --refs \
             "https://github.com/${GITHUB_REPOSITORY}.git" \
-            "refs/tags/${LTS_TAG}-arm64" |
+            "refs/tags/${TAG}-arm64" |
             grep -q .; then
 
-            echo "Already released: ${LTS_TAG}-arm64"
+            echo "Already released: ${TAG}-arm64"
             echo "build=false" >> "$GITHUB_OUTPUT"
 
           else
 
-            echo "New XanMod LTS detected"
+            echo "New build required: ${TAG}"
             echo "build=true" >> "$GITHUB_OUTPUT"
 
           fi
 
-          echo "tag=$LTS_TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
   build:
     needs: check
@@ -168,6 +130,8 @@ jobs:
 
       - name: Setup ccache
         run: |
+          set -euo pipefail
+
           echo "PATH=/usr/lib/ccache:$PATH" >> "$GITHUB_ENV"
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
 
@@ -189,6 +153,27 @@ jobs:
             "$XANMOD_REPO" \
             linux
 
+      - name: Verify XanMod configuration
+        working-directory: linux
+        run: |
+          set -euo pipefail
+
+          URL="${XANMOD_REPO%/}/-/raw/${{ needs.check.outputs.tag }}/CONFIGS/x86_64"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 5 \
+            --retry-delay 2 \
+            "$URL" \
+            -o /tmp/xanmod-x86_64.config
+
+          test -s /tmp/xanmod-x86_64.config
+
+          head -n 5 /tmp/xanmod-x86_64.config
+
       - name: Build ARM64 configuration
         working-directory: linux
         run: |
@@ -198,24 +183,13 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
 
           make defconfig
+
           cp .config /tmp/arm64-defconfig
 
-          CONFIG_URL="${XANMOD_REPO%/}/-/raw/${{ needs.check.outputs.tag }}/CONFIGS/x86_64"
-
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --retry 5 \
-            --retry-delay 2 \
-            "$CONFIG_URL" \
-            -o /tmp/xanmod-x86_64.config
-
-          test -s /tmp/xanmod-x86_64.config
-
           make allmodconfig >/dev/null
+
           cp .config /tmp/arm64-symbols
+
           cp /tmp/arm64-defconfig .config
 
           python3 <<'PY'
@@ -226,13 +200,19 @@ jobs:
           ARM64 = Path("/tmp/arm64-symbols")
           OUT = Path("/tmp/xanmod-arm64.fragment")
 
-          SET = re.compile(r"^(CONFIG_[A-Za-z0-9_]+)=(.*)$")
-          UNSET = re.compile(r"^# (CONFIG_[A-Za-z0-9_]+) is not set$")
+          SET = re.compile(
+              r"^(CONFIG_[A-Za-z0-9_]+)=(.*)$"
+          )
+
+          UNSET = re.compile(
+              r"^# (CONFIG_[A-Za-z0-9_]+) is not set$"
+          )
 
           def parse(path):
               result = {}
 
               for line in path.read_text().splitlines():
+
                   m = SET.match(line)
 
                   if m:
@@ -262,29 +242,35 @@ jobs:
                   changes[symbol] = value
 
           with OUT.open("w") as f:
+
               for symbol in sorted(changes):
+
                   value = changes[symbol]
 
                   if value == "n":
-                      f.write(f"# {symbol} is not set\n")
+                      f.write(
+                          f"# {symbol} is not set\n"
+                      )
                   else:
-                      f.write(f"{symbol}={value}\n")
+                      f.write(
+                          f"{symbol}={value}\n"
+                      )
 
           print(f"XanMod symbols: {len(xanmod)}")
           print(f"ARM64 symbols: {len(arm64)}")
-          print(f"Compatible symbols: {len(xanmod) - len(skipped)}")
-          print(f"Changed symbols: {len(changes)}")
-          print(f"Skipped symbols: {len(skipped)}")
+          print(f"Compatible: {len(xanmod) - len(skipped)}")
+          print(f"Changed: {len(changes)}")
+          print(f"Skipped: {len(skipped)}")
 
           if skipped:
-              print("Skipped architecture-specific symbols:")
+              print("\nSkipped symbols:")
 
               for symbol in skipped:
                   print(symbol)
 
           if not changes:
               raise SystemExit(
-                  "No compatible XanMod configuration changes found"
+                  "No compatible XanMod changes found"
               )
           PY
 
@@ -298,6 +284,7 @@ jobs:
           make olddefconfig
 
           mkdir -p ../configs
+
           cp .config ../configs/xanmod-arm64.config
 
       - name: Validate configuration
@@ -338,6 +325,7 @@ jobs:
           ccache -z
 
           make -j"$(nproc)"
+
           make bindeb-pkg -j"$(nproc)"
 
           ccache -s
@@ -355,7 +343,9 @@ jobs:
             exit 1
           fi
 
-          dpkg-deb --info "${packages[0]}"
+          for pkg in "${packages[@]}"; do
+            dpkg-deb --info "$pkg" >/dev/null
+          done
 
       - name: Generate checksums
         run: |
@@ -385,13 +375,12 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No configuration changes."
-            exit 0
+          else
+            git commit \
+              -m "Update XanMod ARM64 config ${{ needs.check.outputs.tag }}"
+
+            git push
           fi
-
-          git commit \
-            -m "Update XanMod ARM64 config ${{ needs.check.outputs.tag }}"
-
-          git push
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
