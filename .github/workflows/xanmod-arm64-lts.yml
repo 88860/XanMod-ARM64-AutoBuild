@@ -1,0 +1,63 @@
+name: Auto Build XanMod ARM64 Kernel (LTS)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential flex bison libncurses5-dev \
+            libssl-dev libelf-dev bc git curl wget \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            ccache jq
+
+      - name: Detect latest LTS tag
+        id: tag
+        run: |
+          TAG=$(curl -s https://api.github.com/repos/xanmod/linux/releases | jq -r '.[].tag_name' | grep LTS | head -n1)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Clone XanMod Kernel
+        run: |
+          git clone https://github.com/xanmod/linux
+          cd linux
+          git checkout ${{ steps.tag.outputs.tag }}
+
+      - name: Build ARM64 Kernel
+        run: |
+          cd linux
+          make ARCH=arm64 defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+          # 打包成 deb
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bindeb-pkg -j$(nproc)
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd ..
+          sha256sum *.deb > SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xanmod-arm64-lts-deb
+          path: |
+            ../*.deb
+            ../SHA256SUMS.txt
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            ../*.deb
+            ../SHA256SUMS.txt
