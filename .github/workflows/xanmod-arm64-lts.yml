@@ -34,7 +34,7 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
       - name: Clone XanMod Kernel
         run: |
-          git clone https://gitlab.com/xanmod/linux
+          git clone https://gitlab.com/xanmod/linux.git
           cd linux
           git checkout ${{ steps.tag.outputs.tag }}
       - name: Build ARM64 Kernel
