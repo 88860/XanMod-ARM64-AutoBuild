@@ -31,11 +31,9 @@ jobs:
 
           tag=""
           for page in $(seq 1 50); do
-            # 请求官方 GitLab API 
             releases="$(curl -fsSL --retry 5 --retry-all-errors \
               "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page")"
 
-            # 严格根据 assets 链接特征匹配 LTS，无视版本号规则变化
             tag="$(jq -r '
               .[]
               | select(.upcoming_release == false)
@@ -81,14 +79,31 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 1. 开启 ARM64 异构架构支持
+          sudo dpkg --add-architecture arm64
+
+          # 2. 修改 Ubuntu 24.04 默认的 DEB822 源格式，限制原生源仅提供 amd64/i386，防止 404 错误
+          sudo sed -i 's/^Types: deb/Types: deb\nArchitectures: amd64 i386/' /etc/apt/sources.list.d/ubuntu.sources
+
+          # 3. 添加 arm64 专属的 ports.ubuntu.com 官方镜像源
+          cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: noble noble-updates noble-security
+          Components: main restricted universe multiverse
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+
           sudo apt-get update
           
-          # 补齐x86_64交叉编译ARM64内核及打包deb的所有必须环境
+          # 4. 安装宿主机依赖 + 目标架构(arm64)依赖，绝不使用 -d 妥协，彻底满足 dpkg-checkbuilddeps
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ccache clang cpio debhelper dpkg-dev \
             dwarves fakeroot flex kmod libdw-dev libelf-dev libssl-dev lld \
             llvm lz4 openssl pkg-config python3 rsync xz-utils zstd \
-            crossbuild-essential-arm64
+            crossbuild-essential-arm64 \
+            libssl-dev:arm64 libelf-dev:arm64 zlib1g-dev:arm64
 
           command -v clang
           command -v ld.lld
@@ -101,7 +116,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ${{ runner.os }}-cross-arm64-xanmod-${{ steps.xanmod.outputs.tag }}-clang-${{ hashFiles('.github/workflows/xanmod-arm64.yml') }}
+          key: ${{ runner.os }}-cross-arm64-xanmod-${{ steps.xanmod.outputs.tag }}-clang-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cross-arm64-xanmod-
 
       - name: Fetch XanMod source
         if: steps.published.outputs.skip != 'true'
@@ -136,16 +153,12 @@ jobs:
           export LLVM=1
 
           echo "=== 1. Smart merge via Official Kbuild script ==="
-          # 此脚本原生支持处理冲突，XanMod候选参数覆盖ARM64基础参数
-          # 遇到 ARM64 不支持的x86特有硬件，Kconfig依赖树会自动抛弃，不强行覆写
           ./scripts/kconfig/merge_config.sh -O . arch/arm64/configs/defconfig CONFIGS/x86_64/config
 
           echo "=== 2. Normalize and prune configurations ==="
-          # 让Kconfig解析器重写文本，智能转换冲突的注释与取值，输出干净的.config
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 olddefconfig
 
           echo "=== 3. Strict Duplication Audit ==="
-          # 验证没有任何重复项残留
           duplicates="$(grep '^CONFIG_' .config | cut -d= -f1 | sort | uniq -d || true)"
           if [[ -n "$duplicates" ]]; then
             echo "Error: Kconfig duplicates found:"
@@ -182,9 +195,9 @@ jobs:
 
           jobs="$(( $(nproc) + 1 ))"
 
-          # bindeb-pkg 会调用 dpkg-buildpackage 并自动识别 CROSS_COMPILE 传递目标架构
+          # 修复 dpkg-architecture 警告：在 CC 变量中显式指定目标架构，强制覆盖默认的 x86_64 识别
           make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- \
-            CC="ccache clang" \
+            CC="ccache clang --target=aarch64-linux-gnu" \
             HOSTCC="ccache clang" \
             -j"$jobs" \
             bindeb-pkg
@@ -216,7 +229,6 @@ jobs:
             dpkg-deb --info "$deb" >/dev/null
             dpkg-deb --contents "$deb" >/dev/null
 
-            # 严格审计产物架构，保证 x86 上最终产出的是 arm64
             arch="$(dpkg-deb --field "$deb" Architecture)"
             [[ "$arch" == "arm64" ]] || {
               echo "Unexpected package architecture: $deb -> $arch"
