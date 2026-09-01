@@ -1,9 +1,9 @@
-name: Auto Build XanMod ARM64 Kernel
+name: Auto Build XanMod ARM64 Kernel (Stable Mainline)
 
 on:
   release:
-    types: [published]   # XanMod 官方发布新版本时触发
-  workflow_dispatch:      # 支持手动触发
+    types: [published]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -38,9 +38,26 @@ jobs:
           cd linux
           make ARCH=arm64 defconfig
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+          # 打包成 deb
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bindeb-pkg -j$(nproc)
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd ..
+          sha256sum *.deb > SHA256SUMS.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xanmod-arm64-kernel
-          path: linux/arch/arm64/boot/Image
+          name: xanmod-arm64-deb
+          path: |
+            ../*.deb
+            ../SHA256SUMS.txt
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            ../*.deb
+            ../SHA256SUMS.txt
