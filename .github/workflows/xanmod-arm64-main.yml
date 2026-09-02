@@ -220,7 +220,7 @@ jobs:
 
           cd kernel
 
-          # 【核心防御】：彻底移除 Git 目录，切断内核自动附加 -dirty 后缀的机制
+          # 切断内核附加 -dirty 后缀的机制
           rm -rf .git
 
           export ARCH=arm64
@@ -228,38 +228,18 @@ jobs:
           export LLVM=1
 
           rm -f \
-            .config \
-            .config.arm64-base \
-            .config.xanmod \
-            .config.final \
-            .config.audit \
-            .config.clean \
-            .config.vps \
-            .xanmod-candidates \
-            .xanmod-accepted \
-            .xanmod-rejected \
-            .kconfig.log \
-            .kconfig.err \
-            .kconfig.olddefconfig.log \
-            .kconfig.olddefconfig.err \
-            .kconfig.vps.log \
-            .kconfig.vps.err \
-            .kconfig.audit.log \
-            .kconfig.audit.err \
-            kernel.release
+            .config .config.arm64-base .config.xanmod .config.final \
+            .config.audit .config.clean .config.vps .xanmod-candidates \
+            .xanmod-accepted .xanmod-rejected .kconfig.* kernel.release
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 defconfig
 
           cp .config .config.arm64-base
 
-          # 【终极精简防御】：利用 awk 强力清洗 x86 配置，移除桌面无用驱动
+          # 【优雅解法】：不搞黑白名单，提取时仅拦截 x86 的版本名称标签，其余全拿
           awk '
             /^[[:space:]]*CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|".*")$/ {
-              if ($0 ~ /^CONFIG_(SOUND|SND|WLAN|WIRELESS|BT|MEDIA|FIREWIRE|NFC|IRDA|GAMEPORT|INPUT_JOYSTICK|JOYSTICK|DVB|RC)(_|=)/) next;
+              if ($0 ~ /^CONFIG_LOCALVERSION=/) next;
               print
             }
           ' CONFIGS/x86_64/config > .xanmod-candidates
@@ -273,16 +253,12 @@ jobs:
             > .kconfig.log \
             2> .kconfig.err
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            olddefconfig \
-            > .kconfig.olddefconfig.log \
-            2> .kconfig.olddefconfig.err
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 olddefconfig \
+            > .kconfig.olddefconfig.log 2> .kconfig.olddefconfig.err
 
           cp .config .config.xanmod
 
+          # 输出被接受和拒绝的配置清单，方便后续回溯查看
           grep '^CONFIG_' .xanmod-candidates |
             while IFS='=' read -r symbol value; do
               if grep -q "^${symbol}=" .config.xanmod; then
@@ -293,76 +269,31 @@ jobs:
           grep '^CONFIG_' .xanmod-candidates |
             while IFS='=' read -r symbol value; do
               if grep -q "^${symbol}=" .config.xanmod; then
-                final_value="$(
-                  sed -n \
-                    "s/^${symbol}=//p" \
-                    .config.xanmod
-                )"
-
+                final_value="$(sed -n "s/^${symbol}=//p" .config.xanmod)"
                 if [[ "$final_value" != "$value" ]]; then
-                  printf '%s=%s -> %s\n' \
-                    "$symbol" \
-                    "$value" \
-                    "$final_value"
+                  printf '%s=%s -> %s\n' "$symbol" "$value" "$final_value"
                 fi
               else
                 printf '%s=%s\n' "$symbol" "$value"
               fi
             done > .xanmod-rejected
 
-          disable_if_present() {
-            local symbol="$1"
+          # 仅关闭自动附加本地版本的机制
+          if ./scripts/config --state LOCALVERSION_AUTO >/dev/null 2>&1; then
+            ./scripts/config --disable LOCALVERSION_AUTO
+          fi
 
-            if ./scripts/config --state "$symbol" >/dev/null 2>&1; then
-              ./scripts/config --disable "$symbol"
-            fi
-          }
-
-          for symbol in \
-            SOUND \
-            WLAN \
-            WIRELESS \
-            BT \
-            MEDIA_SUPPORT \
-            FIREWIRE \
-            NFC \
-            IRDA \
-            GAMEPORT \
-            INPUT_JOYSTICK \
-            JOYSTICK \
-            TV \
-            SND \
-            DVB_CORE \
-            RC_CORE
-          do
-            disable_if_present "$symbol"
-          done
-
-          disable_if_present LOCALVERSION_AUTO
-
-          # 【修复点】：强行清空被 x86 污染带过来的 CONFIG_LOCALVERSION="-x64v3"
-          ./scripts/config --set-str LOCALVERSION ""
-
-          # 提取 TAG 中的后缀（例如 xanmod1）并组装为完美的文件名后缀
+          # 写入纯正的架构版本号
           xanmod_suffix="${TAG#*-}"
           printf '%s\n' "-${xanmod_suffix}-arm64-main" > localversion
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            olddefconfig \
-            > .kconfig.vps.log \
-            2> .kconfig.vps.err
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 olddefconfig \
+            > .kconfig.vps.log 2> .kconfig.vps.err
 
           cp .config .config.vps
           cp .config .config.final
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            -s kernelrelease > kernel.release
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -s kernelrelease > kernel.release
 
           release="$(cat kernel.release)"
           expected="${TAG}-arm64-main"
@@ -374,22 +305,12 @@ jobs:
 
           cp .config.final .config.audit
 
-          sed \
-            -e '/^[[:space:]]*#/d' \
-            -e '/^[[:space:]]*$/d' \
-            .config.final > .config.clean
+          sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' .config.final > .config.clean
 
-          echo "config_hash=$(sha256sum .config.final | cut -d' ' -f1)" \
-            >> "$GITHUB_OUTPUT"
-
-          echo "kernel_release=$release" \
-            >> "$GITHUB_OUTPUT"
-
-          echo "candidate_count=$(grep -c '^CONFIG_' .xanmod-candidates || true)" \
-            >> "$GITHUB_OUTPUT"
-
-          echo "final_count=$(grep -c '^CONFIG_' .config.final || true)" \
-            >> "$GITHUB_OUTPUT"
+          echo "config_hash=$(sha256sum .config.final | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "kernel_release=$release" >> "$GITHUB_OUTPUT"
+          echo "candidate_count=$(grep -c '^CONFIG_' .xanmod-candidates || true)" >> "$GITHUB_OUTPUT"
+          echo "final_count=$(grep -c '^CONFIG_' .config.final || true)" >> "$GITHUB_OUTPUT"
 
       - name: Audit
         if: steps.published.outputs.skip != 'true'
@@ -432,16 +353,7 @@ jobs:
             exit 1
           fi
 
-          echo "Checking disabled media/wireless configs..."
-          if grep -Eq '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV|SND|DVB_CORE|RC_CORE)=' .config; then
-            echo "Error: Found forbidden media/wireless configs!"
-            grep -E '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV|SND|DVB_CORE|RC_CORE)=' .config
-            exit 1
-          fi
-
-          echo "Checking VPS essentials..."
-          grep -Eq '^CONFIG_VIRTIO=(y|m)$' .config || { echo "Error: CONFIG_VIRTIO missing"; exit 1; }
-          grep -Eq '^CONFIG_VIRTIO_NET=(y|m)$' .config || { echo "Error: CONFIG_VIRTIO_NET missing"; exit 1; }
+          echo "Checking essential kernel subsystems..."
           grep -q '^CONFIG_NET=y$' .config || { echo "Error: CONFIG_NET missing"; exit 1; }
           grep -q '^CONFIG_INET=y$' .config || { echo "Error: CONFIG_INET missing"; exit 1; }
           grep -q '^CONFIG_PROC_FS=y$' .config || { echo "Error: CONFIG_PROC_FS missing"; exit 1; }
@@ -501,7 +413,7 @@ jobs:
           echo "Audit: PASS"
           echo "Release: $release"
           echo "Architecture: arm64"
-          echo "Profile: VPS"
+          echo "Profile: Full-Featured"
           echo "Channel: Main"
           echo "XanMod candidates: $(grep -c '^CONFIG_' .xanmod-candidates || true)"
           echo "Final config: $(grep -c '^CONFIG_' .config || true)"
@@ -600,7 +512,7 @@ jobs:
             echo "XanMod ARM64 Main: $TAG"
             echo "Kernel release: ${TAG}-arm64-main"
             echo "Architecture: arm64"
-            echo "Profile: VPS"
+            echo "Profile: Full-Featured"
             echo "Channel: main"
             echo "XanMod package channel: main"
             echo "Source: https://gitlab.com/xanmod/linux"
@@ -624,3 +536,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "XanMod ${TAG} ARM64 Main" \
             --notes-file dist/RELEASE.md
+
