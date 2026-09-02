@@ -59,7 +59,7 @@ jobs:
                     any(
                       .assets.links[]?;
                       (.url // "")
-                      | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")
+                      | test("sourceforge\\.net/projects/xanmod/files/releases/main/[^/]+/?$")
                     )
                   )
                 | [
@@ -70,7 +70,7 @@ jobs:
                       .assets.links[]
                       | select(
                           (.url // "")
-                          | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")
+                          | test("sourceforge\\.net/projects/xanmod/files/releases/main/[^/]+/?$")
                         )
                       | .url
                     )
@@ -110,7 +110,7 @@ jobs:
                 .assets.links[]?
                 | select(
                     (.url // "")
-                    | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")
+                    | test("sourceforge\\.net/projects/xanmod/files/releases/main/[^/]+/?$")
                   )
                 | .url
               ][0] // empty
@@ -130,7 +130,7 @@ jobs:
           echo "TAG=$tag"
           echo "COMMIT=$commit"
           echo "PACKAGE=$package_url"
-          echo "CHANNEL=edge"
+          echo "CHANNEL=main"
 
       - name: Status
         id: published
@@ -219,6 +219,9 @@ jobs:
           set -euo pipefail
 
           cd kernel
+
+          # 创建 .scmversion 文件，阻止 Kbuild 获取 Git 状态并附加 -dirty 后缀
+          touch .scmversion
 
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
@@ -334,8 +337,9 @@ jobs:
 
           disable_if_present LOCALVERSION_AUTO
 
-          # 修复1：不再拼接 ${xanmod_suffix}，防止后缀叠加
-          printf '%s\n' "-arm64-main" > localversion
+          # 提取 TAG 中的 xanmod1 等后缀并组装
+          xanmod_suffix="${TAG#*-}"
+          printf '%s\n' "-${xanmod_suffix}-arm64-main" > localversion
 
           make \
             ARCH=arm64 \
@@ -357,7 +361,6 @@ jobs:
           release="$(cat kernel.release)"
           expected="${TAG}-arm64-main"
           
-          # 增加的 Debug 信息，如果遇到错误能在 CI 日志里一眼看清
           echo "Generated release: $release"
           echo "Expected release: $expected"
 
@@ -447,7 +450,6 @@ jobs:
           fi
 
           if grep -q '^CONFIG_LOCALVERSION=' .config; then
-            # 修复2：补齐闭合双引号 "
             localversion="$(
               sed -n \
                 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' \
@@ -601,7 +603,7 @@ jobs:
             echo "Architecture: arm64"
             echo "Profile: VPS"
             echo "Channel: main"
-            echo "XanMod package channel: edge"
+            echo "XanMod package channel: main"
             echo "Source: https://gitlab.com/xanmod/linux"
             echo "GitLab release: https://gitlab.com/xanmod/linux/-/releases/$TAG"
             echo ""
