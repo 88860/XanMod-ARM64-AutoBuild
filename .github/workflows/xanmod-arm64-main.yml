@@ -256,8 +256,7 @@ jobs:
 
           cp .config .config.arm64-base
 
-          # 【终极精简防御】：利用 awk 强力清洗 x86 配置
-          # 在合并前直接将声卡、蓝牙、手柄、电视卡等桌面设备的配置拦截在外，防止“依赖复活”
+          # 【终极精简防御】：利用 awk 强力清洗 x86 配置，移除桌面无用驱动
           awk '
             /^[[:space:]]*CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|".*")$/ {
               if ($0 ~ /^CONFIG_(SOUND|SND|WLAN|WIRELESS|BT|MEDIA|FIREWIRE|NFC|IRDA|GAMEPORT|INPUT_JOYSTICK|JOYSTICK|DVB|RC)(_|=)/) next;
@@ -319,7 +318,6 @@ jobs:
             fi
           }
 
-          # 【双重保险】：确保 ARM64 基础配置带来的驱动也被强行关闭
           for symbol in \
             SOUND \
             WLAN \
@@ -341,6 +339,9 @@ jobs:
           done
 
           disable_if_present LOCALVERSION_AUTO
+
+          # 【修复点】：强行清空被 x86 污染带过来的 CONFIG_LOCALVERSION="-x64v3"
+          ./scripts/config --set-str LOCALVERSION ""
 
           # 提取 TAG 中的后缀（例如 xanmod1）并组装为完美的文件名后缀
           xanmod_suffix="${TAG#*-}"
@@ -623,4 +624,3 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "XanMod ${TAG} ARM64 Main" \
             --notes-file dist/RELEASE.md
-
