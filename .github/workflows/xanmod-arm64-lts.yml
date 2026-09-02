@@ -457,7 +457,7 @@ jobs:
 
           shopt -s nullglob
 
-          packages=(../*.deb)
+          packages=(*.deb)
 
           ((${#packages[@]} > 0)) || exit 1
 
