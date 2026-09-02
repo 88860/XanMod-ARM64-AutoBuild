@@ -45,13 +45,11 @@ jobs:
             while IFS=$'\t' read -r candidate candidate_commit candidate_released candidate_url; do
               [[ -n "$candidate" ]] || continue
 
-              if [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+-xanmod[0-9]+$ ]]; then
-                tag="$candidate"
-                commit="$candidate_commit"
-                released_at="$candidate_released"
-                package_url="$candidate_url"
-                break
-              fi
+              tag="$candidate"
+              commit="$candidate_commit"
+              released_at="$candidate_released"
+              package_url="$candidate_url"
+              break
             done < <(
               jq -r '
                 .[]
@@ -61,7 +59,7 @@ jobs:
                     any(
                       .assets.links[]?;
                       (.url // "")
-                      | test("sourceforge\\.net/projects/xanmod/files/releases/edge/")
+                      | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")
                     )
                   )
                 | [
@@ -72,7 +70,7 @@ jobs:
                       .assets.links[]
                       | select(
                           (.url // "")
-                          | test("sourceforge\\.net/projects/xanmod/files/releases/edge/")
+                          | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")
                         )
                       | .url
                     )
@@ -82,6 +80,7 @@ jobs:
             )
 
             [[ -n "$tag" ]] && break
+
             [[ "$(jq 'length' <<<"$releases")" -lt 100 ]] && break
           done
 
@@ -105,6 +104,22 @@ jobs:
           test "$api_commit" = "$commit"
           test "$api_released" = "$released_at"
 
+          api_package_url="$(
+            jq -r '
+              [
+                .assets.links[]?
+                | select(
+                    (.url // "")
+                    | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")
+                  )
+                | .url
+              ][0] // empty
+            ' <<<"$release"
+          )"
+
+          test -n "$api_package_url"
+          test "$api_package_url" = "$package_url"
+
           {
             echo "tag=$tag"
             echo "commit=$commit"
@@ -115,6 +130,7 @@ jobs:
           echo "TAG=$tag"
           echo "COMMIT=$commit"
           echo "PACKAGE=$package_url"
+          echo "CHANNEL=edge"
 
       - name: Status
         id: published
@@ -160,14 +176,14 @@ jobs:
             libssl-dev:arm64 libelf-dev:arm64 zlib1g-dev:arm64
 
       - name: Cache
-  if: steps.published.outputs.skip != 'true'
-  uses: actions/cache@v4
-  with:
-    path: .ccache
-    key: ${{ runner.os }}-cross-arm64-xanmod-main-${{ steps.xanmod.outputs.tag }}-clang-${{ hashFiles('kernel/.config') }}
-    restore-keys: |
-      ${{ runner.os }}-cross-arm64-xanmod-main-${{ steps.xanmod.outputs.tag }}-clang-
-      ${{ runner.os }}-cross-arm64-xanmod-main-
+        if: steps.published.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-cross-arm64-xanmod-main-${{ steps.xanmod.outputs.tag }}-clang-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cross-arm64-xanmod-main-${{ steps.xanmod.outputs.tag }}-clang-
+            ${{ runner.os }}-cross-arm64-xanmod-main-
 
       - name: Source
         if: steps.published.outputs.skip != 'true'
@@ -186,9 +202,13 @@ jobs:
           cd kernel
 
           test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          test "$(git describe --tags --exact-match HEAD)" = "$TAG"
 
           test -f arch/arm64/configs/defconfig
           test -f CONFIGS/x86_64/config
+          test -f localversion
+          test -x scripts/config
+          test -x scripts/kconfig/merge_config.sh
 
       - name: Configure
         if: steps.published.outputs.skip != 'true'
@@ -206,15 +226,24 @@ jobs:
 
           rm -f \
             .config \
+            .config.arm64-base \
             .config.xanmod \
             .config.final \
             .config.audit \
             .config.clean \
             .config.vps \
             .xanmod-candidates \
+            .xanmod-accepted \
+            .xanmod-rejected \
             .kconfig.log \
             .kconfig.err \
-            localversion
+            .kconfig.olddefconfig.log \
+            .kconfig.olddefconfig.err \
+            .kconfig.vps.log \
+            .kconfig.vps.err \
+            .kconfig.audit.log \
+            .kconfig.audit.err \
+            kernel.release
 
           make \
             ARCH=arm64 \
@@ -237,19 +266,7 @@ jobs:
             .config \
             .xanmod-candidates \
             > .kconfig.log \
-            2> .kconfig.err || true
-
-          if grep -Eiq \
-            'warning:|error:|invalid|unknown symbol|undefined symbol|recursive dependency' \
-            .kconfig.err; then
-
-            if grep -Eiq \
-              'unknown symbol|recursive dependency|error:' \
-              .kconfig.err; then
-              cat .kconfig.err
-              exit 1
-            fi
-          fi
+            2> .kconfig.err
 
           make \
             ARCH=arm64 \
@@ -259,33 +276,76 @@ jobs:
             > .kconfig.olddefconfig.log \
             2> .kconfig.olddefconfig.err
 
-          if grep -Eiq \
-            'warning:|error:|invalid|unknown symbol|recursive dependency' \
-            .kconfig.olddefconfig.err; then
-            cat .kconfig.olddefconfig.err
-            exit 1
-          fi
-
           cp .config .config.xanmod
 
-          ./scripts/config \
-            --disable SOUND \
-            --disable WLAN \
-            --disable WIRELESS \
-            --disable BT \
-            --disable MEDIA_SUPPORT \
-            --disable FIREWIRE \
-            --disable NFC \
-            --disable IRDA \
-            --disable GAMEPORT \
-            --disable JOYSTICK \
-            --disable TV \
-            --disable CONFIG_SND \
-            --disable CONFIG_DVB_CORE \
-            --disable CONFIG_RC_CORE \
-            --disable LOCALVERSION_AUTO
+          grep '^CONFIG_' .xanmod-candidates |
+            while IFS='=' read -r symbol value; do
+              if grep -q "^${symbol}=" .config.xanmod; then
+                printf '%s=%s\n' "$symbol" "$value"
+              fi
+            done > .xanmod-accepted
 
-          printf '%s\n' '-arm64-main' > localversion
+          grep '^CONFIG_' .xanmod-candidates |
+            while IFS='=' read -r symbol value; do
+              if grep -q "^${symbol}=" .config.xanmod; then
+                final_value="$(
+                  sed -n \
+                    "s/^${symbol}=//p" \
+                    .config.xanmod
+                )"
+
+                if [[ "$final_value" != "$value" ]]; then
+                  printf '%s=%s -> %s\n' \
+                    "$symbol" \
+                    "$value" \
+                    "$final_value"
+                fi
+              else
+                printf '%s=%s\n' "$symbol" "$value"
+              fi
+            done > .xanmod-rejected
+
+          while read -r symbol; do
+            if grep -q "^${symbol}=" .config.xanmod; then
+              :
+            fi
+          done < <(
+            grep '^CONFIG_' .xanmod-candidates |
+              sed 's/=.*//'
+          )
+
+          disable_if_present() {
+            local symbol="$1"
+
+            if ./scripts/config --state "$symbol" >/dev/null 2>&1; then
+              ./scripts/config --disable "$symbol"
+            fi
+          }
+
+          for symbol in \
+            SOUND \
+            WLAN \
+            WIRELESS \
+            BT \
+            MEDIA_SUPPORT \
+            FIREWIRE \
+            NFC \
+            IRDA \
+            GAMEPORT \
+            JOYSTICK \
+            TV \
+            SND \
+            DVB_CORE \
+            RC_CORE
+          do
+            disable_if_present "$symbol"
+          done
+
+          disable_if_present LOCALVERSION_AUTO
+
+          xanmod_suffix="${TAG#*-}"
+
+          printf '%s\n' "-${xanmod_suffix}-arm64-main" > localversion
 
           make \
             ARCH=arm64 \
@@ -295,13 +355,7 @@ jobs:
             > .kconfig.vps.log \
             2> .kconfig.vps.err
 
-          if grep -Eiq \
-            'warning:|error:|invalid|unknown symbol|recursive dependency' \
-            .kconfig.vps.err; then
-            cat .kconfig.vps.err
-            exit 1
-          fi
-
+          cp .config .config.vps
           cp .config .config.final
 
           make \
@@ -317,10 +371,21 @@ jobs:
 
           cp .config.final .config.audit
 
+          sed \
+            -e '/^[[:space:]]*#/d' \
+            -e '/^[[:space:]]*$/d' \
+            .config.final > .config.clean
+
           echo "config_hash=$(sha256sum .config.final | cut -d' ' -f1)" \
             >> "$GITHUB_OUTPUT"
 
           echo "kernel_release=$release" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "candidate_count=$(grep -c '^CONFIG_' .xanmod-candidates || true)" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "final_count=$(grep -c '^CONFIG_' .config.final || true)" \
             >> "$GITHUB_OUTPUT"
 
       - name: Audit
@@ -335,20 +400,20 @@ jobs:
 
           test -s .config.audit
           test -s .config.final
+          test -s .config.clean
           test -s .xanmod-candidates
+          test -s .config.arm64-base
 
           cp .config.audit .config
 
-          make \
+          if ! make \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 \
             olddefconfig \
-            > /dev/null \
-            2> .audit.kconfig.err
-
-          if [[ -s .audit.kconfig.err ]]; then
-            cat .audit.kconfig.err
+            > .kconfig.audit.log \
+            2> .kconfig.audit.err; then
+            cat .kconfig.audit.err
             exit 1
           fi
 
@@ -356,20 +421,19 @@ jobs:
 
           grep -q '^CONFIG_ARM64=y$' .config
           grep -q '^CONFIG_64BIT=y$' .config
-          grep -q '^CONFIG_MODULES=y$' .config
+          grep -q '^CONFIG_MODULES=y$'
 
           if grep -Eq '^CONFIG_X86(=|_)|^CONFIG_X86_64(=|_)' .config; then
             grep -E '^CONFIG_X86(=|_)|^CONFIG_X86_64(=_)' .config
             exit 1
           fi
 
-          if grep -Eq '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV)=' .config; then
-            grep -E '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV)=' .config
-            exit 1
-          fi
-
-          if grep -Eq '^CONFIG_(SND|DVB_CORE|RC_CORE)=' .config; then
-            grep -E '^CONFIG_(SND|DVB_CORE|RC_CORE)=' .config
+          if grep -Eq \
+            '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV|SND|DVB_CORE|RC_CORE)=' \
+            .config; then
+            grep -E \
+              '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV|SND|DVB_CORE|RC_CORE)=' \
+              .config
             exit 1
           fi
 
@@ -393,7 +457,7 @@ jobs:
               sed -n \
                 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' \
                 .config
-            )"
+            )
 
             test -z "$localversion"
           fi
@@ -438,14 +502,10 @@ jobs:
             LLVM=1 \
             -s prepare
 
-          if [[ -s .audit.kconfig.err ]]; then
-            cat .audit.kconfig.err
-            exit 1
-          fi
-
           echo "Release: $release"
           echo "Architecture: arm64"
           echo "Profile: VPS"
+          echo "Channel: Main"
           echo "XanMod candidates: $(grep -c '^CONFIG_' .xanmod-candidates || true)"
           echo "Final config: $(grep -c '^CONFIG_' .config || true)"
           echo "Config SHA256: $(sha256sum .config | cut -d' ' -f1)"
@@ -475,7 +535,6 @@ jobs:
             ARCH=arm64 \
             LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            LOCALVERSION=-arm64-main \
             CC="ccache clang --target=aarch64-linux-gnu" \
             HOSTCC="ccache clang" \
             -j"$(( $(nproc) + 1 ))" \
@@ -494,9 +553,13 @@ jobs:
 
           shopt -s nullglob
 
-          packages=(*.deb)
+          packages=(../*.deb)
 
           ((${#packages[@]} > 0)) || exit 1
+
+          image_pkg=""
+          headers_pkg=""
+          libc_pkg=""
 
           for deb in "${packages[@]}"; do
             [[ "$(dpkg-deb --field "$deb" Architecture)" == "arm64" ]] || exit 1
@@ -513,6 +576,10 @@ jobs:
                 ;;
             esac
           done
+
+          test -n "$image_pkg"
+          test -n "$headers_pkg"
+          test -n "$libc_pkg"
 
           dpkg-deb --contents "$image_pkg" |
             grep '/boot/vmlinuz-' >/dev/null
@@ -539,6 +606,7 @@ jobs:
             echo "Architecture: arm64"
             echo "Profile: VPS"
             echo "Channel: main"
+            echo "XanMod package channel: edge"
             echo "Source: https://gitlab.com/xanmod/linux"
             echo "GitLab release: https://gitlab.com/xanmod/linux/-/releases/$TAG"
             echo ""
