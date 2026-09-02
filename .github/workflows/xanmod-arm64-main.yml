@@ -220,7 +220,7 @@ jobs:
 
           cd kernel
 
-          # 【现代内核打包标准操作：隐藏或删除 Git 目录，切断强制追加脏后缀的机制】
+          # 【核心防御】：彻底移除 Git 目录，切断内核自动附加 -dirty 后缀的机制
           rm -rf .git
 
           export ARCH=arm64
@@ -256,8 +256,11 @@ jobs:
 
           cp .config .config.arm64-base
 
+          # 【终极精简防御】：利用 awk 强力清洗 x86 配置
+          # 在合并前直接将声卡、蓝牙、手柄、电视卡等桌面设备的配置拦截在外，防止“依赖复活”
           awk '
             /^[[:space:]]*CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|".*")$/ {
+              if ($0 ~ /^CONFIG_(SOUND|SND|WLAN|WIRELESS|BT|MEDIA|FIREWIRE|NFC|IRDA|GAMEPORT|INPUT_JOYSTICK|JOYSTICK|DVB|RC)(_|=)/) next;
               print
             }
           ' CONFIGS/x86_64/config > .xanmod-candidates
@@ -316,6 +319,7 @@ jobs:
             fi
           }
 
+          # 【双重保险】：确保 ARM64 基础配置带来的驱动也被强行关闭
           for symbol in \
             SOUND \
             WLAN \
@@ -326,6 +330,7 @@ jobs:
             NFC \
             IRDA \
             GAMEPORT \
+            INPUT_JOYSTICK \
             JOYSTICK \
             TV \
             SND \
@@ -337,7 +342,7 @@ jobs:
 
           disable_if_present LOCALVERSION_AUTO
 
-          # 提取 TAG 中的 xanmod1 等后缀并组装
+          # 提取 TAG 中的后缀（例如 xanmod1）并组装为完美的文件名后缀
           xanmod_suffix="${TAG#*-}"
           printf '%s\n' "-${xanmod_suffix}-arm64-main" > localversion
 
