@@ -1,4 +1,4 @@
-name: XanMod ARM64 LTS Build
+name: XanMod ARM64 lts Build
 
 on:
   workflow_dispatch:
