@@ -1,4 +1,4 @@
-name: XanMod ARM64 main Build
+name: XanMod ARM64 Main Build
 
 on:
   workflow_dispatch:
@@ -30,6 +30,9 @@ jobs:
           set -euo pipefail
 
           tag=""
+          commit=""
+          released_at=""
+          package_url=""
 
           for page in $(seq 1 50); do
             releases="$(
@@ -39,26 +42,53 @@ jobs:
                 "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page"
             )"
 
-            tag="$(
+            while IFS=$'\t' read -r candidate candidate_commit candidate_released candidate_url; do
+              [[ -n "$candidate" ]] || continue
+
+              if [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+-xanmod[0-9]+$ ]]; then
+                tag="$candidate"
+                commit="$candidate_commit"
+                released_at="$candidate_released"
+                package_url="$candidate_url"
+                break
+              fi
+            done < <(
               jq -r '
                 .[]
                 | select(.upcoming_release == false)
+                | select(.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$"))
                 | select(
                     any(
                       .assets.links[]?;
-                      (.url // "") | contains("/releases/main/")
+                      (.url // "")
+                      | test("sourceforge\\.net/projects/xanmod/files/releases/edge/")
                     )
                   )
-                | .tag_name
-              ' <<<"$releases" | head -n1
-            )"
+                | [
+                    .tag_name,
+                    .commit.id,
+                    .released_at,
+                    (
+                      .assets.links[]
+                      | select(
+                          (.url // "")
+                          | test("sourceforge\\.net/projects/xanmod/files/releases/edge/")
+                        )
+                      | .url
+                    )
+                  ]
+                | @tsv
+              ' <<<"$releases"
+            )
 
             [[ -n "$tag" ]] && break
-
             [[ "$(jq 'length' <<<"$releases")" -lt 100 ]] && break
           done
 
-          [[ -n "$tag" ]] || exit 1
+          [[ -n "$tag" ]] || {
+            echo "Unable to find XanMod Main release"
+            exit 1
+          }
 
           release="$(
             curl -fsSL \
@@ -67,11 +97,24 @@ jobs:
               "$GITLAB_API/releases/$tag"
           )"
 
+          api_tag="$(jq -r '.tag_name' <<<"$release")"
+          api_commit="$(jq -r '.commit.id' <<<"$release")"
+          api_released="$(jq -r '.released_at' <<<"$release")"
+
+          test "$api_tag" = "$tag"
+          test "$api_commit" = "$commit"
+          test "$api_released" = "$released_at"
+
           {
             echo "tag=$tag"
-            echo "commit=$(jq -r '.commit.id' <<<"$release")"
-            echo "released_at=$(jq -r '.released_at' <<<"$release")"
+            echo "commit=$commit"
+            echo "released_at=$released_at"
+            echo "package_url=$package_url"
           } >> "$GITHUB_OUTPUT"
+
+          echo "TAG=$tag"
+          echo "COMMIT=$commit"
+          echo "PACKAGE=$package_url"
 
       - name: Status
         id: published
@@ -79,6 +122,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.xanmod.outputs.tag }}
         run: |
+          set -euo pipefail
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -141,6 +186,9 @@ jobs:
 
           test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
 
+          test -f arch/arm64/configs/defconfig
+          test -f CONFIGS/x86_64/config
+
       - name: Configure
         if: steps.published.outputs.skip != 'true'
         id: config
@@ -155,16 +203,17 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export LLVM=1
 
-          xanmod_config="CONFIGS/x86_64/config"
-          candidate_config=".xanmod-arm64-candidates"
-          before_config=".config.before-vps"
-          final_config=".config"
-
-          test -f "$xanmod_config"
-
           rm -f \
-            "$candidate_config" \
-            "$before_config"
+            .config \
+            .config.xanmod \
+            .config.final \
+            .config.audit \
+            .config.clean \
+            .config.vps \
+            .xanmod-candidates \
+            .kconfig.log \
+            .kconfig.err \
+            localversion
 
           make \
             ARCH=arm64 \
@@ -172,26 +221,51 @@ jobs:
             LLVM=1 \
             defconfig
 
+          cp .config .config.arm64-base
+
           awk '
             /^[[:space:]]*CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|".*")$/ {
               print
             }
-          ' "$xanmod_config" > "$candidate_config"
+          ' CONFIGS/x86_64/config > .xanmod-candidates
 
-          test -s "$candidate_config"
+          test -s .xanmod-candidates
 
           ./scripts/kconfig/merge_config.sh \
             -m \
             .config \
-            "$candidate_config"
+            .xanmod-candidates \
+            > .kconfig.log \
+            2> .kconfig.err || true
+
+          if grep -Eiq \
+            'warning:|error:|invalid|unknown symbol|undefined symbol|recursive dependency' \
+            .kconfig.err; then
+
+            if grep -Eiq \
+              'unknown symbol|recursive dependency|error:' \
+              .kconfig.err; then
+              cat .kconfig.err
+              exit 1
+            fi
+          fi
 
           make \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 \
-            olddefconfig
+            olddefconfig \
+            > .kconfig.olddefconfig.log \
+            2> .kconfig.olddefconfig.err
 
-          cp .config "$before_config"
+          if grep -Eiq \
+            'warning:|error:|invalid|unknown symbol|recursive dependency' \
+            .kconfig.olddefconfig.err; then
+            cat .kconfig.olddefconfig.err
+            exit 1
+          fi
+
+          cp .config .config.xanmod
 
           ./scripts/config \
             --disable SOUND \
@@ -204,20 +278,11 @@ jobs:
             --disable IRDA \
             --disable GAMEPORT \
             --disable JOYSTICK \
-            --disable TV
-
-          ./scripts/config \
+            --disable TV \
             --disable CONFIG_SND \
-            --disable CONFIG_SND_HWDEP \
-            --disable CONFIG_SND_RAWMIDI \
-            --disable CONFIG_SND_USB \
-            --disable CONFIG_SND_FIREWIRE \
             --disable CONFIG_DVB_CORE \
-            --disable CONFIG_RC_CORE
-
-          ./scripts/config \
-            --disable LOCALVERSION_AUTO \
-            --set-str LOCALVERSION ""
+            --disable CONFIG_RC_CORE \
+            --disable LOCALVERSION_AUTO
 
           printf '%s\n' '-arm64-main' > localversion
 
@@ -225,43 +290,37 @@ jobs:
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 \
-            olddefconfig
+            olddefconfig \
+            > .kconfig.vps.log \
+            2> .kconfig.vps.err
 
-          test -s "$final_config"
+          if grep -Eiq \
+            'warning:|error:|invalid|unknown symbol|recursive dependency' \
+            .kconfig.vps.err; then
+            cat .kconfig.vps.err
+            exit 1
+          fi
+
+          cp .config .config.final
 
           make \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 \
-            -s prepare
+            -s kernelrelease > kernel.release
 
-          release="$(
-            make \
-              ARCH=arm64 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              LLVM=1 \
-              -s kernelrelease
-          )"
-
+          release="$(cat kernel.release)"
           expected="${TAG}-arm64-main"
 
           test "$release" = "$expected"
 
-          cp .config .config.final
+          cp .config.final .config.audit
 
           echo "config_hash=$(sha256sum .config.final | cut -d' ' -f1)" \
             >> "$GITHUB_OUTPUT"
 
           echo "kernel_release=$release" \
             >> "$GITHUB_OUTPUT"
-
-          echo "candidate_count=$(
-            grep -c '^CONFIG_' "$candidate_config" || true
-          )" >> "$GITHUB_OUTPUT"
-
-          echo "final_count=$(
-            grep -c '^CONFIG_' .config.final || true
-          )" >> "$GITHUB_OUTPUT"
 
       - name: Audit
         if: steps.published.outputs.skip != 'true'
@@ -273,46 +332,70 @@ jobs:
 
           cd kernel
 
-          config=".config.final"
-          candidate=".xanmod-arm64-candidates"
+          test -s .config.audit
+          test -s .config.final
+          test -s .xanmod-candidates
 
-          test -s "$config"
-          test -s "$candidate"
+          cp .config.audit .config
 
           make \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             LLVM=1 \
-            olddefconfig
+            olddefconfig \
+            > /dev/null \
+            2> .audit.kconfig.err
 
-          cmp -s .config "$config"
-
-          test "$(grep -c '^CONFIG_ARM64=y$' "$config")" -eq 1
-          test "$(grep -c '^CONFIG_64BIT=y$' "$config")" -eq 1
-          test "$(grep -c '^CONFIG_MODULES=y$' "$config")" -eq 1
-
-          test "$(grep -c '^CONFIG_X86=y$' "$config" || true)" -eq 0
-          test "$(grep -c '^CONFIG_X86_64=y$' "$config" || true)" -eq 0
-
-          if grep -Eq '^CONFIG_X86(=|_)|^CONFIG_X86_64(=|_)' "$config"; then
-            echo "ARM64 audit failed: x86 configuration detected"
-            grep -E '^CONFIG_X86(=|_)|^CONFIG_X86_64(=|_)' "$config"
+          if [[ -s .audit.kconfig.err ]]; then
+            cat .audit.kconfig.err
             exit 1
           fi
 
-          if grep -q '^CONFIG_LOCALVERSION_AUTO=y$' "$config"; then
-            echo "ARM64 audit failed: LOCALVERSION_AUTO is enabled"
+          cmp -s .config .config.audit
+
+          grep -q '^CONFIG_ARM64=y$' .config
+          grep -q '^CONFIG_64BIT=y$' .config
+          grep -q '^CONFIG_MODULES=y$' .config
+
+          if grep -Eq '^CONFIG_X86(=|_)|^CONFIG_X86_64(=|_)' .config; then
+            grep -E '^CONFIG_X86(=|_)|^CONFIG_X86_64(=_)' .config
             exit 1
           fi
 
-          localversion="$(
-            sed -n 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' "$config" || true
-          )"
+          if grep -Eq '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV)=' .config; then
+            grep -E '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV)=' .config
+            exit 1
+          fi
 
-          test -z "$localversion"
+          if grep -Eq '^CONFIG_(SND|DVB_CORE|RC_CORE)=' .config; then
+            grep -E '^CONFIG_(SND|DVB_CORE|RC_CORE)=' .config
+            exit 1
+          fi
 
-          test -f localversion
-          test "$(cat localversion)" = "-arm64-main"
+          grep -Eq '^CONFIG_VIRTIO=(y|m)$' .config
+          grep -Eq '^CONFIG_VIRTIO_NET=(y|m)$' .config
+          grep -q '^CONFIG_NET=y$' .config
+          grep -q '^CONFIG_INET=y$' .config
+          grep -q '^CONFIG_PROC_FS=y$' .config
+          grep -q '^CONFIG_SYSFS=y$' .config
+          grep -q '^CONFIG_CGROUPS=y$' .config
+          grep -q '^CONFIG_NAMESPACES=y$' .config
+          grep -q '^CONFIG_BPF=y$' .config
+          grep -q '^CONFIG_BPF_SYSCALL=y$' .config
+
+          if grep -q '^CONFIG_LOCALVERSION_AUTO=y$' .config; then
+            exit 1
+          fi
+
+          if grep -q '^CONFIG_LOCALVERSION=' .config; then
+            localversion="$(
+              sed -n \
+                's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' \
+                .config
+            )"
+
+            test -z "$localversion"
+          fi
 
           release="$(
             make \
@@ -324,119 +407,47 @@ jobs:
 
           test "$release" = "$EXPECTED_RELEASE"
 
-          if grep -Eq 'x64v[0-9]|x86-64|x86_64' <<<"$release"; then
-            echo "ARM64 audit failed: invalid architecture suffix"
-            echo "$release"
+          if grep -qE \
+            '^CONFIG_(MCORE2|MZEN|X86_NATIVE_CPU|X86_64_VERSION)=' \
+            .config; then
+            grep -E \
+              '^CONFIG_(MCORE2|MZEN|X86_NATIVE_CPU|X86_64_VERSION)=' \
+              .config
+            exit 1
+          fi
+
+          if grep -vE \
+            '^(CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|"[^"]*")|# CONFIG_[A-Za-z0-9_]+ is not set)$' \
+            .config | grep -q .; then
             exit 1
           fi
 
           duplicates="$(
-            grep '^CONFIG_' "$config" |
+            grep '^CONFIG_' .config |
               sed 's/=.*//' |
               sort |
               uniq -d
           )"
 
-          if [[ -n "$duplicates" ]]; then
-            echo "ARM64 audit failed: duplicate configuration symbols"
-            echo "$duplicates"
-            exit 1
-          fi
+          test -z "$duplicates"
 
-          malformed="$(
-            grep -vE \
-              '^(CONFIG_[A-Za-z0-9_]+=(y|m|n|-?[0-9]+|0x[0-9A-Fa-f]+|"[^"]*")|# CONFIG_[A-Za-z0-9_]+ is not set)$' \
-              "$config" || true
-          )"
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            -s prepare
 
-          if [[ -n "$malformed" ]]; then
-            echo "ARM64 audit failed: malformed configuration"
-            echo "$malformed"
-            exit 1
-          fi
-
-          if grep -qE '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV)=' "$config"; then
-            echo "ARM64 audit failed: VPS-disabled subsystem is enabled"
-            grep -E '^CONFIG_(SOUND|WLAN|WIRELESS|BT|MEDIA_SUPPORT|FIREWIRE|NFC|IRDA|GAMEPORT|JOYSTICK|TV)=' "$config"
-            exit 1
-          fi
-
-          if grep -qE '^CONFIG_(SND|DVB_CORE|RC_CORE)=' "$config"; then
-            echo "ARM64 audit failed: VPS-disabled media subsystem is enabled"
-            grep -E '^CONFIG_(SND|DVB_CORE|RC_CORE)=' "$config"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_VIRTIO=y$' "$config" &&
-             ! grep -q '^CONFIG_VIRTIO=m$' "$config"; then
-            echo "ARM64 audit failed: VirtIO support is missing"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_VIRTIO_NET=y$' "$config" &&
-             ! grep -q '^CONFIG_VIRTIO_NET=m$' "$config"; then
-            echo "ARM64 audit failed: VirtIO network support is missing"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_NET=y$' "$config"; then
-            echo "ARM64 audit failed: network stack is disabled"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_INET=y$' "$config"; then
-            echo "ARM64 audit failed: IPv4 support is disabled"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_PROC_FS=y$' "$config"; then
-            echo "ARM64 audit failed: procfs is disabled"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_SYSFS=y$' "$config"; then
-            echo "ARM64 audit failed: sysfs is disabled"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_CGROUPS=y$' "$config"; then
-            echo "ARM64 audit failed: cgroups are disabled"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_NAMESPACES=y$' "$config"; then
-            echo "ARM64 audit failed: namespaces are disabled"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_BPF=y$' "$config"; then
-            echo "ARM64 audit failed: BPF is disabled"
-            exit 1
-          fi
-
-          if ! grep -q '^CONFIG_BPF_SYSCALL=y$' "$config"; then
-            echo "ARM64 audit failed: BPF syscall is disabled"
-            exit 1
-          fi
-
-          if grep -q '^CONFIG_LOCALVERSION=' "$config"; then
-            value="$(
-              sed -n 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' "$config"
-            )"
-
-            test -z "$value"
-          fi
-
-          if grep -qE '^CONFIG_(MCORE2|MZEN|X86_NATIVE_CPU|X86_64_VERSION)=' "$config"; then
-            echo "ARM64 audit failed: invalid CPU-specific configuration"
-            grep -E '^CONFIG_(MCORE2|MZEN|X86_NATIVE_CPU|X86_64_VERSION)=' "$config"
+          if [[ -s .audit.kconfig.err ]]; then
+            cat .audit.kconfig.err
             exit 1
           fi
 
           echo "Release: $release"
-          echo "Candidates: $(grep -c '^CONFIG_' "$candidate" || true)"
-          echo "Final: $(grep -c '^CONFIG_' "$config" || true)"
-          echo "Config: $(sha256sum "$config" | cut -d' ' -f1)"
+          echo "Architecture: arm64"
+          echo "Profile: VPS"
+          echo "XanMod candidates: $(grep -c '^CONFIG_' .xanmod-candidates || true)"
+          echo "Final config: $(grep -c '^CONFIG_' .config || true)"
+          echo "Config SHA256: $(sha256sum .config | cut -d' ' -f1)"
           echo "Audit: PASS"
 
       - name: Build
@@ -463,6 +474,7 @@ jobs:
             ARCH=arm64 \
             LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
+            LOCALVERSION=-arm64-main \
             CC="ccache clang --target=aarch64-linux-gnu" \
             HOSTCC="ccache clang" \
             -j"$(( $(nproc) + 1 ))" \
@@ -509,6 +521,12 @@ jobs:
 
           dpkg-deb --contents "$headers_pkg" |
             grep '/usr/src/linux-headers-' >/dev/null
+
+          image_release="$(
+            dpkg-deb --field "$image_pkg" Package
+          )"
+
+          [[ "$image_release" == *"-arm64-main" ]]
 
           cp "${packages[@]}" dist/
 
