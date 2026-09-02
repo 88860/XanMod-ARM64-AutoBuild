@@ -305,15 +305,6 @@ jobs:
               fi
             done > .xanmod-rejected
 
-          while read -r symbol; do
-            if grep -q "^${symbol}=" .config.xanmod; then
-              :
-            fi
-          done < <(
-            grep '^CONFIG_' .xanmod-candidates |
-              sed 's/=.*//'
-          )
-
           disable_if_present() {
             local symbol="$1"
 
@@ -343,9 +334,8 @@ jobs:
 
           disable_if_present LOCALVERSION_AUTO
 
-          xanmod_suffix="${TAG#*-}"
-
-          printf '%s\n' "-${xanmod_suffix}-arm64-main" > localversion
+          # 修复1：不再拼接 ${xanmod_suffix}，防止后缀叠加
+          printf '%s\n' "-arm64-main" > localversion
 
           make \
             ARCH=arm64 \
@@ -366,6 +356,10 @@ jobs:
 
           release="$(cat kernel.release)"
           expected="${TAG}-arm64-main"
+          
+          # 增加的 Debug 信息，如果遇到错误能在 CI 日志里一眼看清
+          echo "Generated release: $release"
+          echo "Expected release: $expected"
 
           test "$release" = "$expected"
 
@@ -453,11 +447,12 @@ jobs:
           fi
 
           if grep -q '^CONFIG_LOCALVERSION=' .config; then
+            # 修复2：补齐闭合双引号 "
             localversion="$(
               sed -n \
                 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' \
                 .config
-            )
+            )"
 
             test -z "$localversion"
           fi
@@ -628,3 +623,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "XanMod ${TAG} ARM64 Main" \
             --notes-file dist/RELEASE.md
+
