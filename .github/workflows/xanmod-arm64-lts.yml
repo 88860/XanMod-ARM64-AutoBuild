@@ -254,9 +254,9 @@ jobs:
           [[ -n "$headers_pkg" ]]
           [[ -n "$libc_pkg" ]]
 
-          dpkg-deb --contents "$image_pkg" | grep -q '/boot/vmlinuz-'
-          dpkg-deb --contents "$image_pkg" | grep -q '/lib/modules/'
-          dpkg-deb --contents "$headers_pkg" | grep -q '/usr/src/linux-headers-'
+          dpkg-deb --contents "$image_pkg" | grep '/boot/vmlinuz-' >/dev/null
+          dpkg-deb --contents "$image_pkg" | grep '/lib/modules/' >/dev/null
+          dpkg-deb --contents "$headers_pkg" | grep '/usr/src/linux-headers-' >/dev/null
 
           cp "${packages[@]}" dist/
 
@@ -285,3 +285,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "XanMod $TAG ARM64" \
             --notes-file dist/RELEASE.md
+
