@@ -160,13 +160,14 @@ jobs:
             libssl-dev:arm64 libelf-dev:arm64 zlib1g-dev:arm64
 
       - name: Cache
-        if: steps.published.outputs.skip != 'true'
-        uses: actions/cache@v4
-        with:
-          path: .ccache
-          key: ${{ runner.os }}-cross-arm64-xanmod-${{ steps.xanmod.outputs.tag }}-clang-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-cross-arm64-xanmod-
+  if: steps.published.outputs.skip != 'true'
+  uses: actions/cache@v4
+  with:
+    path: .ccache
+    key: ${{ runner.os }}-cross-arm64-xanmod-main-${{ steps.xanmod.outputs.tag }}-clang-${{ hashFiles('kernel/.config') }}
+    restore-keys: |
+      ${{ runner.os }}-cross-arm64-xanmod-main-${{ steps.xanmod.outputs.tag }}-clang-
+      ${{ runner.os }}-cross-arm64-xanmod-main-
 
       - name: Source
         if: steps.published.outputs.skip != 'true'
