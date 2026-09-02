@@ -155,6 +155,13 @@ jobs:
           echo "=== 1. Smart merge via Official Kbuild script ==="
           ./scripts/kconfig/merge_config.sh -O . arch/arm64/configs/defconfig CONFIGS/x86_64/config
 
+          echo "=== 1.5. Trim useless drivers for GPU VPS ==="
+          ./scripts/config --disable SOUND \
+                           --disable WLAN \
+                           --disable WIRELESS \
+                           --disable BT \
+                           --disable MEDIA_SUPPORT
+
           echo "=== 2. Normalize and prune configurations ==="
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 olddefconfig
 
@@ -285,4 +292,3 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "XanMod $TAG ARM64" \
             --notes-file dist/RELEASE.md
-
