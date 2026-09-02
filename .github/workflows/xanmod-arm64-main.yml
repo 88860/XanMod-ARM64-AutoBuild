@@ -220,8 +220,8 @@ jobs:
 
           cd kernel
 
-          # 创建 .scmversion 文件，阻止 Kbuild 获取 Git 状态并附加 -dirty 后缀
-          touch .scmversion
+          # 直接删除 .git，从物理层面掐断 -dirty 后缀的生成可能
+          rm -rf .git
 
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
@@ -337,7 +337,7 @@ jobs:
 
           disable_if_present LOCALVERSION_AUTO
 
-          # 提取 TAG 中的 xanmod1 等后缀并组装
+          # 提取 TAG 中的 xanmod1 等后缀，并组装为你预期的完整名字
           xanmod_suffix="${TAG#*-}"
           printf '%s\n' "-${xanmod_suffix}-arm64-main" > localversion
 
@@ -361,6 +361,7 @@ jobs:
           release="$(cat kernel.release)"
           expected="${TAG}-arm64-main"
           
+          # 增加的 Debug 打印信息
           echo "Generated release: $release"
           echo "Expected release: $expected"
 
