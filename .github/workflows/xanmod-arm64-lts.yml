@@ -280,6 +280,13 @@ jobs:
             ./scripts/config --disable LOCALVERSION_AUTO
           fi
 
+          ./scripts/config -d DEBUG_INFO
+          ./scripts/config -d DEBUG_INFO_BTF
+          ./scripts/config -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+          ./scripts/config -d DEBUG_INFO_DWARF4
+          ./scripts/config -d DEBUG_INFO_DWARF5
+          ./scripts/config -e DEBUG_INFO_NONE
+
           xanmod_suffix="${TAG#*-}"
           printf '%s\n' "-${xanmod_suffix}-arm64-lts" > localversion
 
@@ -424,25 +431,27 @@ jobs:
           DEBEMAIL: github-actions@users.noreply.github.com
           KDEB_CHANGELOG_DIST: noble
           CCACHE_DIR: ${{ github.workspace }}/.ccache
+          ARCH: arm64
+          CROSS_COMPILE: aarch64-linux-gnu-
+          LLVM: 1
+          CC: ccache clang
+          HOSTCC: ccache clang
+          LD: ld.lld
+          HOSTLD: ld.lld
+          AR: llvm-ar
+          NM: llvm-nm
+          OBJCOPY: llvm-objcopy
+          OBJDUMP: llvm-objdump
+          STRIP: llvm-strip
+          READELF: llvm-readelf
         run: |
           set -euo pipefail
 
           cd kernel
 
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CCACHE_DIR="$CCACHE_DIR"
-
           ccache --zero-stats
 
-          make \
-            ARCH=arm64 \
-            LLVM=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC="ccache clang --target=aarch64-linux-gnu" \
-            HOSTCC="ccache clang" \
-            -j"$(( $(nproc) + 1 ))" \
-            bindeb-pkg
+          make -j"$(( $(nproc) + 1 ))" bindeb-pkg
 
           ccache --show-stats
 
@@ -469,6 +478,8 @@ jobs:
             [[ "$(dpkg-deb --field "$deb" Architecture)" == "arm64" ]] || exit 1
 
             case "$(dpkg-deb --field "$deb" Package)" in
+              linux-image-*-dbg)
+                ;;
               linux-image-*)
                 image_pkg="$deb"
                 ;;
@@ -532,3 +543,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "XanMod ${TAG} ARM64 LTS" \
             --notes-file dist/RELEASE.md
+
