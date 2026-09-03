@@ -60,26 +60,23 @@ case "$ARCH" in
         echo "[2/5] 检测在线 XanMod MAIN 版本"
         echo
 
-        apt update -qq
-        apt install -y wget curl gpg ca-certificates jq >/dev/null
+        if ! command -v curl >/dev/null 2>&1; then
+            echo "检测依赖 curl 未安装"
+            echo "请先执行: apt-get update && apt-get install -y curl"
+            exit 1
+        fi
 
-        install -d -m 0755 /etc/apt/keyrings
+        XANMOD_REPO_URL="http://deb.xanmod.org/dists/${VERSION_CODENAME}/main/binary-amd64/Packages.gz"
 
-        wget -qO - https://dl.xanmod.org/archive.key |
-            gpg --dearmor --yes -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
+        ONLINE_VERSION=$(curl -fsSL "$XANMOD_REPO_URL" |
+            gzip -dc |
+            awk -v pkg="$XANMOD_PKG" '
+                $1 == "Package:" && $2 == pkg {found=1}
+                found && $1 == "Version:" {print $2; exit}
+                found && $1 == "Package:" && $2 != pkg {exit}
+            ')
 
-        chmod 0644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
-
-        printf '%s\n' \
-            "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${VERSION_CODENAME} main" \
-            > /etc/apt/sources.list.d/xanmod-release.list
-
-        apt update -qq
-
-        ONLINE_VERSION=$(apt-cache policy "$XANMOD_PKG" |
-            awk '/Candidate:/ {print $2; exit}')
-
-        if [ -z "$ONLINE_VERSION" ] || [ "$ONLINE_VERSION" = "(none)" ]; then
+        if [ -z "$ONLINE_VERSION" ]; then
             echo "ERROR: 无法获取 XanMod 在线版本"
             exit 1
         fi
@@ -97,8 +94,11 @@ case "$ARCH" in
         echo "[2/5] 检测在线 XanMod MAIN 版本"
         echo
 
-        apt update -qq
-        apt install -y curl jq >/dev/null
+        if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+            echo "检测依赖 curl 或 jq 未安装"
+            echo "请先安装 curl 和 jq"
+            exit 1
+        fi
 
         RELEASE=$(curl -fsSL \
             'https://api.github.com/repos/88860/XanMod-ARM64-AutoBuild/releases?per_page=100' |
@@ -167,15 +167,33 @@ echo
 echo "[3/5] 开始安装 XanMod MAIN"
 echo
 
+apt-get update
+
+apt-get install -y wget curl gpg ca-certificates jq grub-common grub2-common
+
 case "$ARCH" in
 
     amd64)
 
+        install -d -m 0755 /etc/apt/keyrings
+
+        wget -qO - https://dl.xanmod.org/archive.key |
+            gpg --dearmor --yes -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
+
+        chmod 0644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
+
+        printf '%s\n' \
+            "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${VERSION_CODENAME} main" \
+            > /etc/apt/sources.list.d/xanmod-release.list
+
+        apt-get update
+
+        echo
         echo "正在安装: $XANMOD_PKG"
         echo "目标版本: $ONLINE_VERSION"
         echo
 
-        apt install -y "$XANMOD_PKG"
+        apt-get install -y "$XANMOD_PKG"
 
         ;;
 
@@ -206,7 +224,7 @@ case "$ARCH" in
             exit 1
         fi
 
-        apt install -y "$TMPDIR"/*.deb
+        apt-get install -y "$TMPDIR"/*.deb
 
         ;;
 
