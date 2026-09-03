@@ -532,8 +532,7 @@ read -r -p "是否现在重启系统？[y/N]: " REBOOT_CONFIRM
 case "$REBOOT_CONFIRM" in
     y|Y)
         echo
-        echo "系统将在 3 秒后重启..."
-        sleep 3
+        echo "系统正在重启..."
         reboot
         ;;
     *)
