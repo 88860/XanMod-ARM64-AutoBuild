@@ -435,6 +435,10 @@ jobs:
 
           ccache --zero-stats
 
+          if [ -f scripts/package/mkdebian ]; then
+            sed -i 's|^#!/usr/bin/make -f|#!/usr/bin/make -f\nexport LLVM=1\nexport CROSS_COMPILE=aarch64-linux-gnu-\nexport CC=ccache clang --target=aarch64-linux-gnu\nexport HOSTCC=ccache clang\nexport LD=ld.lld\nexport HOSTLD=ld.lld|' scripts/package/mkdebian
+          fi
+
           make \
             ARCH=arm64 \
             LLVM=1 \
@@ -445,7 +449,7 @@ jobs:
             bindeb-pkg
 
           ccache --show-stats
-
+          
       - name: Verify
         if: steps.published.outputs.skip != 'true'
         env:
