@@ -432,6 +432,7 @@ jobs:
           echo "Config SHA256: $(sha256sum .config | cut -d' ' -f1)"
 
       - name: Build
+            - name: Build
         if: steps.published.outputs.skip != 'true'
         env:
           KBUILD_BUILD_USER: github-actions
@@ -445,18 +446,27 @@ jobs:
 
           cd kernel
 
-          sudo ln -sf /usr/bin/lld /usr/bin/ld.lld
-
-          export PATH="/usr/lib/ccache:$PATH"
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export LLVM=1
+          export CCACHE_DIR="$CCACHE_DIR"
 
           ccache --zero-stats
 
-          make -j"$(( $(nproc) + 1 ))" bindeb-pkg
+          if [ -f scripts/package/mkdebian ]; then
+            sed -i 's|^#!/usr/bin/make -f|#!/usr/bin/make -f\nexport LLVM=1\nexport CROSS_COMPILE=aarch64-linux-gnu-\nexport CC=ccache clang --target=aarch64-linux-gnu\nexport HOSTCC=ccache clang\nexport LD=ld.lld\nexport HOSTLD=ld.lld|' scripts/package/mkdebian
+          fi
+
+          make \
+            ARCH=arm64 \
+            LLVM=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang --target=aarch64-linux-gnu" \
+            HOSTCC="ccache clang" \
+            -j"$(( $(nproc) + 1 ))" \
+            bindeb-pkg
 
           ccache --show-stats
+
 
       - name: Verify
         if: steps.published.outputs.skip != 'true'
