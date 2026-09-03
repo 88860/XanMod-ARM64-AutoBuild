@@ -11,7 +11,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-for cmd in curl wget dpkg apt-get update-grub awk grep sed sort head find; do
+for cmd in curl wget dpkg apt-get update-grub awk grep sed sort head find gpg; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "缺少命令: $cmd"
         exit 1
@@ -53,14 +53,17 @@ if [ "$ARCH" = "arm64" ]; then
         apt-get install -y jq
     fi
 
-    RELEASES="$(curl -fsSL \
-        "https://api.github.com/repos/${REPO}/releases")"
+    RELEASES="$(
+        curl -fsSL \
+        "https://api.github.com/repos/${REPO}/releases"
+    )"
 
     LATEST_RELEASE="$(
         echo "$RELEASES" |
         jq -r '
             .[]
-            | select(.draft == false and .prerelease == false)
+            | select(.draft == false)
+            | select(.prerelease == false)
             | select(
                 ((.tag_name // "") | test("main"; "i"))
                 or
@@ -78,12 +81,13 @@ if [ "$ARCH" = "arm64" ]; then
 
     echo "最新版本: $LATEST_RELEASE"
 
-    INSTALLED_VERSION="$INSTALLED_XANMOD"
-    INSTALLED_VERSION="${INSTALLED_VERSION%-arm64-main}"
+    INSTALLED_VERSION="${INSTALLED_XANMOD%-arm64-main}"
 
     if [ -n "$INSTALLED_XANMOD" ] &&
        [ "$INSTALLED_VERSION" = "$LATEST_RELEASE" ]; then
+
         echo "ARM64 XanMod 已是最新版本"
+
     else
 
         echo "准备安装: $LATEST_RELEASE"
@@ -98,7 +102,7 @@ if [ "$ARCH" = "arm64" ]; then
             jq -r '
                 .assets[]
                 | select(
-                    (.name | test("^linux-image-.*arm64\\.deb$"))
+                    .name | test("^linux-image-.*arm64\\.deb$")
                   )
                 | .browser_download_url
             ' |
@@ -110,7 +114,7 @@ if [ "$ARCH" = "arm64" ]; then
             jq -r '
                 .assets[]
                 | select(
-                    (.name | test("^linux-headers-.*arm64\\.deb$"))
+                    .name | test("^linux-headers-.*arm64\\.deb$")
                   )
                 | .browser_download_url
             ' |
@@ -125,13 +129,15 @@ if [ "$ARCH" = "arm64" ]; then
         mkdir -p /tmp/xanmod-install
         rm -f /tmp/xanmod-install/*.deb
 
-        echo "下载内核"
+        echo "下载 XanMod 内核"
 
         wget -q --show-progress \
             "$IMAGE_URL" \
             -O /tmp/xanmod-install/linux-image.deb
 
-        if [ -n "$HEADERS_URL" ] && [ "$HEADERS_URL" != "null" ]; then
+        if [ -n "$HEADERS_URL" ] &&
+           [ "$HEADERS_URL" != "null" ]; then
+
             wget -q --show-progress \
                 "$HEADERS_URL" \
                 -O /tmp/xanmod-install/linux-headers.deb
@@ -152,12 +158,14 @@ elif [ "$ARCH" = "amd64" ]; then
     echo "开始检查 amd64 XanMod"
 
     if [ -x /lib64/ld-linux-x86-64.so.2 ]; then
-        CPU_LEVEL="$(
-            /lib64/ld-linux-x86-64.so.2 --help 2>/dev/null |
-            grep -q 'x86-64-v3' &&
-            echo "v3" ||
-            echo "v2"
-        )
+
+        if /lib64/ld-linux-x86-64.so.2 --help 2>/dev/null |
+            grep -q 'x86-64-v3'; then
+            CPU_LEVEL="v3"
+        else
+            CPU_LEVEL="v2"
+        fi
+
     else
         CPU_LEVEL="v2"
     fi
@@ -174,7 +182,7 @@ elif [ "$ARCH" = "amd64" ]; then
     . /etc/os-release
 
     if [ -z "${VERSION_CODENAME:-}" ]; then
-        echo "无法确定 Debian 版本代号"
+        echo "无法确定系统版本代号"
         exit 1
     fi
 
@@ -185,9 +193,11 @@ elif [ "$ARCH" = "amd64" ]; then
     mkdir -p /etc/apt/keyrings
 
     if [ ! -f /etc/apt/keyrings/xanmod-archive-keyring.gpg ]; then
+
         echo "安装 XanMod 软件源密钥"
 
-        wget -qO- https://dl.xanmod.org/archive.key |
+        wget -qO- \
+            https://dl.xanmod.org/archive.key |
             gpg --dearmor \
             -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
     fi
@@ -213,50 +223,84 @@ fi
 INSTALLED_XANMOD="$(get_xanmod_kernel)"
 
 if [ -z "$INSTALLED_XANMOD" ]; then
-    echo "未找到已安装的 XanMod 内核"
+    echo "安装后没有找到 XanMod 内核"
     exit 1
 fi
 
-echo "当前 XanMod: $INSTALLED_XANMOD"
+echo "XanMod 内核: $INSTALLED_XANMOD"
 
 echo "更新 GRUB"
 
 update-grub
 
 if [ ! -f "$GRUB_CFG" ]; then
-    echo "找不到 $GRUB_CFG"
+    echo "找不到 GRUB 配置"
     exit 1
 fi
 
 XANMOD_GRUB_PATH=""
 
-CURRENT_SUBMENU_ID=""
+MENU_ID=""
+MENU_DEPTH=0
+SUBMENU_ID=""
 
 while IFS= read -r line; do
 
-    if [[ "$line" =~ ^[[:space:]]*submenu[[:space:]]+.*--id[[:space:]]+\'([^\']+)\' ]]; then
-        CURRENT_SUBMENU_ID="${BASH_REMATCH[1]}"
+    OPEN_COUNT="$(
+        printf '%s\n' "$line" |
+        tr -cd '{' |
+        wc -c
+    )"
+
+    CLOSE_COUNT="$(
+        printf '%s\n' "$line" |
+        tr -cd '}' |
+        wc -c
+    )"
+
+    if printf '%s\n' "$line" |
+        grep -qE '^[[:space:]]*submenu '; then
+
+        SUBMENU_ID="$(
+            printf '%s\n' "$line" |
+            sed -n "s/.*--id[[:space:]]*'\\([^']*\\)'.*/\\1/p"
+        )
+
+        MENU_DEPTH=$((MENU_DEPTH + OPEN_COUNT - CLOSE_COUNT))
         continue
     fi
 
-    if [[ "$line" =~ menuentry[[:space:]]+.*Linux[[:space:]]+${INSTALLED_XANMOD//./\\.}.*--id[[:space:]]+\'([^\']+)\' ]]; then
+    if printf '%s\n' "$line" |
+        grep -q "menuentry "; then
 
-        ENTRY_ID="${BASH_REMATCH[1]}"
+        if printf '%s\n' "$line" |
+            grep -q "Linux ${INSTALLED_XANMOD}" &&
+            ! printf '%s\n' "$line" |
+            grep -q "recovery mode"; then
 
-        if [[ "$line" != *"recovery mode"* ]]; then
+            MENU_ID="$(
+                printf '%s\n' "$line" |
+                sed -n "s/.*--id[[:space:]]*'\\([^']*\\)'.*/\\1/p"
+            )"
 
-            if [ -n "$CURRENT_SUBMENU_ID" ]; then
-                XANMOD_GRUB_PATH="${CURRENT_SUBMENU_ID}>${ENTRY_ID}"
-            else
-                XANMOD_GRUB_PATH="$ENTRY_ID"
+            if [ -n "$MENU_ID" ]; then
+
+                if [ -n "$SUBMENU_ID" ]; then
+                    XANMOD_GRUB_PATH="${SUBMENU_ID}>${MENU_ID}"
+                else
+                    XANMOD_GRUB_PATH="$MENU_ID"
+                fi
+
+                break
             fi
-
-            break
         fi
     fi
 
-    if [[ "$line" =~ ^[[:space:]]*}[[:space:]]*$ ]]; then
-        CURRENT_SUBMENU_ID=""
+    MENU_DEPTH=$((MENU_DEPTH + OPEN_COUNT - CLOSE_COUNT))
+
+    if [ "$MENU_DEPTH" -le 0 ]; then
+        SUBMENU_ID=""
+        MENU_DEPTH=0
     fi
 
 done < "$GRUB_CFG"
@@ -264,10 +308,10 @@ done < "$GRUB_CFG"
 if [ -z "$XANMOD_GRUB_PATH" ]; then
 
     XANMOD_GRUB_PATH="$(
-        grep "menuentry" "$GRUB_CFG" |
+        grep "menuentry " "$GRUB_CFG" |
         grep "Linux ${INSTALLED_XANMOD}" |
         grep -v "recovery mode" |
-        sed -n "s/.*--id-option[[:space:]]*'\\([^']*\\)'.*/\\1/p" |
+        sed -n "s/.*--id[[:space:]]*'\\([^']*\\)'.*/\\1/p" |
         head -n1
     )"
 
@@ -281,13 +325,17 @@ fi
 echo "XanMod GRUB 启动项: $XANMOD_GRUB_PATH"
 
 if grep -q '^GRUB_DEFAULT=' "$GRUB_DEFAULT_FILE"; then
-    sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' "$GRUB_DEFAULT_FILE"
+    sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' \
+        "$GRUB_DEFAULT_FILE"
 else
     echo 'GRUB_DEFAULT=saved' >> "$GRUB_DEFAULT_FILE"
 fi
 
 if grep -q '^GRUB_SAVEDEFAULT=' "$GRUB_DEFAULT_FILE"; then
-    sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=false/' "$GRUB_DEFAULT_FILE"
+    sed -i 's/^GRUB_SAVEDEFAULT=.*/GRUB_SAVEDEFAULT=false/' \
+        "$GRUB_DEFAULT_FILE"
+else
+    echo 'GRUB_SAVEDEFAULT=false' >> "$GRUB_DEFAULT_FILE"
 fi
 
 if command -v grub-set-default >/dev/null 2>&1; then
@@ -296,12 +344,13 @@ if command -v grub-set-default >/dev/null 2>&1; then
 
 else
 
-    echo "缺少 grub-set-default"
-
     if command -v grub-editenv >/dev/null 2>&1; then
-        grub-editenv /boot/grub/grubenv set \
-            "saved_entry=$XANMOD_GRUB_PATH"
+
+        grub-editenv /boot/grub/grubenv \
+            set "saved_entry=$XANMOD_GRUB_PATH"
+
     else
+
         echo "无法设置 GRUB 默认启动项"
         exit 1
     fi
@@ -310,20 +359,19 @@ fi
 update-grub
 
 echo
-echo "================================"
+echo "=============================="
 echo "XanMod 配置完成"
-echo "================================"
-echo "XanMod 内核: $INSTALLED_XANMOD"
+echo "=============================="
+echo "XanMod: $INSTALLED_XANMOD"
 echo "GRUB 默认项: $XANMOD_GRUB_PATH"
 echo
 
 if command -v grub-editenv >/dev/null 2>&1; then
-    echo "GRUB 保存状态:"
     grub-editenv /boot/grub/grubenv list 2>/dev/null || true
-    echo
 fi
 
-echo "已安装的 XanMod 内核:"
+echo
+echo "已安装 XanMod:"
 find /lib/modules \
     -mindepth 1 \
     -maxdepth 1 \
@@ -334,7 +382,7 @@ find /lib/modules \
 
 echo
 echo "下次启动将默认进入 XanMod"
-echo "其他内核不会被删除或修改"
+echo "其他内核不会被处理"
 echo
 
 read -r -p "现在重启吗？[y/N]: " REBOOT
