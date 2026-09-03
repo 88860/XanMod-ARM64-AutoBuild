@@ -4,10 +4,6 @@ set -u
 
 SCRIPT_NAME="XanMod MAIN 安装和升级"
 
-# ============================================================
-# 基础函数
-# ============================================================
-
 die() {
     echo
     echo "错误: $1"
@@ -16,20 +12,14 @@ die() {
 }
 
 require_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        die "请使用 root 运行此脚本"
-    fi
+    [ "$(id -u)" -eq 0 ] || die "请使用 root 运行此脚本"
 }
-
-command -v curl >/dev/null 2>&1 || die "未找到 curl，请先安装 curl"
-command -v awk >/dev/null 2>&1 || die "未找到 awk"
-command -v gzip >/dev/null 2>&1 || die "未找到 gzip"
 
 require_root
 
-# ============================================================
-# 系统检测
-# ============================================================
+for cmd in awk sed grep curl gzip; do
+    command -v "$cmd" >/dev/null 2>&1 || die "未找到 $cmd"
+done
 
 echo "========================================"
 echo "      ${SCRIPT_NAME}"
@@ -39,11 +29,8 @@ echo
 echo "[1/5] 检测系统信息"
 echo
 
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-else
-    die "无法读取 /etc/os-release"
-fi
+[ -f /etc/os-release ] || die "无法读取 /etc/os-release"
+. /etc/os-release
 
 ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
 CURRENT_KERNEL=$(uname -r)
@@ -53,17 +40,12 @@ echo "架构: ${ARCH}"
 echo "当前运行内核: ${CURRENT_KERNEL}"
 echo
 
-# ============================================================
-# XanMod 架构判断
-# ============================================================
-
 if [ "$ARCH" = "amd64" ]; then
 
     echo "架构类型: x86-64"
     echo
 
-    # 注意：
-    # 这里严格保留原来的 v2/v3 检测逻辑
+    # 保留原有 v2/v3 检测逻辑
     if /lib64/ld-linux-x86-64.so.2 --help 2>/dev/null | grep -q 'x86-64-v3 (supported, searched)'; then
         XANMOD_VER="x86-64-v3"
         XANMOD_PKG="linux-xanmod-x64v3"
@@ -77,15 +59,14 @@ if [ "$ARCH" = "amd64" ]; then
 
     echo "CPU 兼容级别: ${XANMOD_VER}"
 
-    if [ -z "$XANMOD_PKG" ]; then
-        die "当前 CPU 不支持 XanMod x86-64-v2/v3"
-    fi
+    [ -n "$XANMOD_PKG" ] || die "当前 CPU 不支持 XanMod x86-64-v2/v3"
 
     echo "XanMod 适配版本: ${XANMOD_PKG}"
 
 elif [ "$ARCH" = "arm64" ]; then
 
     echo "架构类型: ARM64"
+
     XANMOD_VER="ARM64"
     XANMOD_PKG=""
 
@@ -96,22 +77,16 @@ fi
 
 echo
 
-# ============================================================
-# 检测当前已安装 XanMod 内核
-# ============================================================
-
 INSTALLED_XANMOD=""
 
-for kernel in /lib/modules/*; do
-    [ -d "$kernel" ] || continue
+for kernel_dir in /lib/modules/*; do
+    [ -d "$kernel_dir" ] || continue
 
-    k=$(basename "$kernel")
+    kernel_name=$(basename "$kernel_dir")
 
-    case "$k" in
-        *xanmod*)
-            INSTALLED_XANMOD="$k"
-            ;;
-    esac
+    if [[ "$kernel_name" == *xanmod* ]]; then
+        INSTALLED_XANMOD="$kernel_name"
+    fi
 done
 
 if [ -n "$INSTALLED_XANMOD" ]; then
@@ -121,16 +96,10 @@ else
 fi
 
 echo
-
-# ============================================================
-# 检测在线版本
-# ============================================================
-
 echo "[2/5] 检测在线 XanMod MAIN 版本"
 echo
 
 ONLINE_VERSION=""
-ONLINE_KERNEL=""
 
 if [ "$ARCH" = "amd64" ]; then
 
@@ -150,9 +119,7 @@ if [ "$ARCH" = "amd64" ]; then
         '
     )
 
-    if [ -z "$ONLINE_VERSION" ]; then
-        die "无法获取 XanMod MAIN 在线版本"
-    fi
+    [ -n "$ONLINE_VERSION" ] || die "无法获取 XanMod MAIN 在线版本"
 
     echo "在线软件包版本: ${ONLINE_VERSION}"
     echo "软件包: ${XANMOD_PKG}"
@@ -185,15 +152,10 @@ elif [ "$ARCH" = "arm64" ]; then
         )
 
     else
-
-        RELEASE_TAG=$(echo "$RELEASE_JSON" |
-            grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' |
-            head -n1 |
-            sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"//;s/"$//')
+        die "ARM64 检测需要 jq，请先安装 jq"
     fi
 
-    [ -n "$RELEASE_TAG" ] ||
-        die "无法找到 XanMod ARM64 MAIN 版本"
+    [ -n "$RELEASE_TAG" ] || die "无法找到 XanMod ARM64 MAIN 版本"
 
     ONLINE_VERSION="$RELEASE_TAG"
 
@@ -201,14 +163,6 @@ elif [ "$ARCH" = "arm64" ]; then
 fi
 
 echo
-echo "========================================"
-echo "检测完成"
-echo "========================================"
-echo
-
-# ============================================================
-# 判断安装 / 升级 / 已是最新
-# ============================================================
 
 ACTION="安装"
 
@@ -218,35 +172,47 @@ fi
 
 if [ "$ARCH" = "amd64" ] && [ -n "$INSTALLED_XANMOD" ]; then
 
-    # 查询当前软件包版本
     INSTALLED_PKG_VERSION=$(
         dpkg-query -W -f='${Version}' "$XANMOD_PKG" 2>/dev/null || true
     )
 
     if [ -n "$INSTALLED_PKG_VERSION" ]; then
+
         echo "当前软件包版本: ${INSTALLED_PKG_VERSION}"
         echo "在线软件包版本: ${ONLINE_VERSION}"
+        echo
 
         if [ "$INSTALLED_PKG_VERSION" = "$ONLINE_VERSION" ]; then
-            echo
             echo "XanMod MAIN 已经是最新版本。"
             echo
 
-            read -r -p "仍然重新安装当前版本吗？[y/N]: " REINSTALL
+            read -r -p "是否重新安装当前版本？[y/N]: " REINSTALL
 
             case "$REINSTALL" in
-                y|Y)
-                    ACTION="重新安装"
-                    ;;
-                *)
-                    echo
-                    echo "无需操作。"
-                    exit 0
-                    ;;
+                y|Y) ACTION="重新安装" ;;
+                *) echo "无需操作。"; exit 0 ;;
             esac
-        else
-            ACTION="升级"
         fi
+    fi
+
+elif [ "$ARCH" = "arm64" ] && [ -n "$INSTALLED_XANMOD" ]; then
+
+    CURRENT_XANMOD_VERSION="${INSTALLED_XANMOD%%-xanmod*}"
+
+    echo "当前 XanMod 内核: ${INSTALLED_XANMOD}"
+    echo "在线 XanMod 版本: ${ONLINE_VERSION}"
+    echo
+
+    if [[ "$INSTALLED_XANMOD" == *"$ONLINE_VERSION"* ]]; then
+        echo "当前 XanMod 已经是在线版本。"
+        echo
+
+        read -r -p "是否重新安装当前版本？[y/N]: " REINSTALL
+
+        case "$REINSTALL" in
+            y|Y) ACTION="重新安装" ;;
+            *) echo "无需操作。"; exit 0 ;;
+        esac
     fi
 fi
 
@@ -256,18 +222,9 @@ echo
 read -r -p "是否${ACTION} XanMod MAIN 内核？[y/N]: " CONFIRM
 
 case "$CONFIRM" in
-    y|Y)
-        ;;
-    *)
-        echo
-        echo "已取消。"
-        exit 0
-        ;;
+    y|Y) ;;
+    *) echo "已取消。"; exit 0 ;;
 esac
-
-# ============================================================
-# 安装 / 升级
-# ============================================================
 
 echo
 echo "[3/5] 开始${ACTION} XanMod MAIN"
@@ -275,14 +232,11 @@ echo
 
 if [ "$ARCH" = "amd64" ]; then
 
-    echo "配置 XanMod 软件源..."
-
     mkdir -p /etc/apt/keyrings
 
-    curl -fsSL \
-        https://dl.xanmod.org/archive.key |
-        gpg --dearmor \
-        -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
+    curl -fsSL https://dl.xanmod.org/archive.key |
+        gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg ||
+        die "XanMod 密钥安装失败"
 
     chmod 644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
 
@@ -292,71 +246,54 @@ EOF
 
     echo "更新软件包索引..."
 
-    apt-get update
+    apt-get update ||
+        die "apt-get update 失败"
 
     echo
     echo "安装 / 升级 ${XANMOD_PKG}..."
 
     DEBIAN_FRONTEND=noninteractive \
-        apt-get install -y "$XANMOD_PKG"
-
-    if [ $? -ne 0 ]; then
+        apt-get install -y "$XANMOD_PKG" ||
         die "XanMod 安装 / 升级失败"
-    fi
 
 elif [ "$ARCH" = "arm64" ]; then
 
-    echo "获取 XanMod ARM64 MAIN 安装包..."
-
     TMP_DIR=$(mktemp -d)
+    trap 'rm -rf "$TMP_DIR"' EXIT
 
-    cleanup() {
-        rm -rf "$TMP_DIR"
-    }
-
-    trap cleanup EXIT
+    echo "获取 XanMod ARM64 MAIN 安装包..."
 
     RELEASE_JSON=$(curl -fsSL \
         "https://api.github.com/repos/88860/XanMod-ARM64-AutoBuild/releases") ||
         die "无法获取 GitHub Release"
 
-    if command -v jq >/dev/null 2>&1; then
+    ASSETS=$(
+        echo "$RELEASE_JSON" |
+        jq -r '
+            .[]
+            | select(.draft == false)
+            | select(.prerelease == false)
+            | select(
+                ((.tag_name // "") | ascii_downcase | contains("main"))
+                or
+                ((.name // "") | ascii_downcase | contains("main"))
+                or
+                ((.body // "") | ascii_downcase | contains("main"))
+            )
+            | .assets[]
+            | select(
+                (.name | test("^linux-(image|headers)-.*arm64\\.deb$"))
+            )
+            | .browser_download_url
+        ' |
+        head -n2
+    )
 
-        ASSETS=$(
-            echo "$RELEASE_JSON" |
-            jq -r '
-                .[]
-                | select(.draft == false)
-                | select(.prerelease == false)
-                | select(
-                    ((.tag_name // "") | ascii_downcase | contains("main"))
-                    or
-                    ((.name // "") | ascii_downcase | contains("main"))
-                    or
-                    ((.body // "") | ascii_downcase | contains("main"))
-                )
-                | .assets[]
-                | select(
-                    (.name | test("^linux-(image|headers)-.*arm64\\.deb$"))
-                )
-                | .browser_download_url
-            ' |
-            head -n2
-        )
-
-    else
-        ASSETS=$(
-            echo "$RELEASE_JSON" |
-            grep -o 'https[^"]*linux-[^"]*arm64\.deb' |
-            head -n2
-        )
-    fi
-
-    [ -n "$ASSETS" ] ||
-        die "没有找到 ARM64 XanMod MAIN 安装包"
+    [ -n "$ASSETS" ] || die "没有找到 ARM64 XanMod MAIN 安装包"
 
     echo "$ASSETS" |
     while read -r URL; do
+
         [ -n "$URL" ] || continue
 
         FILE="$TMP_DIR/$(basename "$URL")"
@@ -365,6 +302,7 @@ elif [ "$ARCH" = "arm64" ]; then
 
         curl -fL "$URL" -o "$FILE" ||
             die "下载失败: $URL"
+
     done
 
     echo
@@ -373,14 +311,12 @@ elif [ "$ARCH" = "arm64" ]; then
     dpkg -i "$TMP_DIR"/*.deb
 
     if [ $? -ne 0 ]; then
+
         echo
-        echo "检测到依赖问题，尝试自动修复..."
+        echo "尝试修复依赖..."
 
-        apt-get -f install -y
-
-        if [ $? -ne 0 ]; then
+        apt-get -f install -y ||
             die "ARM64 XanMod 安装失败"
-        fi
     fi
 
 fi
@@ -391,20 +327,18 @@ echo "XanMod ${ACTION}成功"
 echo "========================================"
 echo
 
-# ============================================================
-# 动态检测实际安装的 XanMod 内核
-# ============================================================
-
 XANMOD_KERNEL=""
 
 for kernel_dir in /lib/modules/*; do
+
     [ -d "$kernel_dir" ] || continue
 
-    k=$(basename "$kernel_dir")
+    kernel_name=$(basename "$kernel_dir")
 
-    if [[ "$k" == *xanmod* ]]; then
-        XANMOD_KERNEL="$k"
+    if [[ "$kernel_name" == *xanmod* ]]; then
+        XANMOD_KERNEL="$kernel_name"
     fi
+
 done
 
 [ -n "$XANMOD_KERNEL" ] ||
@@ -412,109 +346,127 @@ done
 
 echo "检测到 XanMod 内核:"
 echo "${XANMOD_KERNEL}"
-
 echo
-
-# ============================================================
-# 设置 GRUB 默认启动
-# ============================================================
 
 echo "[4/5] 设置 XanMod 为默认启动内核"
 echo
 
-# 确保 grub 使用 saved 模式
+command -v update-grub >/dev/null 2>&1 ||
+    die "未找到 update-grub"
+
+command -v grub-set-default >/dev/null 2>&1 ||
+    die "未找到 grub-set-default"
+
+command -v grub-editenv >/dev/null 2>&1 ||
+    die "未找到 grub-editenv"
+
 if grep -q '^GRUB_DEFAULT=' /etc/default/grub; then
     sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
 else
     echo 'GRUB_DEFAULT=saved' >> /etc/default/grub
 fi
 
-# 生成 grub.cfg
-update-grub
-
-if [ $? -ne 0 ]; then
+update-grub ||
     die "update-grub 执行失败"
-fi
 
-# ============================================================
-# 从 grub.cfg 动态获取 XanMod menuentry ID
-# 同时兼容：
-#   $menuentry_id_option 'xxxx'
-#   --id 'xxxx'
-# ============================================================
+echo
+echo "正在搜索 XanMod GRUB 启动项..."
+echo
 
-GRUB_ID=$(
-    awk -v kernel="$XANMOD_KERNEL" '
-        /menuentry / {
-            id=""
-            active=1
-
-            line=$0
+# 按 XanMod 名称寻找正式 menuentry，并处理 submenu 层级
+GRUB_TARGET=$(
+    awk '
+        function extract_id(line, x) {
 
             if (match(line, /\$menuentry_id_option '\''[^'\'']+'\''/)) {
                 x=substr(line, RSTART, RLENGTH)
                 sub(/^\$menuentry_id_option[[:space:]]+'\''/, "", x)
                 sub(/'\''$/, "", x)
-                id=x
+                return x
             }
-            else if (match(line, /--id[[:space:]]+'\''[^'\'']+'\''/)) {
+
+            if (match(line, /--id[[:space:]]+'\''[^'\'']+'\''/)) {
                 x=substr(line, RSTART, RLENGTH)
                 sub(/^--id[[:space:]]+'\''/, "", x)
                 sub(/'\''$/, "", x)
-                id=x
+                return x
             }
+
+            return ""
         }
 
-        active && index($0, "vmlinuz-" kernel) {
-            if (id != "") {
-                print id
-                exit
+        {
+            line=$0
+
+            if (match(line, /^submenu /)) {
+                submenu_id=extract_id(line)
+                submenu_depth=1
+                next
+            }
+
+            if (match(line, /^menuentry /)) {
+
+                entry_id=extract_id(line)
+                lower=tolower(line)
+
+                if (
+                    index(lower, "xanmod") > 0 &&
+                    index(lower, "recovery") == 0 &&
+                    entry_id != ""
+                ) {
+
+                    if (submenu_id != "") {
+                        print submenu_id ">" entry_id
+                    } else {
+                        print entry_id
+                    }
+
+                    exit
+                }
+            }
+
+            if (submenu_id != "" && line ~ /^}/) {
+                submenu_id=""
             }
         }
     ' /boot/grub/grub.cfg
 )
 
-if [ -z "$GRUB_ID" ]; then
-    die "无法找到 XanMod 对应的 GRUB ID"
-fi
+[ -n "$GRUB_TARGET" ] ||
+    die "无法找到名称包含 XanMod 的 GRUB 正式启动项"
 
-echo "XanMod GRUB ID:"
-echo "$GRUB_ID"
+echo "找到 XanMod GRUB 启动项:"
+echo "${GRUB_TARGET}"
 echo
 
-# ============================================================
-# 写入 saved_entry
-# ============================================================
-
-if ! command -v grub-set-default >/dev/null 2>&1; then
-    die "未找到 grub-set-default"
-fi
-
-grub-set-default "$GRUB_ID"
-
-if [ $? -ne 0 ]; then
+grub-set-default "$GRUB_TARGET" ||
     die "设置 GRUB 默认启动失败"
-fi
 
-# ============================================================
-# 验证
-# ============================================================
+SAVED_ENTRY=$(
+    grub-editenv list 2>/dev/null |
+    sed -n 's/^saved_entry=//p'
+)
 
-SAVED_ENTRY=$(grub-editenv list 2>/dev/null |
-    sed -n 's/^saved_entry=//p')
+if [ "$SAVED_ENTRY" != "$GRUB_TARGET" ]; then
 
-if [ "$SAVED_ENTRY" != "$GRUB_ID" ]; then
+    echo "GRUB 默认启动验证失败。"
+    echo
+    echo "期望:"
+    echo "$GRUB_TARGET"
+    echo
+    echo "实际:"
+    echo "${SAVED_ENTRY:-未设置}"
+
     die "GRUB 默认启动验证失败"
 fi
 
-echo "GRUB 默认启动设置成功。"
+echo "GRUB 默认启动项设置成功。"
 echo
-echo "默认启动内核:"
-echo "${XANMOD_KERNEL}"
-
-# ============================================================
-# 重启确认
-# ============================================================
+echo "目标启动项: XanMod"
+echo "目标内核: ${XANMOD_KERNEL}"
+echo
+echo "注意：这里只验证 GRUB 默认项。"
+echo "重启后的实际运行内核请使用 uname -r 确认。"
 
 echo
 echo "========================================"
@@ -523,8 +475,10 @@ echo "========================================"
 echo
 
 echo "XanMod MAIN 已成功${ACTION}。"
-echo "下次启动将默认进入:"
-echo "${XANMOD_KERNEL}"
+echo
+echo "当前运行内核: ${CURRENT_KERNEL}"
+echo "GRUB 默认启动: XanMod"
+echo "目标内核: ${XANMOD_KERNEL}"
 echo
 
 read -r -p "是否现在重启系统？[y/N]: " REBOOT_CONFIRM
@@ -532,16 +486,4 @@ read -r -p "是否现在重启系统？[y/N]: " REBOOT_CONFIRM
 case "$REBOOT_CONFIRM" in
     y|Y)
         echo
-        echo "系统正在重启..."
-        reboot
-        ;;
-    *)
-        echo
-        echo "已取消重启。"
-        echo "当前系统仍运行:"
-        echo "${CURRENT_KERNEL}"
-        echo
-        echo "下次重启将默认进入:"
-        echo "${XANMOD_KERNEL}"
-        ;;
-esac
+        echo "正在重启系统
