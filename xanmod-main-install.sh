@@ -203,23 +203,38 @@ GRUB_DEFAULT_FILE="/etc/default/grub"
 [ -f "$GRUB_CFG" ] ||
     die "GRUB configuration not found"
 
-XANMOD_GRUB_ID=$(
-    grep -B 30 "vmlinuz-${XANMOD_KERNEL}" "$GRUB_CFG" |
-    grep "menuentry " |
-    grep -v "recovery mode" |
-    sed -n "s/.*--id[[:space:]]*'\([^']*\)'.*/\1/p" |
-    tail -n1
-)
-
-if [ -z "$XANMOD_GRUB_ID" ]; then
-    XANMOD_GRUB_ID=$(
-        grep -B 50 "vmlinuz-${XANMOD_KERNEL}" "$GRUB_CFG" |
-        grep "menuentry " |
-        grep -vi "recovery" |
-        sed -n "s/.*--id[[:space:]]*'\([^']*\)'.*/\1/p" |
-        tail -n1
-    )
-fi
+XANMOD_GRUB_ID=$(awk -v k="vmlinuz-${XANMOD_KERNEL}" '
+    /^[[:space:]]*submenu[[:space:]]/ {
+        for(i=1; i<=NF; i++) {
+            if($i ~ /id_option$/ || $i == "--id") {
+                id = $(i+1)
+                gsub(/'\''/, "", id)
+                sub_id = id
+            }
+        }
+    }
+    /^[[:space:]]*menuentry[[:space:]]/ {
+        m_id = ""
+        for(i=1; i<=NF; i++) {
+            if($i ~ /id_option$/ || $i == "--id") {
+                id = $(i+1)
+                gsub(/'\''/, "", id)
+                m_id = id
+            }
+        }
+        if ($0 ~ /recovery/) {
+            m_id = ""
+        }
+    }
+    $0 ~ k && m_id != "" {
+        if (sub_id != "") {
+            print sub_id ">" m_id
+        } else {
+            print m_id
+        }
+        exit
+    }
+' "$GRUB_CFG")
 
 [ -n "$XANMOD_GRUB_ID" ] ||
     die "XanMod GRUB entry not found"
@@ -251,7 +266,7 @@ update-grub || die "最终 update-grub 失败"
 
 echo "XanMod: $XANMOD_KERNEL"
 echo "GRUB: $XANMOD_GRUB_ID"
-echo "完成，系统将在 3 秒后重启"
+echo "完成，系统即将重启"
 
-sleep 3
 reboot
+
