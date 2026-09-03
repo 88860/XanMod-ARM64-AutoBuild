@@ -431,8 +431,7 @@ jobs:
           echo "Final config: $(grep -c '^CONFIG_' .config || true)"
           echo "Config SHA256: $(sha256sum .config | cut -d' ' -f1)"
 
-      - name: Build
-            - name: Build
+        - name: Build
         if: steps.published.outputs.skip != 'true'
         env:
           KBUILD_BUILD_USER: github-actions
