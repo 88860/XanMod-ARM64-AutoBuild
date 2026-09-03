@@ -51,15 +51,8 @@ jobs:
                 "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page"
             )"
 
-            while IFS=$'\t' read -r candidate candidate_commit candidate_released candidate_url; do
-              [[ -n "$candidate" ]] || continue
-
-              tag="$candidate"
-              commit="$candidate_commit"
-              released_at="$candidate_released"
-              package_url="$candidate_url"
-              break
-            done < <(
+            # 修复 1：移除 while 循环，直接 read 单行，彻底消除 jq Broken pipe 报错
+            IFS=$'\t' read -r tag commit released_at package_url < <(
               jq -r '
                 limit(1;
                   .[]
@@ -88,7 +81,7 @@ jobs:
                   | @tsv
                 )
               ' <<<"$releases"
-            )
+            ) || true
 
             [[ -n "$tag" ]] && break
 
@@ -457,12 +450,16 @@ jobs:
             sed -i 's|^#!/usr/bin/make -f|#!/usr/bin/make -f\nexport LLVM=1\nexport CROSS_COMPILE=aarch64-linux-gnu-\nexport CC=ccache clang --target=aarch64-linux-gnu\nexport HOSTCC=ccache clang\nexport LD=ld.lld\nexport HOSTLD=ld.lld|' scripts/package/mkdebian
           fi
 
+          # 修复 2：加入 HOSTLD, HOSTAR, HOSTCFLAGS 参数，统一确保纯正的 LLVM 工具链编译
           make \
             ARCH=arm64 \
             LLVM=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang --target=aarch64-linux-gnu" \
             HOSTCC="ccache clang" \
+            HOSTLD="ld.lld" \
+            HOSTAR="llvm-ar" \
+            HOSTCFLAGS="-fuse-ld=lld" \
             -j"$(( $(nproc) + 1 ))" \
             bindeb-pkg
 
