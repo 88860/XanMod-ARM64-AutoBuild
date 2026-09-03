@@ -204,20 +204,20 @@ GRUB_DEFAULT_FILE="/etc/default/grub"
     die "GRUB configuration not found"
 
 XANMOD_GRUB_ID=$(
-    grep "menuentry " "$GRUB_CFG" |
-    grep "Linux ${XANMOD_KERNEL}" |
+    grep -B 30 "vmlinuz-${XANMOD_KERNEL}" "$GRUB_CFG" |
+    grep "menuentry " |
     grep -v "recovery mode" |
     sed -n "s/.*--id[[:space:]]*'\([^']*\)'.*/\1/p" |
-    head -n1
+    tail -n1
 )
 
 if [ -z "$XANMOD_GRUB_ID" ]; then
     XANMOD_GRUB_ID=$(
-        grep "menuentry " "$GRUB_CFG" |
-        grep "$XANMOD_KERNEL" |
+        grep -B 50 "vmlinuz-${XANMOD_KERNEL}" "$GRUB_CFG" |
+        grep "menuentry " |
         grep -vi "recovery" |
         sed -n "s/.*--id[[:space:]]*'\([^']*\)'.*/\1/p" |
-        head -n1
+        tail -n1
     )
 fi
 
@@ -251,6 +251,7 @@ update-grub || die "最终 update-grub 失败"
 
 echo "XanMod: $XANMOD_KERNEL"
 echo "GRUB: $XANMOD_GRUB_ID"
-echo "完成，系统即将重启"
+echo "完成，系统将在 3 秒后重启"
 
+sleep 3
 reboot
