@@ -18,6 +18,15 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
       - name: Checkout
         uses: actions/checkout@v5
 
@@ -431,23 +440,17 @@ jobs:
           DEBEMAIL: github-actions@users.noreply.github.com
           KDEB_CHANGELOG_DIST: noble
           CCACHE_DIR: ${{ github.workspace }}/.ccache
-          ARCH: arm64
-          CROSS_COMPILE: aarch64-linux-gnu-
-          LLVM: 1
-          CC: ccache clang
-          HOSTCC: ccache clang
-          LD: ld.lld
-          HOSTLD: ld.lld
-          AR: llvm-ar
-          NM: llvm-nm
-          OBJCOPY: llvm-objcopy
-          OBJDUMP: llvm-objdump
-          STRIP: llvm-strip
-          READELF: llvm-readelf
         run: |
           set -euo pipefail
 
           cd kernel
+
+          sudo ln -sf /usr/bin/lld /usr/bin/ld.lld
+
+          export PATH="/usr/lib/ccache:$PATH"
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export LLVM=1
 
           ccache --zero-stats
 
@@ -543,3 +546,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "XanMod ${TAG} ARM64 EDGE" \
             --notes-file dist/RELEASE.md
+
