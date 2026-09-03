@@ -104,7 +104,7 @@ elif [ "$ARCH" = "arm64" ]; then
     TMPDIR=$(mktemp -d)
     trap 'rm -rf "$TMPDIR"' EXIT
 
-    API_URL="https://api.github.com/repos/88860/XanMod-ARM64-AutoBuild/releases"
+    API_URL="https://api.github.com/repos/88860/XanMod-ARM64-AutoBuild/releases?per_page=100"
 
     RELEASE_JSON=$(curl -fsSL "$API_URL" 2>/dev/null) ||
         die "无法获取 ARM64 XanMod Release"
@@ -185,12 +185,12 @@ if [ "$NEED_INSTALL" -eq 1 ]; then
 
         apt install -y "$TMPDIR"/*.deb
     fi
-
-    update-grub || die "update-grub 失败"
 else
     echo "无需安装或升级"
     echo "直接进入 GRUB 配置"
 fi
+
+update-grub || die "update-grub 失败"
 
 XANMOD_KERNEL=$(get_xanmod_kernel)
 
