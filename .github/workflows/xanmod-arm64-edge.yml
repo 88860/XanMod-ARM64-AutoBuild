@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Free Disk Space
+      - name: Space
         run: |
           set -e
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -27,10 +27,10 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fetch Latest Release
+      - name: Release
         id: xanmod
         shell: bash
         env:
@@ -74,7 +74,7 @@ jobs:
             echo "package_url=$package_url"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Check Publish Status
+      - name: Status
         id: published
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,8 +86,10 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Setup Build Environment & Dependencies
+      - name: Dependencies
         if: steps.published.outputs.skip != 'true'
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           set -euo pipefail
           
@@ -105,27 +107,33 @@ jobs:
           
           sudo apt-get update
 
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
+
           sudo apt-get install -y --no-install-recommends \
             build-essential crossbuild-essential-arm64 \
             bc bison flex fakeroot kmod cpio lz4 xz-utils zstd \
-            clang lld llvm rsync \
-            libelf-dev libssl-dev libdw-dev \
+            clang-22 lld-22 llvm-22 rsync \
+            libelf-dev libssl-dev libdw-dev zlib1g-dev \
             libelf-dev:arm64 libssl-dev:arm64 zlib1g-dev:arm64 \
             debhelper dpkg-dev dwarves ccache pkg-config python3 binutils
+
+          for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+            sudo ln -sf "/usr/bin/${tool}-22" "/usr/bin/${tool}"
+          done
             
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
-      - name: Cache Compiler Object Files
+      - name: Cache
         if: steps.published.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ${{ runner.os }}-cross-arm64-xanmod-edge-${{ steps.xanmod.outputs.tag }}-clang-${{ github.sha }}
+          key: ${{ runner.os }}-cross-arm64-xanmod-edge-${{ steps.xanmod.outputs.tag }}-clang22-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-cross-arm64-xanmod-edge-${{ steps.xanmod.outputs.tag }}-clang-
+            ${{ runner.os }}-cross-arm64-xanmod-edge-${{ steps.xanmod.outputs.tag }}-clang22-
             ${{ runner.os }}-cross-arm64-xanmod-edge-
 
-      - name: Clone XanMod Linux Source
+      - name: Source
         if: steps.published.outputs.skip != 'true'
         env:
           TAG: ${{ steps.xanmod.outputs.tag }}
@@ -138,9 +146,8 @@ jobs:
           [[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT" ]] || exit 1
           [[ -f arch/arm64/configs/defconfig ]] && [[ -f CONFIGS/x86_64/config ]] || exit 1
 
-      - name: Configure Kernel
+      - name: Configure
         if: steps.published.outputs.skip != 'true'
-        id: config
         env:
           TAG: ${{ steps.xanmod.outputs.tag }}
           ARCH: arm64
@@ -178,14 +185,10 @@ jobs:
           release="$(make -s kernelrelease)"
           expected="${TAG}-arm64-edge"
           [[ "$release" == "$expected" ]] || exit 1
-          
-          echo "config_hash=$(sha256sum .config.final | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
-      - name: Audit Configuration
+      - name: Audit
         if: steps.published.outputs.skip != 'true'
         env:
-          TAG: ${{ steps.xanmod.outputs.tag }}
-          EXPECTED_RELEASE: ${{ steps.xanmod.outputs.tag }}-arm64-edge
           ARCH: arm64
           LLVM: 1
           CROSS_COMPILE: aarch64-linux-gnu-
@@ -207,7 +210,7 @@ jobs:
 
           make -s prepare
 
-      - name: Build Debian Packages
+      - name: Build
         if: steps.published.outputs.skip != 'true'
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -221,11 +224,11 @@ jobs:
           cd kernel
           ccache --zero-stats
           
-          make -j"$(nproc)" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- HOSTLD=ld.lld HOSTAR=llvm-ar HOSTCFLAGS="-fuse-ld=lld" bindeb-pkg
+          make -j"$(($(nproc) + 1))" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- HOSTLD=ld.lld HOSTAR=llvm-ar HOSTCFLAGS="-fuse-ld=lld" bindeb-pkg
           
           ccache --show-stats
 
-      - name: Verify Artifacts
+      - name: Verify
         if: steps.published.outputs.skip != 'true'
         env:
           TAG: ${{ steps.xanmod.outputs.tag }}
@@ -237,13 +240,33 @@ jobs:
           packages=(*.deb)
           ((${#packages[@]} > 0)) || exit 1
 
+          image_pkg=""
+          headers_pkg=""
+          libc_pkg=""
+
           for deb in "${packages[@]}"; do
             arch="$(dpkg-deb --field "$deb" Architecture)"
             [[ "$arch" == "arm64" || "$arch" == "all" ]] || exit 1
+            
+            pkg_name="$(dpkg-deb --field "$deb" Package)"
+            case "$pkg_name" in
+              linux-image-*-dbg) continue ;;
+              linux-image-*) image_pkg="$deb" ;;
+              linux-headers-*) headers_pkg="$deb" ;;
+              linux-libc-dev) libc_pkg="$deb" ;;
+            esac
             mv "$deb" dist/
           done
 
+          [[ -n "$image_pkg" && -n "$headers_pkg" && -n "$libc_pkg" ]] || exit 1
+
           cd dist
+          dpkg-deb --contents "$image_pkg" | grep -q '/boot/vmlinuz-' || exit 1
+          dpkg-deb --contents "$image_pkg" | grep -q '/lib/modules/' || exit 1
+          dpkg-deb --contents "$headers_pkg" | grep -q '/usr/src/linux-headers-' || exit 1
+
+          [[ "$(dpkg-deb --field "$image_pkg" Package)" == *"-arm64-edge" ]] || exit 1
+
           sha256sum *.deb > SHA256SUMS
 
           cat <<EOF > RELEASE.md
@@ -261,7 +284,7 @@ jobs:
           \`\`\`
           EOF
 
-      - name: Publish Release
+      - name: Publish
         if: steps.published.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
