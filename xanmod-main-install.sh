@@ -109,13 +109,8 @@ if [ "$ARCH" = "amd64" ]; then
         curl -fsSL "$XANMOD_REPO_URL" 2>/dev/null |
         gzip -dc 2>/dev/null |
         awk -v pkg="$XANMOD_PKG" '
-            $1 == "Package:" && $2 == pkg {
-                found=1
-            }
-            found && $1 == "Version:" {
-                print $2
-                exit
-            }
+            $1 == "Package:" && $2 == pkg { found=1 }
+            found && $1 == "Version:" { print $2; exit }
         '
     )
 
@@ -489,79 +484,23 @@ echo
 echo "正在搜索 XanMod GRUB 启动项..."
 
 GRUB_TARGET=$(
-awk -v target="$XANMOD_KERNEL" '
-function extract_id(line, id) {
-    id=""
-
-    if (match(line, /\$menuentry_id_option[[:space:]]+\047[^\047]+\047/)) {
-        id=substr(line, RSTART, RLENGTH)
-        sub(/^\$menuentry_id_option[[:space:]]+\047/, "", id)
-        sub(/\047$/, "", id)
-        return id
-    }
-
-    if (match(line, /--id[[:space:]]+\047[^\047]+\047/)) {
-        id=substr(line, RSTART, RLENGTH)
-        sub(/^--id[[:space:]]+\047/, "", id)
-        sub(/\047$/, "", id)
-        return id
-    }
-
-    return ""
-}
-
-function count_open(line, t) {
-    t=line
-    return gsub(/\{/, "", t)
-}
-
-function count_close(line, t) {
-    t=line
-    return gsub(/\}/, "", t)
-}
-
-{
-    line=$0
-
-    if (line ~ /^[[:space:]]*submenu[[:space:]]/) {
-
-        sid=extract_id(line)
-
-        if (sid != "") {
-            submenu_id=sid
-            submenu_depth=depth
-        }
-    }
-
-    if (line ~ /^[[:space:]]*menuentry[[:space:]]/) {
-
-        entry_id=extract_id(line)
-
-        if (
-            entry_id != "" &&
-            index(tolower(line), tolower(target)) > 0 &&
-            index(tolower(line), "recovery") == 0
-        ) {
-
-            if (submenu_id != "" && depth > submenu_depth) {
-                print submenu_id ">" entry_id
-            } else {
-                print entry_id
-            }
-
-            exit
-        }
-    }
-
-    depth += count_open(line)
-    depth -= count_close(line)
-
-    if (submenu_id != "" && depth <= submenu_depth) {
-        submenu_id=""
-    }
-}
-' /boot/grub/grub.cfg
+grep "menuentry.*${XANMOD_KERNEL}" /boot/grub/grub.cfg |
+grep -v recovery |
+head -n1 |
+sed -n "s/.*'\([^']*\)'.*/\1/p"
 )
+
+if [ -z "$GRUB_TARGET" ]; then
+    GRUB_TARGET=$(
+    awk -v target="$XANMOD_KERNEL" '
+    /menuentry/ && $0 ~ target && $0 !~ /recovery/ {
+        match($0, /'\''([^'\'']+)'\''/);
+        print substr($0, RSTART+1, RLENGTH-2);
+        exit
+    }
+    ' /boot/grub/grub.cfg
+    )
+fi
 
 [ -n "$GRUB_TARGET" ] ||
     die "无法找到目标 XanMod GRUB 启动项"
@@ -583,11 +522,8 @@ if [ "$SAVED_ENTRY" != "$GRUB_TARGET" ]; then
 
     echo "GRUB 默认启动验证失败。"
     echo
-    echo "期望:"
-    echo "$GRUB_TARGET"
-    echo
-    echo "实际:"
-    echo "${SAVED_ENTRY:-未设置}"
+    echo "期望: $GRUB_TARGET"
+    echo "实际: ${SAVED_ENTRY:-未设置}"
 
     die "GRUB 默认启动验证失败"
 
@@ -597,8 +533,7 @@ echo "GRUB 默认启动项设置成功。"
 echo
 echo "目标内核: ${XANMOD_KERNEL}"
 echo
-echo "注意：这里只验证 GRUB 默认启动项。"
-echo "重启后的实际运行内核请使用 uname -r 确认。"
+echo "注意：重启后请用 uname -r 确认实际运行的内核。"
 
 echo
 echo "[5/5] 操作完成"
