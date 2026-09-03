@@ -446,11 +446,12 @@ jobs:
 
           ccache --zero-stats
 
+          # 终极修复：把 HOSTAR 和 HOSTCFLAGS 也加入 sed 强行注入 mkdebian 的清单中，彻底防丢变量
           if [ -f scripts/package/mkdebian ]; then
-            sed -i 's|^#!/usr/bin/make -f|#!/usr/bin/make -f\nexport LLVM=1\nexport CROSS_COMPILE=aarch64-linux-gnu-\nexport CC=ccache clang --target=aarch64-linux-gnu\nexport HOSTCC=ccache clang\nexport LD=ld.lld\nexport HOSTLD=ld.lld|' scripts/package/mkdebian
+            sed -i 's|^#!/usr/bin/make -f|#!/usr/bin/make -f\nexport LLVM=1\nexport CROSS_COMPILE=aarch64-linux-gnu-\nexport CC=ccache clang --target=aarch64-linux-gnu\nexport HOSTCC=ccache clang\nexport LD=ld.lld\nexport HOSTLD=ld.lld\nexport HOSTAR=llvm-ar\nexport HOSTCFLAGS="-fuse-ld=lld"|' scripts/package/mkdebian
           fi
 
-          # 修复 2：加入 HOSTLD, HOSTAR, HOSTCFLAGS 参数，彻底解决 Linux 7.2 内核交叉编译宿主机工具找不到 ld 的崩溃
+          # 修复 2：加入 HOSTLD, HOSTAR, HOSTCFLAGS 参数，统一确保纯正的 LLVM 工具链编译
           make \
             ARCH=arm64 \
             LLVM=1 \
