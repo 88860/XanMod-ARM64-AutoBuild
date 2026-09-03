@@ -61,30 +61,32 @@ jobs:
               break
             done < <(
               jq -r '
-                .[]
-                | select(.upcoming_release == false)
-                | select(.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$"))
-                | select(
-                    any(
-                      .assets.links[]?;
-                      (.url // "")
-                      | test("sourceforge\\.net/projects/xanmod/files/releases/lts/[^/]+/?$")
+                limit(1;
+                  .[]
+                  | select(.upcoming_release == false)
+                  | select(.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$"))
+                  | select(
+                      any(
+                        .assets.links[]?;
+                        (.url // "")
+                        | test("sourceforge\\.net/projects/xanmod/files/releases/lts/[^/]+/?$")
+                      )
                     )
-                  )
-                | [
-                    .tag_name,
-                    .commit.id,
-                    .released_at,
-                    (
-                      .assets.links[]
-                      | select(
-                          (.url // "")
-                          | test("sourceforge\\.net/projects/xanmod/files/releases/lts/[^/]+/?$")
-                        )
-                      | .url
-                    )
-                  ]
-                | @tsv
+                  | [
+                      .tag_name,
+                      .commit.id,
+                      .released_at,
+                      (
+                        .assets.links[]
+                        | select(
+                            (.url // "")
+                            | test("sourceforge\\.net/projects/xanmod/files/releases/lts/[^/]+/?$")
+                          )
+                        | .url
+                      )
+                    ]
+                  | @tsv
+                )
               ' <<<"$releases"
             )
 
@@ -465,7 +467,7 @@ jobs:
             bindeb-pkg
 
           ccache --show-stats
-
+          
       - name: Verify
         if: steps.published.outputs.skip != 'true'
         env:
