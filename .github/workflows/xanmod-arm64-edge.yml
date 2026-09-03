@@ -2,6 +2,8 @@ name: XanMod ARM64 EDGE Build
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '37 3 * * *'
 
 permissions:
   contents: write
@@ -16,141 +18,174 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Free disk space
+      - name: Free Disk Space
         run: |
-          set -euo pipefail
-
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
-
-          sudo docker system prune -af || true
+          sudo docker image prune --all --force
           df -h
 
-      - name: Checkout workflow repository
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - name: Detect latest XanMod EDGE release
+      - name: Release
         id: xanmod
         shell: bash
+        env:
+          GITLAB_API: https://gitlab.com/api/v4/projects/xanmod%2Flinux
         run: |
           set -euo pipefail
 
-          echo "Querying official XanMod GitLab releases..."
+          tag=""
+          commit=""
+          released_at=""
+          package_url=""
 
-          RELEASES_JSON="$(curl -fsSL \
-            https://gitlab.com/api/v4/projects/xanmod%2Flinux/releases?per_page=100)"
+          for page in $(seq 1 50); do
+            releases="$(
+              curl -fsSL \
+                --retry 5 \
+                --retry-all-errors \
+                "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page"
+            )"
 
-          TAG="$(
-            printf '%s' "$RELEASES_JSON" |
-            jq -r '
-              .[]
-              | select(
-                  any(.assets.links[]?;
-                    (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/edge/")
+            while IFS=$'\t' read -r candidate candidate_commit candidate_released candidate_url; do
+              [[ -n "$candidate" ]] || continue
+
+              tag="$candidate"
+              commit="$candidate_commit"
+              released_at="$candidate_released"
+              package_url="$candidate_url"
+              break
+            done < <(
+              jq -r '
+                .[]
+                | select(.upcoming_release == false)
+                | select(.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$"))
+                | select(
+                    any(
+                      .assets.links[]?;
+                      (.url // "")
+                      | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")
+                    )
                   )
-                )
-              | .tag_name
-            ' |
-            head -n1
+                | [
+                    .tag_name,
+                    .commit.id,
+                    .released_at,
+                    (
+                      .assets.links[]
+                      | select(
+                          (.url // "")
+                          | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")
+                        )
+                      | .url
+                    )
+                  ]
+                | @tsv
+              ' <<<"$releases"
+            )
+
+            [[ -n "$tag" ]] && break
+
+            [[ "$(jq 'length' <<<"$releases")" -lt 100 ]] && break
+          done
+
+          [[ -n "$tag" ]] || {
+            echo "Unable to find XanMod EDGE release"
+            exit 1
+          }
+
+          release="$(
+            curl -fsSL \
+              --retry 5 \
+              --retry-all-errors \
+              "$GITLAB_API/releases/$tag"
           )"
 
-          if [[ -z "$TAG" || "$TAG" == "null" ]]; then
-            echo "ERROR: Unable to find the latest official XanMod EDGE release."
-            exit 1
-          fi
+          api_tag="$(jq -r '.tag_name' <<<"$release")"
+          api_commit="$(jq -r '.commit.id' <<<"$release")"
+          api_released="$(jq -r '.released_at' <<<"$release")"
 
-          echo "Latest XanMod EDGE release: $TAG"
+          test "$api_tag" = "$tag"
+          test "$api_commit" = "$commit"
+          test "$api_released" = "$released_at"
 
-          EDGE_URL="https://sourceforge.net/projects/xanmod/files/releases/edge/${TAG}"
+          api_package_url="$(
+            jq -r '
+              [
+                .assets.links[]?
+                | select(
+                    (.url // "")
+                    | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")
+                  )
+                | .url
+              ][0] // empty
+            ' <<<"$release"
+          )"
 
-          if ! curl -fsIL "$EDGE_URL" >/dev/null; then
-            echo "ERROR: XanMod EDGE package path does not exist:"
-            echo "$EDGE_URL"
-            exit 1
-          fi
+          test -n "$api_package_url"
+          test "$api_package_url" = "$package_url"
 
           {
-            echo "tag=$TAG"
-            echo "channel=edge"
-            echo "source_url=https://gitlab.com/xanmod/linux.git"
-            echo "release_url=$EDGE_URL"
+            echo "tag=$tag"
+            echo "commit=$commit"
+            echo "released_at=$released_at"
+            echo "package_url=$package_url"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Show XanMod release
+          echo "TAG=$tag"
+          echo "COMMIT=$commit"
+          echo "PACKAGE=$package_url"
+          echo "CHANNEL=edge"
+
+      - name: Status
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.xanmod.outputs.tag }}
         run: |
           set -euo pipefail
 
-          echo "TAG=${{ steps.xanmod.outputs.tag }}"
-          echo "CHANNEL=${{ steps.xanmod.outputs.channel }}"
-          echo "SOURCE=https://gitlab.com/xanmod/linux.git"
-          echo "EDGE_RELEASE=https://sourceforge.net/projects/xanmod/files/releases/edge/${{ steps.xanmod.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Install build dependencies
-        shell: bash
+      - name: Dependencies
+        if: steps.published.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
           sudo dpkg --add-architecture arm64
 
-          sudo mkdir -p /etc/apt/sources.list.d
+          sudo sed -i \
+            's/^Types: deb/Types: deb\nArchitectures: amd64 i386/' \
+            /etc/apt/sources.list.d/ubuntu.sources
 
-          sudo tee /etc/apt/sources.list.d/ubuntu.sources >/dev/null <<'EOF'
-          Types: deb
-          URIs: http://archive.ubuntu.com/ubuntu
-          Suites: noble noble-updates
-          Components: main universe restricted multiverse
-          Architectures: amd64 i386
-
-          Types: deb
-          URIs: http://security.ubuntu.com/ubuntu
-          Suites: noble-security
-          Components: main universe restricted multiverse
-          Architectures: amd64 i386
-
+          cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
           Types: deb
           URIs: http://ports.ubuntu.com/ubuntu-ports
           Suites: noble noble-updates noble-security
-          Components: main universe restricted multiverse
+          Components: main restricted universe multiverse
           Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
 
           sudo apt-get update
 
-          sudo apt-get install -y \
-            bc \
-            bison \
-            build-essential \
-            ccache \
-            clang \
-            cpio \
-            debhelper \
-            dpkg-dev \
-            dwarves \
-            fakeroot \
-            flex \
-            kmod \
-            libdw-dev \
-            libelf-dev \
-            libssl-dev \
-            lld \
-            llvm \
-            lz4 \
-            openssl \
-            pkg-config \
-            python3 \
-            rsync \
-            xz-utils \
-            zstd \
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache clang cpio debhelper dpkg-dev \
+            dwarves fakeroot flex kmod libdw-dev libelf-dev libssl-dev lld \
+            llvm lz4 openssl pkg-config python3 rsync xz-utils zstd \
             crossbuild-essential-arm64 \
-            libssl-dev:arm64 \
-            libelf-dev:arm64 \
-            zlib1g-dev:arm64 \
-            jq \
-            curl
+            libssl-dev:arm64 libelf-dev:arm64 zlib1g-dev:arm64
 
-      - name: Restore ccache
+      - name: Cache
+        if: steps.published.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: .ccache
@@ -159,40 +194,24 @@ jobs:
             ${{ runner.os }}-cross-arm64-xanmod-edge-${{ steps.xanmod.outputs.tag }}-clang-
             ${{ runner.os }}-cross-arm64-xanmod-edge-
 
-      - name: Prepare ccache
-        shell: bash
+      - name: Source
+        if: steps.published.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.xanmod.outputs.tag }}
+          EXPECTED_COMMIT: ${{ steps.xanmod.outputs.commit }}
         run: |
           set -euo pipefail
-
-          mkdir -p .ccache
-
-          ccache --zero-stats
-          ccache --show-config
-
-      - name: Clone XanMod source
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -rf kernel
 
           git clone \
-            --depth=1 \
-            --branch "${{ steps.xanmod.outputs.tag }}" \
+            --depth 1 \
+            --branch "$TAG" \
             https://gitlab.com/xanmod/linux.git \
             kernel
 
           cd kernel
 
-          git fetch --depth=1 origin \
-            "refs/tags/${{ steps.xanmod.outputs.tag }}:refs/tags/${{ steps.xanmod.outputs.tag }}"
-
-          git checkout --detach "${{ steps.xanmod.outputs.tag }}"
-
-          echo "HEAD=$(git rev-parse HEAD)"
-          echo "TAG=${{ steps.xanmod.outputs.tag }}"
-
-          test "$(git describe --tags --exact-match HEAD)" = "${{ steps.xanmod.outputs.tag }}"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          test "$(git describe --tags --exact-match HEAD)" = "$TAG"
 
           test -f arch/arm64/configs/defconfig
           test -f CONFIGS/x86_64/config
@@ -200,340 +219,331 @@ jobs:
           test -x scripts/config
           test -x scripts/kconfig/merge_config.sh
 
-      - name: Configure ARM64 kernel
-        shell: bash
-        working-directory: kernel
+      - name: Configure
+        if: steps.published.outputs.skip != 'true'
+        id: config
+        env:
+          TAG: ${{ steps.xanmod.outputs.tag }}
         run: |
           set -euo pipefail
+
+          cd kernel
+
+          rm -rf .git
 
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export LLVM=1
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            defconfig
+          rm -f \
+            .config .config.arm64-base .config.xanmod .config.final \
+            .config.audit .config.clean .config.vps .xanmod-candidates \
+            .xanmod-accepted .xanmod-rejected .kconfig.* kernel.release
 
-          cp .config .config.base
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 defconfig
+
+          cp .config .config.arm64-base
 
           awk '
-            /^[[:space:]]*#/ { next }
-            /^[[:space:]]*$/ { next }
-            /^CONFIG_[A-Za-z0-9_]+=/ {
+            /^[[:space:]]*CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|".*")$/ {
+              if ($0 ~ /^[[:space:]]*CONFIG_LOCALVERSION=/) next;
+              sub(/^[[:space:]]+/, "");
               print
             }
           ' CONFIGS/x86_64/config > .xanmod-candidates
 
+          test -s .xanmod-candidates
+
           ./scripts/kconfig/merge_config.sh \
             -m \
             .config \
-            .xanmod-candidates
+            .xanmod-candidates \
+            > .kconfig.log \
+            2> .kconfig.err
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            olddefconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 olddefconfig \
+            > .kconfig.olddefconfig.log 2> .kconfig.olddefconfig.err
 
-          ./scripts/config --disable LOCALVERSION_AUTO
+          cp .config .config.xanmod
 
-          ./scripts/config --disable DEBUG_INFO
-          ./scripts/config --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
-          ./scripts/config --disable DEBUG_INFO_DWARF4
-          ./scripts/config --disable DEBUG_INFO_DWARF5
-          ./scripts/config --disable DEBUG_INFO_BTF
-          ./scripts/config --disable DEBUG_INFO_BTF_MODULES
-          ./scripts/config --enable DEBUG_INFO_NONE
+          grep '^CONFIG_' .xanmod-candidates |
+            while IFS='=' read -r symbol value; do
+              if grep -q "^${symbol}=" .config.xanmod; then
+                printf '%s=%s\n' "$symbol" "$value"
+              fi
+            done > .xanmod-accepted
 
-          printf '%s\n' "-${{ steps.xanmod.outputs.tag }}-arm64-edge" > localversion
+          grep '^CONFIG_' .xanmod-candidates |
+            while IFS='=' read -r symbol value; do
+              if grep -q "^${symbol}=" .config.xanmod; then
+                final_value="$(sed -n "s/^${symbol}=//p" .config.xanmod)"
+                if [[ "$final_value" != "$value" ]]; then
+                  printf '%s=%s -> %s\n' "$symbol" "$value" "$final_value"
+                fi
+              else
+                printf '%s=%s\n' "$symbol" "$value"
+              fi
+            done > .xanmod-rejected
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            olddefconfig
+          if ./scripts/config --state LOCALVERSION_AUTO >/dev/null 2>&1; then
+            ./scripts/config --disable LOCALVERSION_AUTO
+          fi
 
-          KERNELRELEASE="$(
-            make \
-              -s \
-              ARCH=arm64 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              LLVM=1 \
-              kernelrelease
-          )"
+          ./scripts/config -d DEBUG_INFO
+          ./scripts/config -d DEBUG_INFO_BTF
+          ./scripts/config -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+          ./scripts/config -d DEBUG_INFO_DWARF4
+          ./scripts/config -d DEBUG_INFO_DWARF5
+          ./scripts/config -e DEBUG_INFO_NONE
 
-          echo "KERNELRELEASE=$KERNELRELEASE"
+          xanmod_suffix="${TAG#*-}"
+          printf '%s\n' "-${xanmod_suffix}-arm64-edge" > localversion
 
-          test "$KERNELRELEASE" = "${{ steps.xanmod.outputs.tag }}-arm64-edge"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 olddefconfig \
+            > .kconfig.vps.log 2> .kconfig.vps.err
 
-          cp .config .config.audit
-          cp .config .config.clean
+          cp .config .config.vps
+          cp .config .config.final
 
-          {
-            echo "CONFIGURATION ACCEPTED"
-            echo
-            cat .config
-          } > config-final.txt
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -s kernelrelease > kernel.release
 
-          {
-            echo "XANMOD CONFIG CANDIDATES"
-            echo
-            cat .xanmod-candidates
-          } > config-candidates.txt
+          release="$(cat kernel.release)"
+          expected="${TAG}-arm64-edge"
 
-      - name: Audit kernel configuration
-        shell: bash
-        working-directory: kernel
+          echo "Generated release: $release"
+          echo "Expected release: $expected"
+
+          test "$release" = "$expected"
+
+          cp .config.final .config.audit
+
+          sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' .config.final > .config.clean
+
+          echo "config_hash=$(sha256sum .config.final | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "kernel_release=$release" >> "$GITHUB_OUTPUT"
+          echo "candidate_count=$(grep -c '^CONFIG_' .xanmod-candidates || true)" >> "$GITHUB_OUTPUT"
+          echo "final_count=$(grep -c '^CONFIG_' .config.final || true)" >> "$GITHUB_OUTPUT"
+
+      - name: Audit
+        if: steps.published.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.xanmod.outputs.tag }}
+          EXPECTED_RELEASE: ${{ steps.xanmod.outputs.tag }}-arm64-edge
         run: |
           set -euo pipefail
 
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export LLVM=1
+          cd kernel
+
+          test -s .config.audit
+          test -s .config.final
+          test -s .config.clean
+          test -s .xanmod-candidates
+          test -s .config.arm64-base
 
           cp .config.audit .config
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            olddefconfig
+          if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 olddefconfig > .kconfig.audit.log 2> .kconfig.audit.err; then
+            cat .kconfig.audit.err
+            exit 1
+          fi
 
           if ! cmp -s .config .config.audit; then
-            echo "ERROR: olddefconfig modified the audited configuration."
+            echo "Error: Config changed unexpectedly during Audit olddefconfig!"
             diff -u .config.audit .config || true
             exit 1
           fi
 
-          required_configs=(
-            CONFIG_ARM64=y
-            CONFIG_64BIT=y
-            CONFIG_MODULES=y
-            CONFIG_NET=y
-            CONFIG_INET=y
-            CONFIG_PROC_FS=y
-            CONFIG_SYSFS=y
-            CONFIG_CGROUPS=y
-            CONFIG_NAMESPACES=y
-            CONFIG_BPF=y
-            CONFIG_BPF_SYSCALL=y
-          )
+          echo "Checking base architecture..."
+          grep -q '^CONFIG_ARM64=y$' .config || { echo "Error: CONFIG_ARM64=y missing"; exit 1; }
+          grep -q '^CONFIG_64BIT=y$' .config || { echo "Error: CONFIG_64BIT=y missing"; exit 1; }
+          grep -q '^CONFIG_MODULES=y$' .config || { echo "Error: CONFIG_MODULES=y missing"; exit 1; }
 
-          for item in "${required_configs[@]}"; do
-            key="${item%%=*}"
-            expected="${item#*=}"
+          echo "Checking forbidden x86 configs..."
+          if grep -Eq '^CONFIG_X86(=|_)|^CONFIG_X86_64(=_)' .config; then
+            echo "Error: Found x86 specific configs!"
+            grep -E '^CONFIG_X86(=|_)|^CONFIG_X86_64(=_)' .config
+            exit 1
+          fi
 
-            actual="$(
-              sed -n "s/^${key}=//p" .config |
-              head -n1
-            )"
+          echo "Checking essential kernel subsystems..."
+          grep -q '^CONFIG_NET=y$' .config || { echo "Error: CONFIG_NET missing"; exit 1; }
+          grep -q '^CONFIG_INET=y$' .config || { echo "Error: CONFIG_INET missing"; exit 1; }
+          grep -q '^CONFIG_PROC_FS=y$' .config || { echo "Error: CONFIG_PROC_FS missing"; exit 1; }
+          grep -q '^CONFIG_SYSFS=y$' .config || { echo "Error: CONFIG_SYSFS missing"; exit 1; }
+          grep -q '^CONFIG_CGROUPS=y$' .config || { echo "Error: CONFIG_CGROUPS missing"; exit 1; }
+          grep -q '^CONFIG_NAMESPACES=y$' .config || { echo "Error: CONFIG_NAMESPACES missing"; exit 1; }
+          grep -q '^CONFIG_BPF=y$' .config || { echo "Error: CONFIG_BPF missing"; exit 1; }
+          grep -q '^CONFIG_BPF_SYSCALL=y$' .config || { echo "Error: CONFIG_BPF_SYSCALL missing"; exit 1; }
 
-            if [[ "$actual" != "$expected" ]]; then
-              echo "ERROR: $key expected $expected, got ${actual:-unset}"
+          echo "Checking LOCALVERSION..."
+          if grep -q '^CONFIG_LOCALVERSION_AUTO=y$' .config; then
+            echo "Error: CONFIG_LOCALVERSION_AUTO is set to y"
+            exit 1
+          fi
+
+          if grep -q '^CONFIG_LOCALVERSION=' .config; then
+            localversion="$(sed -n 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' .config)"
+            if [ -n "$localversion" ]; then
+              echo "Error: CONFIG_LOCALVERSION is not empty: $localversion"
               exit 1
             fi
-          done
+          fi
 
-          if grep -Eq '^CONFIG_(X86|X86_64|CPU_SUP_[A-Z0-9_]+_X86|X86_[A-Z0-9_]+)=' .config; then
-            echo "ERROR: x86-specific configuration detected."
-            grep -E '^CONFIG_(X86|X86_64|CPU_SUP_[A-Z0-9_]+_X86|X86_[A-Z0-9_]+)=' .config || true
+          echo "Checking Kernel Release Version..."
+          release="$(make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -s kernelrelease)"
+          if [ "$release" != "$EXPECTED_RELEASE" ]; then
+            echo "Error: Release mismatch!"
+            echo "Expected: $EXPECTED_RELEASE"
+            echo "Got:      $release"
             exit 1
           fi
 
-          LOCALVERSION_VALUE="$(
-            sed -n 's/^CONFIG_LOCALVERSION="\(.*\)"/\1/p' .config |
-            head -n1
-          )"
-
-          if [[ -n "$LOCALVERSION_VALUE" ]]; then
-            echo "ERROR: CONFIG_LOCALVERSION must be empty."
-            echo "CONFIG_LOCALVERSION=$LOCALVERSION_VALUE"
+          echo "Checking CPU specific flags..."
+          if grep -qE '^CONFIG_(MCORE2|MZEN|X86_NATIVE_CPU|X86_64_VERSION)=' .config; then
+            echo "Error: Found x86 CPU specific configs!"
+            grep -E '^CONFIG_(MCORE2|MZEN|X86_NATIVE_CPU|X86_64_VERSION)=' .config
             exit 1
           fi
 
-          if grep -q '^CONFIG_LOCALVERSION_AUTO=y' .config; then
-            echo "ERROR: CONFIG_LOCALVERSION_AUTO=y"
+          echo "Validating config syntax..."
+          if grep -vE '^(CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|"[^"]*"))$' .config.clean | grep -q .; then
+            echo "Error: Found invalid or malformed config lines!"
+            grep -vE '^(CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|"[^"]*"))$' .config.clean
             exit 1
           fi
 
-          KERNELRELEASE="$(
-            make \
-              -s \
-              ARCH=arm64 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              LLVM=1 \
-              kernelrelease
-          )"
-
-          echo "Audited KERNELRELEASE=$KERNELRELEASE"
-
-          test "$KERNELRELEASE" = "${{ steps.xanmod.outputs.tag }}-arm64-edge"
-
-          if grep -nE '^[[:space:]]*CONFIG_[A-Za-z0-9_]+[[:space:]]*=' .config |
-             awk '
-               {
-                 key=$0
-                 sub(/=.*/, "", key)
-                 count[key]++
-               }
-               END {
-                 for (key in count)
-                   if (count[key] > 1)
-                     print key
-               }
-             ' |
-             grep -q .; then
-            echo "ERROR: duplicate configuration entries detected."
+          echo "Checking for duplicates..."
+          duplicates="$(grep '^CONFIG_' .config | sed 's/=.*//' | sort | uniq -d)"
+          if [ -n "$duplicates" ]; then
+            echo "Error: Found duplicate configs:"
+            echo "$duplicates"
             exit 1
           fi
 
-          make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            prepare
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 -s prepare
 
-      - name: Build Debian packages
-        shell: bash
-        working-directory: kernel
+          echo "Audit: PASS"
+          echo "Release: $release"
+          echo "Architecture: arm64"
+          echo "Profile: Full-Featured"
+          echo "Channel: EDGE"
+          echo "XanMod candidates: $(grep -c '^CONFIG_' .xanmod-candidates || true)"
+          echo "Final config: $(grep -c '^CONFIG_' .config || true)"
+          echo "Config SHA256: $(sha256sum .config | cut -d' ' -f1)"
+
+      - name: Build
+        if: steps.published.outputs.skip != 'true'
+        env:
+          KBUILD_BUILD_USER: github-actions
+          KBUILD_BUILD_HOST: github-arm64-cross
+          DEBFULLNAME: github-actions
+          DEBEMAIL: github-actions@users.noreply.github.com
+          KDEB_CHANGELOG_DIST: noble
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
           set -euo pipefail
 
+          cd kernel
+
+          sudo ln -sf /usr/bin/lld /usr/bin/ld.lld
+
+          export PATH="/usr/lib/ccache:$PATH"
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           export LLVM=1
 
-          export KBUILD_BUILD_USER=xanmod
-          export KBUILD_BUILD_HOST=github-actions
-
-          export DEB_BUILD_OPTIONS="parallel=$(nproc)"
-
-          sudo ln -sf /usr/bin/ld.lld /usr/bin/lld
-
-          export PATH="/usr/lib/ccache:$PATH"
-
           ccache --zero-stats
 
-          make \
-            -j"$(( $(nproc) + 1 ))" \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            bindeb-pkg
+          make -j"$(( $(nproc) + 1 ))" bindeb-pkg
 
           ccache --show-stats
 
-      - name: Verify generated packages
-        shell: bash
-        working-directory: kernel
+      - name: Verify
+        if: steps.published.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.xanmod.outputs.tag }}
         run: |
           set -euo pipefail
 
-          mapfile -t packages < <(
-            find .. \
-              -maxdepth 1 \
-              -type f \
-              -name '*.deb' \
-              -printf '%f\n' |
-            sort
-          )
+          mkdir -p dist
 
-          if [[ "${#packages[@]}" -eq 0 ]]; then
-            echo "ERROR: No Debian packages generated."
-            exit 1
-          fi
+          shopt -s nullglob
 
-          echo "Generated packages:"
-          printf '%s\n' "${packages[@]}"
+          packages=(*.deb)
 
-          for pkg in "${packages[@]}"; do
-            dpkg-deb -f "../$pkg" Architecture
-          done
-
-          for pkg in "${packages[@]}"; do
-            arch="$(dpkg-deb -f "../$pkg" Architecture)"
-
-            if [[ "$arch" != "arm64" ]]; then
-              echo "ERROR: Non-arm64 package detected: $pkg ($arch)"
-              exit 1
-            fi
-          done
+          ((${#packages[@]} > 0)) || exit 1
 
           image_pkg=""
           headers_pkg=""
           libc_pkg=""
 
-          for pkg in "${packages[@]}"; do
-            if dpkg-deb -c "../$pkg" | grep -q '/boot/vmlinuz-'; then
-              image_pkg="$pkg"
-            fi
+          for deb in "${packages[@]}"; do
+            [[ "$(dpkg-deb --field "$deb" Architecture)" == "arm64" ]] || exit 1
 
-            if dpkg-deb -c "../$pkg" | grep -q '/usr/src/linux-headers-'; then
-              headers_pkg="$pkg"
-            fi
-
-            if [[ "$pkg" == *libc-dev* ]]; then
-              libc_pkg="$pkg"
-            fi
+            case "$(dpkg-deb --field "$deb" Package)" in
+              linux-image-*-dbg)
+                ;;
+              linux-image-*)
+                image_pkg="$deb"
+                ;;
+              linux-headers-*)
+                headers_pkg="$deb"
+                ;;
+              linux-libc-dev)
+                libc_pkg="$deb"
+                ;;
+            esac
           done
 
-          [[ -n "$image_pkg" ]]
-          [[ -n "$headers_pkg" ]]
+          test -n "$image_pkg"
+          test -n "$headers_pkg"
+          test -n "$libc_pkg"
 
-          if ! dpkg-deb -c "../$image_pkg" | grep -q '/lib/modules/'; then
-            echo "ERROR: Image package does not contain /lib/modules/"
-            exit 1
-          fi
+          dpkg-deb --contents "$image_pkg" |
+            grep '/boot/vmlinuz-' >/dev/null
 
-          if ! [[ "$image_pkg" == *-arm64-edge.deb ]]; then
-            echo "ERROR: Image package does not end with -arm64-edge.deb"
-            echo "Actual: $image_pkg"
-            exit 1
-          fi
+          dpkg-deb --contents "$image_pkg" |
+            grep '/lib/modules/' >/dev/null
 
-          mkdir -p ../dist
+          dpkg-deb --contents "$headers_pkg" |
+            grep '/usr/src/linux-headers-' >/dev/null
 
-          cp ../*.deb ../dist/
+          image_release="$(
+            dpkg-deb --field "$image_pkg" Package
+          )"
 
-          (
-            cd ../dist
+          [[ "$image_release" == *"-arm64-edge" ]]
 
-            sha256sum ./*.deb > SHA256SUMS
+          cp "${packages[@]}" dist/
 
-            {
-              echo "# XanMod ARM64 EDGE"
-              echo
-              echo "Kernel: ${{ steps.xanmod.outputs.tag }}"
-              echo "Channel: EDGE"
-              echo "Architecture: arm64"
-              echo
-              echo "Kernel release:"
-              echo "\`${{ steps.xanmod.outputs.tag }}-arm64-edge\`"
-              echo
-              echo "Packages:"
-              printf '%s\n' ./*.deb
-              echo
-              echo "SHA256:"
-              echo
-              echo '```'
-              cat SHA256SUMS
-              echo '```'
-            } > RELEASE.md
-          )
+          sha256sum dist/*.deb > dist/SHA256SUMS
 
-      - name: Publish GitHub release
+          {
+            echo "XanMod ARM64 EDGE: $TAG"
+            echo "Kernel release: ${TAG}-arm64-edge"
+            echo "Architecture: arm64"
+            echo "Profile: Full-Featured"
+            echo "Channel: EDGE"
+            echo "XanMod package channel: edge"
+            echo "Source: https://gitlab.com/xanmod/linux"
+            echo "GitLab release: https://gitlab.com/xanmod/linux/-/releases/$TAG"
+            echo ""
+            cat dist/SHA256SUMS
+          } > dist/RELEASE.md
+
+      - name: Publish
+        if: steps.published.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.xanmod.outputs.tag }}
         run: |
           set -euo pipefail
 
-          TAG="${{ steps.xanmod.outputs.tag }}"
-
-          gh release create "$TAG" \
+          gh release create \
+            "$TAG" \
             dist/*.deb \
             dist/SHA256SUMS \
             --target "$GITHUB_SHA" \
             --title "XanMod ${TAG} ARM64 EDGE" \
             --notes-file dist/RELEASE.md
+
