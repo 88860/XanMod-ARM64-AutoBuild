@@ -2,13 +2,14 @@
 
 set -e
 
-apt update
-apt install -y wget curl gpg ca-certificates jq grub-common grub2-common
+apt update >/dev/null 2>&1
+apt install -y wget curl gpg ca-certificates jq grub-common grub2-common >/dev/null 2>&1
 
+CURRENT_KERNEL=$(uname -r)
 ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
 
 die() {
-    echo "ERROR: $1"
+    echo -e "\nERROR: $1"
     exit 1
 }
 
@@ -31,8 +32,7 @@ if [ "$ARCH" = "amd64" ]; then
         XANMOD_VER="x86-64-v2"
         XANMOD_PKG="linux-xanmod-x64v2"
     else
-        XANMOD_VER="x86-64-v1"
-        XANMOD_PKG=""
+        die "XanMod MAIN does not provide x86-64-v1"
     fi
 elif [ "$ARCH" = "arm64" ]; then
     XANMOD_VER="ARM64"
@@ -41,63 +41,30 @@ else
     die "Unsupported architecture: $ARCH"
 fi
 
-echo "Detected architecture: $ARCH"
-echo "Detected XanMod: $XANMOD_VER"
-
 ONLINE_VERSION=""
 INSTALLED_VERSION=""
-NEED_INSTALL=1
 
 if [ "$ARCH" = "amd64" ]; then
-    if [ "$XANMOD_VER" = "x86-64-v1" ]; then
-        die "XanMod MAIN does not provide x86-64-v1"
-    fi
-
     install -d -m 0755 /etc/apt/keyrings
-
-    wget -qO - https://dl.xanmod.org/archive.key |
-        gpg --dearmor --yes -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
-
+    wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor --yes -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
     chmod 0644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
-
     . /etc/os-release
-
-    printf '%s\n' \
-        "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${VERSION_CODENAME} main" \
-        > /etc/apt/sources.list.d/xanmod-release.list
-
-    apt update
+    printf '%s\n' "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${VERSION_CODENAME} main" > /etc/apt/sources.list.d/xanmod-release.list
+    apt update >/dev/null 2>&1
 
     XANMOD_REPO_URL="http://deb.xanmod.org/dists/${VERSION_CODENAME}/main/binary-amd64/Packages.gz"
-
     ONLINE_VERSION=$(
         curl -fsSL "$XANMOD_REPO_URL" 2>/dev/null |
         gzip -dc 2>/dev/null |
         awk -v pkg="$XANMOD_PKG" '
-            $1 == "Package:" && $2 == pkg {
-                found=1
-            }
-            found && $1 == "Version:" {
-                print $2
-                exit
-            }
+            $1 == "Package:" && $2 == pkg { found=1 }
+            found && $1 == "Version:" { print $2; exit }
         '
     )
-
     [ -n "$ONLINE_VERSION" ] || die "无法获取 XanMod 在线版本"
 
-    if dpkg-query -W -f='${Status}' "$XANMOD_PKG" 2>/dev/null |
-        grep -q "install ok installed"; then
+    if dpkg-query -W -f='${Status}' "$XANMOD_PKG" 2>/dev/null | grep -q "install ok installed"; then
         INSTALLED_VERSION=$(dpkg-query -W -f='${Version}' "$XANMOD_PKG" 2>/dev/null)
-    fi
-
-    echo "Installed version: ${INSTALLED_VERSION:-未安装}"
-    echo "Online version:    $ONLINE_VERSION"
-
-    if [ -n "$INSTALLED_VERSION" ] &&
-       [ "$INSTALLED_VERSION" = "$ONLINE_VERSION" ]; then
-        echo "XanMod 已是最新版本"
-        NEED_INSTALL=0
     fi
 
 elif [ "$ARCH" = "arm64" ]; then
@@ -105,9 +72,7 @@ elif [ "$ARCH" = "arm64" ]; then
     trap 'rm -rf "$TMPDIR"' EXIT
 
     API_URL="https://api.github.com/repos/88860/XanMod-ARM64-AutoBuild/releases?per_page=100"
-
-    RELEASE_JSON=$(curl -fsSL "$API_URL" 2>/dev/null) ||
-        die "无法获取 ARM64 XanMod Release"
+    RELEASE_JSON=$(curl -fsSL "$API_URL" 2>/dev/null) || die "无法获取 ARM64 XanMod Release"
 
     RELEASE_TAG=$(
         echo "$RELEASE_JSON" |
@@ -126,48 +91,56 @@ elif [ "$ARCH" = "arm64" ]; then
         ' |
         head -n1
     )
-
     [ -n "$RELEASE_TAG" ] || die "没有找到 ARM64 MAIN Release"
-
     ONLINE_VERSION="$RELEASE_TAG"
 
     INSTALLED_XANMOD=$(get_xanmod_kernel)
-
     if [ -n "$INSTALLED_XANMOD" ]; then
         INSTALLED_VERSION="${INSTALLED_XANMOD%-arm64-main}"
     fi
+fi
 
-    echo "Installed version: ${INSTALLED_VERSION:-未安装}"
-    echo "Online version:    $ONLINE_VERSION"
+echo "========================================="
+echo "当前运行内核: $CURRENT_KERNEL"
+echo "系统架构:     $ARCH"
+echo "适配的XanMod: $XANMOD_VER"
+echo "已安装版本:   ${INSTALLED_VERSION:-未安装}"
+echo "最新在线版本: $ONLINE_VERSION"
+echo "========================================="
+echo ""
 
-    if [ -n "$INSTALLED_VERSION" ] &&
-       [ "$INSTALLED_VERSION" = "$ONLINE_VERSION" ]; then
-        echo "XanMod 已是最新版本"
-        NEED_INSTALL=0
+DO_INSTALL=0
+
+if [ -z "$INSTALLED_VERSION" ]; then
+    read -r -p "未检测到 XanMod，是否安装？[y/N]: " CONFIRM
+    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        DO_INSTALL=1
+    else
+        echo "已取消安装，脚本退出。"
+        exit 0
+    fi
+elif [ "$INSTALLED_VERSION" = "$ONLINE_VERSION" ]; then
+    if echo "$CURRENT_KERNEL" | grep -qi "xanmod"; then
+        read -r -p "XanMod 已是最新版本且当前已在运行，按回车键退出脚本..." DUMMY
+        exit 0
+    else
+        read -r -p "XanMod 已是最新版本，但尚未应用。按回车键继续配置 GRUB..." DUMMY
+    fi
+else
+    read -r -p "发现新版本，是否升级？[y/N]: " CONFIRM
+    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+        DO_INSTALL=1
+    else
+        echo "已跳过升级，直接进行 GRUB 配置..."
     fi
 fi
 
-if [ "$NEED_INSTALL" -eq 1 ]; then
-    echo "检测到需要安装或升级 XanMod"
-
-    read -r -p "是否继续？[y/N]: " CONFIRM
-
-    case "$CONFIRM" in
-        y|Y)
-            ;;
-        *)
-            echo "已取消"
-            exit 0
-            ;;
-    esac
-
+if [ "$DO_INSTALL" -eq 1 ]; then
     if [ "$ARCH" = "amd64" ]; then
-        echo "Installing MAIN: $XANMOD_PKG"
+        echo -e "\n正在安装 $XANMOD_PKG ..."
         apt install -y "$XANMOD_PKG"
-
     elif [ "$ARCH" = "arm64" ]; then
-        echo "Selected MAIN release: $RELEASE_TAG"
-
+        echo -e "\n正在下载并安装 ARM64 MAIN release: $RELEASE_TAG ..."
         curl -fsSL \
             "https://api.github.com/repos/88860/XanMod-ARM64-AutoBuild/releases/tags/$RELEASE_TAG" |
             jq -r '
@@ -177,31 +150,21 @@ if [ "$NEED_INSTALL" -eq 1 ]; then
             ' |
             wget -q -i- -P "$TMPDIR"
 
-        ls "$TMPDIR"/linux-image-*_arm64.deb >/dev/null 2>&1 ||
-            die "ARM64 MAIN image package not found"
-
-        ls "$TMPDIR"/linux-headers-*_arm64.deb >/dev/null 2>&1 ||
-            die "ARM64 MAIN headers package not found"
-
+        ls "$TMPDIR"/linux-image-*_arm64.deb >/dev/null 2>&1 || die "ARM64 MAIN image package not found"
+        ls "$TMPDIR"/linux-headers-*_arm64.deb >/dev/null 2>&1 || die "ARM64 MAIN headers package not found"
         apt install -y "$TMPDIR"/*.deb
     fi
-else
-    echo "无需安装或升级"
-    echo "直接进入 GRUB 配置"
 fi
 
+echo -e "\n正在配置 GRUB..."
 update-grub || die "update-grub 失败"
 
 XANMOD_KERNEL=$(get_xanmod_kernel)
-
-[ -n "$XANMOD_KERNEL" ] ||
-    die "XanMod kernel not found"
+[ -n "$XANMOD_KERNEL" ] || die "未找到 XanMod 内核文件，GRUB 配置终止"
 
 GRUB_CFG="/boot/grub/grub.cfg"
 GRUB_DEFAULT_FILE="/etc/default/grub"
-
-[ -f "$GRUB_CFG" ] ||
-    die "GRUB configuration not found"
+[ -f "$GRUB_CFG" ] || die "未找到 GRUB 配置文件 ($GRUB_CFG)"
 
 XANMOD_GRUB_ID=$(awk -v k="vmlinuz-${XANMOD_KERNEL}" '
     /^[[:space:]]*submenu[[:space:]]/ {
@@ -236,8 +199,7 @@ XANMOD_GRUB_ID=$(awk -v k="vmlinuz-${XANMOD_KERNEL}" '
     }
 ' "$GRUB_CFG")
 
-[ -n "$XANMOD_GRUB_ID" ] ||
-    die "XanMod GRUB entry not found"
+[ -n "$XANMOD_GRUB_ID" ] || die "未能从 grub.cfg 中提取到 XanMod 的启动项 ID"
 
 if grep -q '^GRUB_DEFAULT=' "$GRUB_DEFAULT_FILE"; then
     sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' "$GRUB_DEFAULT_FILE"
@@ -251,22 +213,20 @@ else
     printf '%s\n' 'GRUB_SAVEDEFAULT=false' >> "$GRUB_DEFAULT_FILE"
 fi
 
-grub-set-default "$XANMOD_GRUB_ID" ||
-    die "设置 GRUB 默认启动项失败"
+grub-set-default "$XANMOD_GRUB_ID" || die "设置 GRUB 默认启动项失败"
 
-SAVED_ENTRY=$(
-    grub-editenv /boot/grub/grubenv list 2>/dev/null |
-    sed -n 's/^saved_entry=//p'
-)
-
-[ "$SAVED_ENTRY" = "$XANMOD_GRUB_ID" ] ||
-    die "GRUB 默认启动项验证失败"
+SAVED_ENTRY=$(grub-editenv /boot/grub/grubenv list 2>/dev/null | sed -n 's/^saved_entry=//p')
+[ "$SAVED_ENTRY" = "$XANMOD_GRUB_ID" ] || die "GRUB 默认启动项验证失败"
 
 update-grub || die "最终 update-grub 失败"
 
-echo "XanMod: $XANMOD_KERNEL"
-echo "GRUB: $XANMOD_GRUB_ID"
-echo "完成，系统即将重启"
+echo ""
+echo "========================================="
+echo "默认启动内核已设置为: $XANMOD_KERNEL"
+echo "GRUB 启动项 ID 映射:  $XANMOD_GRUB_ID"
+echo "========================================="
+echo ""
 
+read -r -p "GRUB 配置成功！按回车键立即重启系统 (或按 Ctrl+C 取消重启)... " DUMMY
 reboot
 
