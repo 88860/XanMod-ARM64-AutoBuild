@@ -166,7 +166,7 @@ jobs:
               next
           }
           /^CONFIG_/ {
-              split($0,a,"="）
+              split($0,a,"=")
               if (a[1] in arm)
                   print
               next
