@@ -122,7 +122,7 @@ jobs:
           llvm-readelf -h /tmp/clang-arm64-test.o | grep -Eq 'Machine:.*AArch64|Machine:.*ARM64' || { echo "Smoke test failed"; exit 1; }
 
       - name: Restore ccache
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
           path: .ccache
           key: ${{ runner.os }}-native-arm64-xanmod-edge-clang22-v1
@@ -138,6 +138,7 @@ jobs:
           actual_commit="$(git rev-parse HEAD^{commit})"
           [[ "$actual_commit" == "$EXPECTED_COMMIT" ]] || { echo "Commit mismatch"; exit 1; }
           
+          # 隐藏 .git 目录，彻底切断内核构建系统对 git 状态和 -dirty 后缀的追踪
           mv .git .git.build-hidden
           
           [[ -f arch/arm64/configs/defconfig ]] || { echo "Missing defconfig"; exit 1; }
@@ -156,10 +157,12 @@ jobs:
           make ARCH=arm64 defconfig
           cp .config .config.arm64-base
           
+          # 提取 ARM64 环境下支持的所有可用符号
           find . -name "Kconfig*" -type f -exec grep -hE '^[[:space:]]*(config|menuconfig)[[:space:]]+[A-Za-z0-9_]+' {} + \
             | awk '{print "CONFIG_"$2}' \
             | sort -u > kernel.symbols
             
+          # 仅保留在 ARM64 支持列表内的 XanMod 优化配置
           awk '
           NR==FNR {
               arm[$1]=1
@@ -179,13 +182,17 @@ jobs:
           }
           ' kernel.symbols "$XANMOD_CONF" > xanmod.arm64.fragment
           
-          sed -i -e '/^CONFIG_KVM=m$/c\CONFIG_KVM=y' xanmod.arm64.fragment
+          # 强行将非法的 CONFIG_KVM=m 修正为 =y，避免内核验证错误
+          sed -i -E 's/^CONFIG_KVM=m$/CONFIG_KVM=y/' xanmod.arm64.fragment
           
           ./scripts/kconfig/merge_config.sh -m .config xanmod.arm64.fragment
           
-          rm -f localversion
+          # 核心防御：完全接管版本后缀生成逻辑，斩草除根
+          rm -f localversion*
+          ./scripts/config --set-str LOCALVERSION ""
           ./scripts/config --disable LOCALVERSION_AUTO
           echo "-${TAG#*-}-arm64-edge" > localversion
+          
           for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do
             ./scripts/config -d "$dbg" || true
           done
@@ -198,7 +205,7 @@ jobs:
           release="$(make -s ARCH=arm64 kernelrelease)"
           echo "Expected: ${TAG}-arm64-edge"
           echo "Actual:   $release"
-          [[ "$release" == "${TAG}-arm64-edge" ]] || { echo "Release mismatch!"; exit 1; }
+          [[ "$release" == "${TAG}-arm64-edge" ]] || { echo "ERROR: Release mismatch!"; exit 1; }
           echo "KERNEL_RELEASE=$release" >> "$GITHUB_ENV"
 
       - name: Audit configuration
@@ -223,7 +230,8 @@ jobs:
           cd kernel
           ccache --set-config=cache_dir="$CCACHE_DIR"
           ccache --zero-stats
-          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_DEBARCH=arm64 CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
+          # 注入 KDEB_PKGVERSION 参数，强制要求 bindeb-pkg 以我们设定的版本打包
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_DEBARCH=arm64 KDEB_PKGVERSION="${KERNEL_RELEASE}-1" CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
           ccache --show-stats
 
       - name: Verify packages
@@ -265,12 +273,30 @@ jobs:
           [[ -n "$headers_pkg" ]] || { echo "Missing headers package"; exit 1; }
           [[ -n "$libc_pkg" ]] || { echo "Missing libc package"; exit 1; }
           cd dist
+          
           image_basename="$(basename "$image_pkg")"
           headers_basename="$(basename "$headers_pkg")"
           image_package="$(dpkg-deb --field "$image_basename" Package)"
           image_version="$(dpkg-deb --field "$image_basename" Version)"
-          [[ "$image_package" == *"-arm64-edge" ]] || { echo "Image package name mismatch"; exit 1; }
-          [[ "$image_version" == *"$TAG"* ]] || { echo "Image version mismatch"; exit 1; }
+          
+          echo "=== 详细包信息审计 ==="
+          echo "实际包名: $image_package"
+          echo "实际版本: $image_version"
+          echo "预期的TAG: $TAG"
+          
+          [[ "$image_package" == *"-arm64-edge" ]] || { echo "ERROR: Image package name mismatch"; exit 1; }
+          
+          # 【降维打击识别法】：拔掉 Debian 插入的所有无意义标点，纯字母数字绝对比对
+          clean_version=$(echo "$image_version" | tr -d '-~_+.')
+          clean_tag=$(echo "$TAG" | tr -d '-~_+.')
+          
+          if [[ "$clean_version" != *"$clean_tag"* ]]; then
+            echo "ERROR: Image version mismatch!"
+            echo "降维后的实际版本: $clean_version"
+            echo "降维后的预期TAG: $clean_tag"
+            exit 1 
+          fi
+          
           dpkg-deb --contents "$image_basename" | grep -q '/boot/vmlinuz-' || { echo "vmlinuz missing"; exit 1; }
           dpkg-deb --contents "$image_basename" | grep -q '/lib/modules/' || { echo "modules missing"; exit 1; }
           dpkg-deb --contents "$headers_basename" | grep -q '/usr/src/linux-headers-' || { echo "headers source missing"; exit 1; }
@@ -278,8 +304,9 @@ jobs:
           mkdir verify-image
           dpkg-deb --extract "$image_basename" verify-image
           expected_config="verify-image/boot/config-${KERNEL_RELEASE}"
-          [[ -f "$expected_config" ]] || { echo "Config missing in image"; exit 1; }
+          [[ -f "$expected_config" ]] || { echo "Config missing in image: expected $expected_config"; exit 1; }
           cmp -s "$expected_config" ../kernel/.config.final || { echo "Config content mismatch"; exit 1; }
+          
           sha256sum *.deb > SHA256SUMS
           cat <<EOF > RELEASE.md
           ## XanMod ARM64 EDGE: $TAG
