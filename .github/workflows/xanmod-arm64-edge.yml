@@ -60,9 +60,6 @@ jobs:
       TAG: ${{ needs.preflight.outputs.tag }}
       EXPECTED_COMMIT: ${{ needs.preflight.outputs.commit }}
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
-      # 核心修复：把被删掉的全局架构和编译器环境加回来！
-      ARCH: arm64
-      LLVM: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - name: Setup
@@ -97,6 +94,18 @@ jobs:
           DEBEMAIL: github-actions@users.noreply.github.com
         run: |
           set -euo pipefail
+          
+          # 核心修复：全局 Export 交叉编译环境，确保所有的 make 命令使用一致的 Clang，阻断 GCC 回退！
+          export ARCH=arm64
+          export LLVM=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC="ccache clang --target=aarch64-linux-gnu"
+          export HOSTCC="ccache clang"
+          export HOSTCXX="ccache clang++"
+          export HOSTLD=ld.lld
+          export HOSTAR=llvm-ar
+          export LD=ld.lld
+          
           git clone --filter=blob:none --branch "$TAG" https://gitlab.com/xanmod/linux.git kernel
           cd kernel
           [[ "$(git rev-parse HEAD^{commit})" == "$EXPECTED_COMMIT" ]] || exit 1
@@ -104,7 +113,7 @@ jobs:
           if [[ -f "CONFIGS/x86_64/config" ]]; then xanmod_conf="CONFIGS/x86_64/config"; else xanmod_conf=$(find CONFIGS -type f -name "config" | grep -iE 'x86_64|x86-64-v' | head -n 1 || true); fi
           [[ -f "$xanmod_conf" ]] || exit 1
           
-          make ARCH=arm64 defconfig
+          make defconfig
           find . -name "Kconfig*" -type f -exec grep -hE '^[[:space:]]*(config|menuconfig)[[:space:]]+[A-Za-z0-9_]+' {} + | awk '{print "CONFIG_"$2}' | sort -u > kernel.symbols
           awk 'NR==FNR{arm[$1]=1;next}/^CONFIG_/{split($0,a,"=");if(a[1] in arm)print;next}/^# CONFIG_/{match($0,/CONFIG_[A-Za-z0-9_]+/);sym=substr($0,RSTART,RLENGTH);if(sym in arm)print}' kernel.symbols "$xanmod_conf" > xanmod.arm64.fragment
           sed -i -E 's/^CONFIG_KVM=m$/CONFIG_KVM=y/' xanmod.arm64.fragment
@@ -116,28 +125,34 @@ jobs:
           echo "-${TAG#*-}-arm64-${CHANNEL}" > localversion
           for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do ./scripts/config -d "$dbg" || true; done
           
-          make ARCH=arm64 olddefconfig
+          make olddefconfig
+          
+          # 核心修复：重拾失落的防线，确保配置没有回退到 GCC
+          grep -q '^CONFIG_CC_IS_CLANG=y$' .config || { echo "ERROR: Compiler fell back to GCC!"; exit 1; }
+          
           cp .config .config.final
           touch .scmversion
-          
-          kernel_rel="$(make -s ARCH=arm64 kernelrelease)"
+          kernel_rel="$(make -s kernelrelease)"
           [[ "$kernel_rel" == "${TAG}-arm64-${CHANNEL}" ]] || exit 1
           
           ccache --set-config=cache_dir="$CCACHE_DIR"
-          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld -s prepare
-          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_DEBARCH=arm64 KDEB_PKGVERSION="${kernel_rel}-1" CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
+          ccache --zero-stats
+          make KDEB_PKGVERSION="${kernel_rel}-1" KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
+          ccache --show-stats
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # 核心修复：bindeb-pkg 输出包在上一级目录（$GITHUB_WORKSPACE），这里千万不能加 kernel/ 前缀
           mkdir -p dist
           shopt -s nullglob
-          dbg_pkgs=(kernel/*dbg*.deb kernel/*dbgsym*.deb)
+          dbg_pkgs=(*dbg*.deb *dbgsym*.deb)
           ((${#dbg_pkgs[@]} == 0)) || exit 1
-          packages=(kernel/*.deb)
+          packages=(*.deb)
           ((${#packages[@]} > 0)) || exit 1
+          
           img="" hdr="" libc=""
           for deb in "${packages[@]}"; do
             case "$(dpkg-deb --field "$deb" Package)" in
