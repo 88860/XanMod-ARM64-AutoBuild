@@ -60,6 +60,9 @@ jobs:
       TAG: ${{ needs.preflight.outputs.tag }}
       EXPECTED_COMMIT: ${{ needs.preflight.outputs.commit }}
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+      # 核心修复：把被删掉的全局架构和编译器环境加回来！
+      ARCH: arm64
+      LLVM: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - name: Setup
@@ -94,20 +97,6 @@ jobs:
           DEBEMAIL: github-actions@users.noreply.github.com
         run: |
           set -euo pipefail
-          
-          # 核心修复：定义全局统一的 Make 参数，确保配置阶段和编译阶段的编译器 100% 一致！
-          MAKE_ARGS=(
-            ARCH=arm64
-            LLVM=1
-            CROSS_COMPILE=aarch64-linux-gnu-
-            "CC=ccache clang --target=aarch64-linux-gnu"
-            "HOSTCC=ccache clang"
-            "HOSTCXX=ccache clang++"
-            HOSTLD=ld.lld
-            HOSTAR=llvm-ar
-            LD=ld.lld
-          )
-          
           git clone --filter=blob:none --branch "$TAG" https://gitlab.com/xanmod/linux.git kernel
           cd kernel
           [[ "$(git rev-parse HEAD^{commit})" == "$EXPECTED_COMMIT" ]] || exit 1
@@ -115,32 +104,28 @@ jobs:
           if [[ -f "CONFIGS/x86_64/config" ]]; then xanmod_conf="CONFIGS/x86_64/config"; else xanmod_conf=$(find CONFIGS -type f -name "config" | grep -iE 'x86_64|x86-64-v' | head -n 1 || true); fi
           [[ -f "$xanmod_conf" ]] || exit 1
           
-          # 修复点：配置基线时传入 LLVM 环境
-          make "${MAKE_ARGS[@]}" defconfig
-          
+          make ARCH=arm64 defconfig
           find . -name "Kconfig*" -type f -exec grep -hE '^[[:space:]]*(config|menuconfig)[[:space:]]+[A-Za-z0-9_]+' {} + | awk '{print "CONFIG_"$2}' | sort -u > kernel.symbols
           awk 'NR==FNR{arm[$1]=1;next}/^CONFIG_/{split($0,a,"=");if(a[1] in arm)print;next}/^# CONFIG_/{match($0,/CONFIG_[A-Za-z0-9_]+/);sym=substr($0,RSTART,RLENGTH);if(sym in arm)print}' kernel.symbols "$xanmod_conf" > xanmod.arm64.fragment
           sed -i -E 's/^CONFIG_KVM=m$/CONFIG_KVM=y/' xanmod.arm64.fragment
           ./scripts/kconfig/merge_config.sh -m .config xanmod.arm64.fragment
+          
           rm -f localversion*
           ./scripts/config --set-str LOCALVERSION ""
           ./scripts/config --disable LOCALVERSION_AUTO
           echo "-${TAG#*-}-arm64-${CHANNEL}" > localversion
           for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do ./scripts/config -d "$dbg" || true; done
           
-          # 修复点：合并完成后，再次用相同的 LLVM 参数刷新配置
-          make "${MAKE_ARGS[@]}" olddefconfig
+          make ARCH=arm64 olddefconfig
           cp .config .config.final
           touch .scmversion
           
-          kernel_rel="$(make -s "${MAKE_ARGS[@]}" kernelrelease)"
+          kernel_rel="$(make -s ARCH=arm64 kernelrelease)"
           [[ "$kernel_rel" == "${TAG}-arm64-${CHANNEL}" ]] || exit 1
           
           ccache --set-config=cache_dir="$CCACHE_DIR"
-          
-          # 编译阶段同样复用相同的 LLVM 参数数组
-          make "${MAKE_ARGS[@]}" -s prepare
-          make "${MAKE_ARGS[@]}" KDEB_PKGVERSION="${kernel_rel}-1" KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld -s prepare
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_DEBARCH=arm64 KDEB_PKGVERSION="${kernel_rel}-1" CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
 
       - name: Publish
         env:
@@ -164,15 +149,18 @@ jobs:
           done
           [[ -n "$img" && -n "$hdr" && -n "$libc" ]] || exit 1
           cd dist
+          
           [[ "$(dpkg-deb --field "$img" Package)" == *"-arm64-${CHANNEL}" ]] || exit 1
           [[ "$(echo "$(dpkg-deb --field "$img" Version)" | tr -d '-~_+.')" == *"$(echo "$TAG" | tr -d '-~_+.')"* ]] || exit 1
           dpkg-deb --contents "$img" | grep -q '/boot/vmlinuz-' || exit 1
           dpkg-deb --contents "$img" | grep -q '/lib/modules/' || exit 1
           dpkg-deb --contents "$hdr" | grep -q '/usr/src/linux-headers-' || exit 1
+          
           mkdir verify-image
           dpkg-deb --extract "$img" verify-image
           [[ -f "verify-image/boot/config-${TAG}-arm64-${CHANNEL}" ]] || exit 1
           cmp -s "verify-image/boot/config-${TAG}-arm64-${CHANNEL}" ../kernel/.config.final || exit 1
+          
           sha256sum *.deb > SHA256SUMS
           cat <<EOF > RELEASE.md
           ## XanMod ARM64 ${CHANNEL^^}: $TAG
@@ -182,12 +170,15 @@ jobs:
           * **Compiler:** Clang ${LLVM_VER}
           * **Build:** GitHub Actions Native ARM64
           EOF
+          
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" *.deb SHA256SUMS --clobber
             gh release edit "$RELEASE_TAG" --title "XanMod ${TAG} ARM64 ${CHANNEL^^}" --notes-file RELEASE.md
           else
             gh release create "$RELEASE_TAG" *.deb SHA256SUMS --title "XanMod ${TAG} ARM64 ${CHANNEL^^}" --notes-file RELEASE.md
           fi
+          
           gh release list --limit 50 | awk '{print $1}' | grep "\-arm64-${CHANNEL}$" | grep -v "^${RELEASE_TAG}$" | while read -r old_tag; do
             gh release delete "$old_tag" --cleanup-tag -y || true
           done
+
