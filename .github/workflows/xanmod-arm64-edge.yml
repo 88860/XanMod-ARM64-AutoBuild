@@ -465,7 +465,7 @@ jobs:
 
           echo "=== Building ==="
 
-          make -j"$(nproc)" bindeb-pkg
+          make -j"$(nproc)" bindeb-pkg DPKG_FLAGS="-d"
 
           echo "=== ccache after build ==="
           ccache --show-stats
