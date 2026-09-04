@@ -359,10 +359,7 @@ jobs:
                 ./scripts/config --disable "${conf#CONFIG_}" || true
             done
 
-          echo "=== Second Kconfig auto-resolution ==="
-          make ARCH=arm64 olddefconfig
-
-          echo "=== Configuration adjustments ==="
+          echo "=== Configuration adjustments (Debug & Version) ==="
           rm -f localversion
           ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
           printf '%s\n' "-${TAG#*-}-arm64-edge" > localversion
@@ -381,23 +378,6 @@ jobs:
           make ARCH=arm64 olddefconfig
           cp .config .config.final
 
-          echo "=== Final architecture residue audit ==="
-          if grep -qE '^CONFIG_(X86|X86_64|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config.final; then
-            echo "ERROR: x86 residue detected"
-            grep -E '^CONFIG_(X86|X86_64|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config.final
-            exit 1
-          fi
-
-          echo "=== Verify ARM64 architecture ==="
-          grep -q '^CONFIG_ARM64=y$' .config.final || {
-            echo "ERROR: ARM64 kernel config missing"
-            exit 1
-          }
-          grep -q '^CONFIG_64BIT=y$' .config.final || {
-            echo "ERROR: 64bit config missing"
-            exit 1
-          }
-
           echo "=== Verify Kernel Release ==="
           release="$(make -s ARCH=arm64 kernelrelease)"
           echo "Expected: ${TAG}-arm64-edge"
@@ -414,14 +394,14 @@ jobs:
 
           cd kernel
 
-          echo "=== Architecture audit ==="
-          if grep -qE '^CONFIG_(X86|X86_64|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config; then
+          echo "=== Architecture & CPU Tuning Audit ==="
+          if grep -qE '^CONFIG_(X86|X86_64|INTEL|AMD|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config; then
             echo "ERROR: x86 configuration or CPU tuning detected:"
-            grep -E '^CONFIG_(X86|X86_64|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config
+            grep -E '^CONFIG_(X86|X86_64|INTEL|AMD|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config
             exit 1
           fi
 
-          echo "=== Required configuration ==="
+          echo "=== Required ARM64 Configuration Audit ==="
           for req in \
             ARM64 \
             64BIT \
@@ -441,7 +421,7 @@ jobs:
             }
           done
 
-          echo "=== Compiler configuration ==="
+          echo "=== Compiler Configuration Audit ==="
           grep -q '^CONFIG_CC_IS_CLANG=y$' .config || {
             echo "ERROR: Kernel is not configured for Clang."
             exit 1
