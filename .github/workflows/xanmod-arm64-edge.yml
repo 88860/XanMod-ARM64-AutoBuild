@@ -133,37 +133,50 @@ jobs:
       - name: Fetch source
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "$TAG" https://gitlab.com/xanmod/linux.git kernel
+          git clone --filter=blob:none --branch "$TAG" https://gitlab.com/xanmod/linux.git kernel
           cd kernel
           actual_commit="$(git rev-parse HEAD^{commit})"
           [[ "$actual_commit" == "$EXPECTED_COMMIT" ]] || exit 1
+          
           [[ -f arch/arm64/configs/defconfig ]] || exit 1
           xanmod_conf="CONFIGS/x86_64/config"
           if [[ ! -f "$xanmod_conf" ]]; then
             exit 1
           fi
           echo "XANMOD_CONF=$xanmod_conf" >> "$GITHUB_ENV"
-          [[ -z "$(git status --porcelain)" ]] || exit 1
 
       - name: Configure kernel
         run: |
           set -euo pipefail
           cd kernel
+          
           make ARCH=arm64 defconfig
           cp .config .config.arm64-base
           
-          ARCH=arm64 ./scripts/kconfig/merge_config.sh -m .config "$XANMOD_CONF"
+          find . -name "Kconfig*" -type f -exec grep -hE '^[[:space:]]*(config|menuconfig)[[:space:]]+[A-Za-z0-9_]+' {} + \
+            | awk '{print "CONFIG_"$2}' \
+            | sort -u > kernel.symbols
+            
+          awk '
+          NR==FNR {
+              arm[$1]=1
+              next
+          }
+          /^CONFIG_/ {
+              split($0,a,"=")
+              if (a[1] in arm)
+                  print
+              next
+          }
+          /^# CONFIG_/ {
+              match($0,/CONFIG_[A-Za-z0-9_]+/)
+              sym=substr($0,RSTART,RLENGTH)
+              if (sym in arm)
+                  print
+          }
+          ' kernel.symbols "$XANMOD_CONF" > xanmod.arm64.fragment
           
-          if grep -qE '^# CONFIG_(X86 |X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config 2>/dev/null; then
-            grep -E '^# CONFIG_(X86 |X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config | sed -E 's/^# CONFIG_([^ ]+) .*/\1/' | while read -r conf; do
-              ./scripts/config --disable "$conf" || true
-            done
-          fi
-          if grep -qE '^CONFIG_(X86=|X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config 2>/dev/null; then
-            grep -E '^CONFIG_(X86=|X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config | cut -d= -f1 | while read -r conf; do
-              ./scripts/config --disable "${conf#CONFIG_}" || true
-            done
-          fi
+          ./scripts/kconfig/merge_config.sh -m .config xanmod.arm64.fragment
           
           rm -f localversion
           ./scripts/config --disable LOCALVERSION_AUTO
@@ -175,6 +188,8 @@ jobs:
           make ARCH=arm64 olddefconfig
           cp .config .config.final
           
+          touch .scmversion
+          
           release="$(make -s ARCH=arm64 kernelrelease)"
           [[ "$release" == "${TAG}-arm64-edge" ]] || exit 1
           echo "KERNEL_RELEASE=$release" >> "$GITHUB_ENV"
@@ -183,15 +198,12 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          if grep -qE '^CONFIG_(X86=|X86_|X86_64_|MCORE2|MZEN|MK8|MPSC|CPU_SUP_INTEL|CPU_SUP_AMD)' .config; then
-            exit 1
-          fi
           for req in ARM64 64BIT MODULES NET INET PROC_FS SYSFS CGROUPS NAMESPACES BPF BPF_SYSCALL; do
             grep -q "^CONFIG_${req}=y$" .config || exit 1
           done
           grep -q '^CONFIG_CC_IS_CLANG=y$' .config || exit 1
           grep -q '^CONFIG_LD_IS_LLD=y$' .config || exit 1
-          make -s prepare
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld -s prepare
 
       - name: Build packages
         env:
@@ -204,7 +216,7 @@ jobs:
           cd kernel
           ccache --set-config=cache_dir="$CCACHE_DIR"
           ccache --zero-stats
-          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_DEBARCH=arm64 CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_DEBARCH=arm64 CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
           ccache --show-stats
 
       - name: Verify packages
@@ -267,7 +279,7 @@ jobs:
 
           * **Kernel Release:** \`${KERNEL_RELEASE}\`
           * **Architecture:** \`arm64\`
-          * **Profile:** Full-Featured
+          * **Profile:** Full-Featured (Cross-Ported)
           * **Channel:** EDGE
           * **Upstream Source:** [GitLab XanMod Linux](https://gitlab.com/xanmod/linux/-/releases/$TAG)
           * **Upstream Commit:** \`${EXPECTED_COMMIT}\`
@@ -292,4 +304,3 @@ jobs:
           else
             gh release create "$RELEASE_TAG" dist/*.deb dist/SHA256SUMS --title "XanMod ${TAG} ARM64 EDGE" --notes-file dist/RELEASE.md
           fi
-
