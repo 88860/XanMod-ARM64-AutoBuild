@@ -5,8 +5,7 @@ on:
   schedule:
     - cron: '37 3 * * *'
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: xanmod-arm64-edge
@@ -15,6 +14,8 @@ concurrency:
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       commit: ${{ steps.check.outputs.commit }}
@@ -37,6 +38,7 @@ jobs:
               curl -fsSL \
                 --retry 5 \
                 --retry-delay 2 \
+                --retry-all-errors \
                 "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page"
             )"
 
@@ -99,9 +101,9 @@ jobs:
 
             complete=true
 
-            grep -Eq '^linux-image-.*\.deb$' <<< "$assets" || complete=false
-            grep -Eq '^linux-headers-.*\.deb$' <<< "$assets" || complete=false
-            grep -Eq '^linux-libc-dev.*\.deb$' <<< "$assets" || complete=false
+            grep -Eq '^linux-image-.*arm64-edge.*\.deb$' <<< "$assets" || complete=false
+            grep -Eq '^linux-headers-.*arm64-edge.*\.deb$' <<< "$assets" || complete=false
+            grep -Eq '^linux-libc-dev.*arm64.*\.deb$' <<< "$assets" || complete=false
             grep -Fxq 'SHA256SUMS' <<< "$assets" || complete=false
 
             if [[ "$complete" == true ]]; then
@@ -123,11 +125,15 @@ jobs:
     if: needs.preflight.outputs.build_needed == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
+    permissions:
+      contents: write
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
       EXPECTED_COMMIT: ${{ needs.preflight.outputs.commit }}
       ARCH: arm64
       LLVM: 1
+      KCONFIG_WARN_UNKNOWN_SYMBOLS: 1
+      KCONFIG_WARN_CHANGED_INPUT: 1
 
     steps:
       - name: Native Environment Audit
@@ -135,10 +141,13 @@ jobs:
           set -euo pipefail
 
           echo "=== Native ARM64 environment ==="
-          uname -m
-          dpkg --print-architecture
-          nproc
+          uname -a
+          echo "Machine:     $(uname -m)"
+          echo "DPKG arch:   $(dpkg --print-architecture)"
+          echo "CPU cores:   $(nproc)"
+          echo "Memory:"
           free -h
+          echo "Disk:"
           df -h /
 
           [[ "$(uname -m)" == "aarch64" ]] || {
@@ -151,8 +160,15 @@ jobs:
             exit 1
           }
 
+          [[ "$(nproc)" -ge 2 ]] || {
+            echo "ERROR: Insufficient CPU cores."
+            exit 1
+          }
+
+          echo "=== Native compiler architecture ==="
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Dependencies
         env:
@@ -209,6 +225,8 @@ jobs:
 
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
+          sudo apt-get clean
+
           echo "=== LLVM toolchain ==="
           clang --version
           ld.lld --version
@@ -224,11 +242,25 @@ jobs:
             exit 1
           }
 
+          echo "=== Native compiler binaries ==="
+          file "$(command -v clang)"
+          file "$(command -v ld.lld)"
+          file "$(command -v llvm-ar)"
+
           echo "=== Target triple checks ==="
-          clang --target=aarch64-linux-gnu -dumpmachine
-          clang -print-target-triple
+          echo "Debian architecture: $(dpkg --print-architecture)"
+          echo "Debian GNU triplet:   $(dpkg-architecture -qDEB_HOST_GNU_TYPE)"
+          echo "Clang target:         $(clang -print-target-triple)"
+          echo "Clang ARM64 target:   $(clang --target=aarch64-linux-gnu -dumpmachine)"
+
+          clang --target=aarch64-linux-gnu -dumpmachine \
+            | grep -qx 'aarch64-linux-gnu' || {
+              echo "ERROR: Clang ARM64 target triple is incorrect."
+              exit 1
+            }
 
           echo "=== ARM64 LLVM smoke test ==="
+
           cat >/tmp/clang-arm64-test.c <<'EOF'
           int test_function(void)
           {
@@ -250,10 +282,10 @@ jobs:
           echo "ARM64 Native Clang smoke test passed."
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
-          key: ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-v1
+          key: ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-v2
           restore-keys: |
             ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-
             ${{ runner.os }}-native-arm64-xanmod-edge-
@@ -299,6 +331,10 @@ jobs:
             exit 1
           }
 
+          echo "=== Source revision ==="
+          git rev-parse HEAD
+          git show -s --format='%cI' HEAD > .source-commit-date
+
           mv .git .git.build-hidden
 
       - name: Configure Kernel
@@ -312,29 +348,89 @@ jobs:
 
           cp .config .config.arm64-base
 
-          echo "=== Extract reusable XanMod configuration ==="
+          echo "=== Extract current XanMod x86_64 configuration ==="
 
           awk '
             /^[[:space:]]*CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|".*")$/ {
-              if ($0 ~ /^[[:space:]]*CONFIG_LOCALVERSION=/)
-                next
-
+              sub(/^[[:space:]]+/, "")
+              if ($0 !~ /^CONFIG_LOCALVERSION=/)
+                print
+            }
+            /^[[:space:]]*# CONFIG_[A-Za-z0-9_]+ is not set$/ {
               sub(/^[[:space:]]+/, "")
               print
             }
           ' CONFIGS/x86_64/config > .xanmod-candidates
 
+          [[ -s .xanmod-candidates ]] || {
+            echo "ERROR: XanMod configuration extraction produced no entries."
+            exit 1
+          }
+
+          candidate_duplicates="$(
+            awk '
+              {
+                line=$0
+                if (line ~ /^CONFIG_/) {
+                  sub(/=.*/, "", line)
+                  print line
+                } else if (line ~ /^# CONFIG_/) {
+                  sub(/^# /, "", line)
+                  sub(/ is not set$/, "", line)
+                  print line
+                }
+              }
+            ' .xanmod-candidates \
+            | sort \
+            | uniq -d
+          )"
+
+          [[ -z "$candidate_duplicates" ]] || {
+            echo "ERROR: Duplicate XanMod configuration symbols detected:"
+            printf '%s\n' "$candidate_duplicates"
+            exit 1
+          }
+
           echo "Candidate configuration entries:"
           wc -l .xanmod-candidates
 
-          echo "=== Merge XanMod configuration ==="
+          echo "=== Merge current XanMod configuration into ARM64 base ==="
 
           ./scripts/kconfig/merge_config.sh \
             -m \
             .config \
             .xanmod-candidates
 
-          make olddefconfig > /dev/null
+          cp .config .config.xanmod-merged
+
+          echo "=== ARM64 base versus XanMod migration diff ==="
+
+          diff -u \
+            .config.arm64-base \
+            .config.xanmod-merged \
+            > .config.arm64-xanmod-migration.diff || true
+
+          echo "Migration changes:"
+          grep -E '^[+-]CONFIG_|^[+-]# CONFIG_' \
+            .config.arm64-xanmod-migration.diff \
+            | wc -l || true
+
+          echo "=== Normalize migrated configuration ==="
+
+          make olddefconfig
+
+          cp .config .config.after-olddefconfig
+
+          echo "=== Configuration changes caused by Kconfig ==="
+
+          scripts/diffconfig \
+            .config.xanmod-merged \
+            .config.after-olddefconfig \
+            > .config.kconfig-resolution.diff || true
+
+          echo "=== Final XanMod ARM64 configuration ==="
+
+          cp .config.after-olddefconfig .config
 
           rm -f localversion
 
@@ -429,6 +525,15 @@ jobs:
             exit 1
           }
 
+          echo "=== Configuration resolution audit ==="
+
+          if grep -Eq \
+            'CONFIG_X86|CONFIG_MCORE2|CONFIG_MZEN|CONFIG_X86_NATIVE_CPU|CONFIG_X86_64_VERSION' \
+            .xanmod-candidates
+          then
+            echo "X86-specific entries existed in the source XanMod configuration."
+          fi
+
           echo "=== Prepare ==="
 
           make -s prepare
@@ -436,24 +541,45 @@ jobs:
       - name: Build Debian Packages
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 1G
           KBUILD_BUILD_USER: github-actions
           KBUILD_BUILD_HOST: github-arm64-native
           DEBFULLNAME: github-actions
           DEBEMAIL: github-actions@users.noreply.github.com
+          CC: clang --target=aarch64-linux-gnu
+          KBUILD_DEBARCH: arm64
         run: |
           set -euo pipefail
 
           cd kernel
 
-          echo "=== ccache before build ==="
-          ccache --show-stats || true
+          echo "=== Configure ccache ==="
 
+          ccache --max-size=1G
+          ccache --set-config=compiler_check=content
+          ccache --show-config
+          ccache --show-stats
           ccache --zero-stats
+
+          echo "=== Debian architecture ==="
+
+          dpkg-architecture -qDEB_BUILD_ARCH
+          dpkg-architecture -qDEB_HOST_ARCH
+          dpkg-architecture -qDEB_BUILD_GNU_TYPE
+          dpkg-architecture -qDEB_HOST_GNU_TYPE
+
+          echo "=== Compiler ==="
+
+          echo "CC=$CC"
+          clang --target=aarch64-linux-gnu -dumpmachine
+          clang --target=aarch64-linux-gnu --version
 
           echo "=== Building ==="
 
           make \
             ARCH=arm64 \
+            LLVM=1 \
             KDEB_COMPRESS=gzip \
             skipdbg=true \
             -j"$(nproc)" \
@@ -579,121 +705,22 @@ jobs:
 
           image_package="$(dpkg-deb --field "$image_basename" Package)"
           image_version="$(dpkg-deb --field "$image_basename" Version)"
+          image_arch="$(dpkg-deb --field "$image_basename" Architecture)"
 
           echo "Image package: $image_package"
           echo "Image version: $image_version"
+          echo "Image arch:    $image_arch"
 
           [[ "$image_package" == *"-arm64-edge" ]] || {
             echo "ERROR: Unexpected image package name."
             exit 1
           }
 
+          [[ "$image_arch" == "arm64" ]] || {
+            echo "ERROR: Image package architecture is not arm64."
+            exit 1
+          }
+
           [[ "$image_version" == *"$TAG"* ]] || {
             echo "ERROR: Package version does not contain expected TAG."
-            echo "Expected: $TAG"
-            echo "Actual:   $image_version"
-            exit 1
-          }
-
-          echo "=== Package contents ==="
-
-          dpkg-deb --contents "$image_basename" \
-            | grep -q '/boot/vmlinuz-' || {
-              echo "ERROR: Kernel image not found."
-              exit 1
-            }
-
-          dpkg-deb --contents "$image_basename" \
-            | grep -q '/lib/modules/' || {
-              echo "ERROR: /lib/modules not found."
-              exit 1
-            }
-
-          dpkg-deb --contents "$headers_basename" \
-            | grep -q '/usr/src/linux-headers-' || {
-              echo "ERROR: Kernel headers not found."
-              exit 1
-            }
-
-          echo "=== Verify embedded kernel configuration ==="
-
-          rm -rf verify-image
-          mkdir verify-image
-
-          dpkg-deb --extract \
-            "$image_basename" \
-            verify-image
-
-          expected_config="verify-image/boot/config-${TAG}-arm64-edge"
-
-          [[ -f "$expected_config" ]] || {
-            echo "ERROR: Expected kernel config not found:"
-            echo "       $expected_config"
-            exit 1
-          }
-
-          cmp -s \
-            "$expected_config" \
-            ../kernel/.config.final || {
-              echo "ERROR: Packaged kernel configuration differs from .config.final."
-              exit 1
-            }
-
-          echo "Embedded kernel configuration matches .config.final."
-
-          echo "=== SHA256 ==="
-
-          sha256sum *.deb > SHA256SUMS
-
-          cat SHA256SUMS
-
-          cat <<EOF > RELEASE.md
-          ## XanMod ARM64 EDGE: $TAG
-
-          * **Kernel Release:** \`${TAG}-arm64-edge\`
-          * **Architecture:** \`arm64\`
-          * **Profile:** Full-Featured
-          * **Channel:** EDGE
-          * **Upstream Source:** [GitLab XanMod Linux](https://gitlab.com/xanmod/linux/-/releases/$TAG)
-          * **Upstream Commit:** \`${EXPECTED_COMMIT}\`
-          * **Compiler:** Clang 22 / LLD 22
-          * **Build:** GitHub Actions Native ARM64 compilation
-
-          ### Checksums (SHA256)
-
-          \`\`\`text
-          $(cat SHA256SUMS)
-          \`\`\`
-          EOF
-
-          echo "=== Release contents ==="
-          ls -lh
-
-      - name: Publish Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Existing GitHub Release found."
-            echo "Uploading/replacing build assets..."
-
-            gh release upload "$TAG" \
-              dist/*.deb \
-              dist/SHA256SUMS \
-              --clobber
-
-            gh release edit "$TAG" \
-              --title "XanMod ${TAG} ARM64 EDGE" \
-              --notes-file dist/RELEASE.md
-          else
-            echo "GitHub Release does not exist."
-            echo "Creating new release..."
-
-            gh release create "$TAG" \
-              dist/*.deb \
-              dist/SHA256SUMS \
-              --title "XanMod ${TAG} ARM64 EDGE" \
-              --notes-file dist/RELEASE.md
-          fi
+            echo 
