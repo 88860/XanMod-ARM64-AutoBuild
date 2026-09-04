@@ -122,7 +122,7 @@ jobs:
           llvm-readelf -h /tmp/clang-arm64-test.o | grep -Eq 'Machine:.*AArch64|Machine:.*ARM64' || { echo "Smoke test failed"; exit 1; }
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .ccache
           key: ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-v1
@@ -137,6 +137,9 @@ jobs:
           cd kernel
           actual_commit="$(git rev-parse HEAD^{commit})"
           [[ "$actual_commit" == "$EXPECTED_COMMIT" ]] || { echo "Commit mismatch"; exit 1; }
+          
+          # 隐藏 .git 目录，彻底切断内核构建系统对 git 状态和 -dirty 后缀的追踪
+          mv .git .git.build-hidden
           
           [[ -f arch/arm64/configs/defconfig ]] || { echo "Missing defconfig"; exit 1; }
           xanmod_conf="CONFIGS/x86_64/config"
