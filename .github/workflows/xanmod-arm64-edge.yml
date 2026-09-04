@@ -1,4 +1,4 @@
-name: XanMod ARM64 EDGE Build
+name: XanMod ARM64 Build
 
 on:
   workflow_dispatch:
@@ -31,50 +31,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          GITLAB_API="https://gitlab.com/api/v4/projects/xanmod%2Flinux"
           tag=""
           commit=""
-          for page in $(seq 1 50); do
-            releases="$(curl -fsSL --retry 5 --retry-delay 2 "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page")"
-            IFS=$'\t' read -r found_tag found_commit < <(
-              jq -r --arg channel "$CHANNEL" '
-                limit(1;
-                  .[]
-                  | select(.upcoming_release == false)
-                  | select(.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$"))
-                  | select(any(.assets.links[]?; (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/\\($channel)/[^/]+/?$")))
-                  | [.tag_name, .commit.id]
-                  | @tsv
-                )
-              ' <<< "$releases"
-            ) || true
-            if [[ -n "${found_tag:-}" ]]; then
-              tag="$found_tag"
-              commit="$found_commit"
-              break
-            fi
-            [[ "$(jq 'length' <<< "$releases")" -lt 100 ]] && break
+          for p in $(seq 1 50); do
+            res="$(curl -fsSL --retry 5 "https://gitlab.com/api/v4/projects/xanmod%2Flinux/releases?order_by=released_at&sort=desc&per_page=100&page=$p")"
+            IFS=$'\t' read -r t c < <(jq -r --arg ch "$CHANNEL" 'limit(1; .[] | select(.upcoming_release == false and (.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$")) and any(.assets.links[]?; (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/\\($ch)/[^/]+/?$"))) | [.tag_name, .commit.id] | @tsv)' <<< "$res") || true
+            [[ -n "$t" ]] && { tag="$t"; commit="$c"; break; }
+            [[ "$(jq 'length' <<< "$res")" -lt 100 ]] && break
           done
           [[ -n "$tag" && -n "$commit" ]] || exit 1
-          gh_rel_tag="${tag}-arm64-${CHANNEL}"
+          rel_tag="${tag}-arm64-${CHANNEL}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$gh_rel_tag" >> "$GITHUB_OUTPUT"
-          if gh release view "$gh_rel_tag" >/dev/null 2>&1; then
-            assets="$(gh release view "$gh_rel_tag" --json assets --jq '.assets[].name')"
-            complete=true
-            grep -Eq '^linux-image-.*\.deb$' <<< "$assets" || complete=false
-            grep -Eq '^linux-headers-.*\.deb$' <<< "$assets" || complete=false
-            grep -Eq '^linux-libc-dev.*\.deb$' <<< "$assets" || complete=false
-            grep -Fxq 'SHA256SUMS' <<< "$assets" || complete=false
-            if [[ "$complete" == true ]]; then
-              echo "build_needed=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "build_needed=true" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$rel_tag" >> "$GITHUB_OUTPUT"
+          build=true
+          if gh release view "$rel_tag" >/dev/null 2>&1; then
+            assets="$(gh release view "$rel_tag" --json assets --jq '.assets[].name')"
+            grep -Eq '^linux-image-.*\.deb$' <<< "$assets" && grep -Eq '^linux-headers-.*\.deb$' <<< "$assets" && grep -Eq '^linux-libc-dev.*\.deb$' <<< "$assets" && grep -Fxq 'SHA256SUMS' <<< "$assets" && build=false || true
           fi
+          echo "build_needed=$build" >> "$GITHUB_OUTPUT"
 
   build:
     needs: preflight
@@ -85,8 +60,6 @@ jobs:
       TAG: ${{ needs.preflight.outputs.tag }}
       EXPECTED_COMMIT: ${{ needs.preflight.outputs.commit }}
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
-      ARCH: arm64
-      LLVM: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - name: Setup
@@ -94,43 +67,40 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -euo pipefail
-          [[ "$(uname -m)" == "aarch64" ]] || exit 1
-          [[ "$(dpkg --print-architecture)" == "arm64" ]] || exit 1
+          [[ "$(uname -m)" == "aarch64" && "$(dpkg --print-architecture)" == "arm64" ]] || exit 1
           sudo apt-get update
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
-          sudo apt-get install -y --no-install-recommends build-essential bc bison flex fakeroot kmod cpio lz4 xz-utils zstd clang-22 lld-22 llvm-22 rsync libelf-dev libssl-dev libdw-dev zlib1g-dev debhelper dpkg-dev dwarves ccache pkg-config python3 binutils
-          for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do sudo ln -sf "/usr/bin/${tool}-22" "/usr/bin/${tool}"; done
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- "$LLVM_VER"
+          sudo apt-get install -y --no-install-recommends build-essential bc bison flex fakeroot kmod cpio lz4 xz-utils zstd clang-$LLVM_VER lld-$LLVM_VER llvm-$LLVM_VER rsync libelf-dev libssl-dev libdw-dev zlib1g-dev debhelper dpkg-dev dwarves ccache pkg-config python3 binutils
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do sudo ln -sf "/usr/bin/$t-$LLVM_VER" "/usr/bin/$t"; done
           sudo ln -sf /usr/bin/ld.lld /usr/bin/ld
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-          clang --version | grep -q '22\.' || exit 1
-          ld.lld --version | grep -q '22\.' || exit 1
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .ccache
-          key: ${{ runner.os }}-native-arm64-xanmod-${{ env.CHANNEL }}-clang${{ env.LLVM_VER }}-v1
+          key: ${{ runner.os }}-arm64-${{ env.CHANNEL }}-clang${{ env.LLVM_VER }}-${{ env.TAG }}
           restore-keys: |
-            ${{ runner.os }}-native-arm64-xanmod-${{ env.CHANNEL }}-clang${{ env.LLVM_VER }}-
-            ${{ runner.os }}-native-arm64-xanmod-${{ env.CHANNEL }}-
+            ${{ runner.os }}-arm64-${{ env.CHANNEL }}-clang${{ env.LLVM_VER }}-
 
-      - name: Config
+      - name: Config & Build
+        env:
+          KBUILD_BUILD_USER: github-actions
+          KBUILD_BUILD_HOST: github-arm64-native
+          DEBFULLNAME: github-actions
+          DEBEMAIL: github-actions@users.noreply.github.com
         run: |
           set -euo pipefail
           git clone --filter=blob:none --branch "$TAG" https://gitlab.com/xanmod/linux.git kernel
           cd kernel
-          actual_commit="$(git rev-parse HEAD^{commit})"
-          [[ "$actual_commit" == "$EXPECTED_COMMIT" ]] || exit 1
+          [[ "$(git rev-parse HEAD^{commit})" == "$EXPECTED_COMMIT" ]] || exit 1
           mv .git .git.build-hidden
-          [[ -f arch/arm64/configs/defconfig ]] || exit 1
-          xanmod_conf="CONFIGS/x86_64/config"
+          if [[ -f "CONFIGS/x86_64/config" ]]; then xanmod_conf="CONFIGS/x86_64/config"; else xanmod_conf=$(find CONFIGS -type f -name "config" | grep -iE 'x86_64|x86-64-v' | head -n 1 || true); fi
           [[ -f "$xanmod_conf" ]] || exit 1
-          echo "XANMOD_CONF=$xanmod_conf" >> "$GITHUB_ENV"
           make ARCH=arm64 defconfig
-          cp .config .config.arm64-base
           find . -name "Kconfig*" -type f -exec grep -hE '^[[:space:]]*(config|menuconfig)[[:space:]]+[A-Za-z0-9_]+' {} + | awk '{print "CONFIG_"$2}' | sort -u > kernel.symbols
           awk 'NR==FNR{arm[$1]=1;next}/^CONFIG_/{split($0,a,"=");if(a[1] in arm)print;next}/^# CONFIG_/{match($0,/CONFIG_[A-Za-z0-9_]+/);sym=substr($0,RSTART,RLENGTH);if(sym in arm)print}' kernel.symbols "$xanmod_conf" > xanmod.arm64.fragment
           sed -i -E 's/^CONFIG_KVM=m$/CONFIG_KVM=y/' xanmod.arm64.fragment
@@ -143,27 +113,11 @@ jobs:
           make ARCH=arm64 olddefconfig
           cp .config .config.final
           touch .scmversion
-          release="$(make -s ARCH=arm64 kernelrelease)"
-          [[ "$release" == "${TAG}-arm64-${CHANNEL}" ]] || exit 1
-          echo "KERNEL_RELEASE=$release" >> "$GITHUB_ENV"
-
-      - name: Build
-        env:
-          KBUILD_BUILD_USER: github-actions
-          KBUILD_BUILD_HOST: github-arm64-native
-          DEBFULLNAME: github-actions
-          DEBEMAIL: github-actions@users.noreply.github.com
-        run: |
-          set -euo pipefail
-          cd kernel
-          for req in ARM64 64BIT MODULES NET INET PROC_FS SYSFS CGROUPS NAMESPACES BPF BPF_SYSCALL; do grep -q "^CONFIG_${req}=y$" .config || exit 1; done
-          grep -q '^CONFIG_CC_IS_CLANG=y$' .config || exit 1
-          grep -q '^CONFIG_LD_IS_LLD=y$' .config || exit 1
-          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld -s prepare
+          kernel_rel="$(make -s ARCH=arm64 kernelrelease)"
+          [[ "$kernel_rel" == "${TAG}-arm64-${CHANNEL}" ]] || exit 1
           ccache --set-config=cache_dir="$CCACHE_DIR"
-          ccache --zero-stats
-          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_DEBARCH=arm64 KDEB_PKGVERSION="${KERNEL_RELEASE}-1" CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
-          ccache --show-stats
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld -s prepare
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_DEBARCH=arm64 KDEB_PKGVERSION="${kernel_rel}-1" CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
 
       - name: Publish
         env:
@@ -172,60 +126,38 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           shopt -s nullglob
-          debug_packages=(*dbg*.deb *dbgsym*.deb)
-          ((${#debug_packages[@]} == 0)) || exit 1
-          packages=(*.deb)
+          dbg_pkgs=(kernel/*dbg*.deb kernel/*dbgsym*.deb)
+          ((${#dbg_pkgs[@]} == 0)) || exit 1
+          packages=(kernel/*.deb)
           ((${#packages[@]} > 0)) || exit 1
-          image_pkg=""
-          headers_pkg=""
-          libc_pkg=""
+          img="" hdr="" libc=""
           for deb in "${packages[@]}"; do
-            pkg_name="$(dpkg-deb --field "$deb" Package)"
-            arch="$(dpkg-deb --field "$deb" Architecture)"
-            case "$pkg_name" in
-              linux-image-*) [[ "$arch" == "arm64" ]] || exit 1; [[ -z "$image_pkg" ]] || exit 1; image_pkg="$deb" ;;
-              linux-headers-*) [[ "$arch" == "arm64" || "$arch" == "all" ]] || exit 1; [[ -z "$headers_pkg" ]] || exit 1; headers_pkg="$deb" ;;
-              linux-libc-dev) [[ "$arch" == "arm64" ]] || exit 1; [[ -z "$libc_pkg" ]] || exit 1; libc_pkg="$deb" ;;
-              *) exit 1 ;;
+            case "$(dpkg-deb --field "$deb" Package)" in
+              linux-image-*) [[ -z "$img" ]] && img="$(basename "$deb")" ;;
+              linux-headers-*) [[ -z "$hdr" ]] && hdr="$(basename "$deb")" ;;
+              linux-libc-dev) [[ -z "$libc" ]] && libc="$(basename "$deb")" ;;
             esac
             mv "$deb" dist/
           done
-          [[ -n "$image_pkg" && -n "$headers_pkg" && -n "$libc_pkg" ]] || exit 1
+          [[ -n "$img" && -n "$hdr" && -n "$libc" ]] || exit 1
           cd dist
-          image_basename="$(basename "$image_pkg")"
-          headers_basename="$(basename "$headers_pkg")"
-          image_package="$(dpkg-deb --field "$image_basename" Package)"
-          image_version="$(dpkg-deb --field "$image_basename" Version)"
-          [[ "$image_package" == *"-arm64-${CHANNEL}" ]] || exit 1
-          clean_version=$(echo "$image_version" | tr -d '-~_+.')
-          clean_tag=$(echo "$TAG" | tr -d '-~_+.')
-          [[ "$clean_version" == *"$clean_tag"* ]] || exit 1
-          dpkg-deb --contents "$image_basename" | grep -q '/boot/vmlinuz-' || exit 1
-          dpkg-deb --contents "$image_basename" | grep -q '/lib/modules/' || exit 1
-          dpkg-deb --contents "$headers_basename" | grep -q '/usr/src/linux-headers-' || exit 1
+          [[ "$(dpkg-deb --field "$img" Package)" == *"-arm64-${CHANNEL}" ]] || exit 1
+          [[ "$(echo "$(dpkg-deb --field "$img" Version)" | tr -d '-~_+.')" == *"$(echo "$TAG" | tr -d '-~_+.')"* ]] || exit 1
+          dpkg-deb --contents "$img" | grep -q '/boot/vmlinuz-' || exit 1
+          dpkg-deb --contents "$img" | grep -q '/lib/modules/' || exit 1
+          dpkg-deb --contents "$hdr" | grep -q '/usr/src/linux-headers-' || exit 1
           mkdir verify-image
-          dpkg-deb --extract "$image_basename" verify-image
-          expected_config="verify-image/boot/config-${KERNEL_RELEASE}"
-          [[ -f "$expected_config" ]] || exit 1
-          cmp -s "$expected_config" ../kernel/.config.final || exit 1
+          dpkg-deb --extract "$img" verify-image
+          [[ -f "verify-image/boot/config-${TAG}-arm64-${CHANNEL}" ]] || exit 1
+          cmp -s "verify-image/boot/config-${TAG}-arm64-${CHANNEL}" ../kernel/.config.final || exit 1
           sha256sum *.deb > SHA256SUMS
           cat <<EOF > RELEASE.md
           ## XanMod ARM64 ${CHANNEL^^}: $TAG
-
-          * **Kernel Release:** \`${KERNEL_RELEASE}\`
           * **Architecture:** \`arm64\`
-          * **Profile:** Full-Featured (Cross-Ported)
           * **Channel:** ${CHANNEL^^}
-          * **Upstream Source:** [GitLab XanMod Linux](https://gitlab.com/xanmod/linux/-/releases/$TAG)
-          * **Upstream Commit:** \`${EXPECTED_COMMIT}\`
-          * **Compiler:** Clang ${LLVM_VER} / LLD ${LLVM_VER}
-          * **Build:** GitHub Actions Native ARM64 compilation
-
-          ### Checksums (SHA256)
-
-          \`\`\`text
-          $(cat SHA256SUMS)
-          \`\`\`
+          * **Upstream:** [GitLab XanMod Linux](https://gitlab.com/xanmod/linux/-/releases/$TAG)
+          * **Compiler:** Clang ${LLVM_VER}
+          * **Build:** GitHub Actions Native ARM64
           EOF
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" *.deb SHA256SUMS --clobber
