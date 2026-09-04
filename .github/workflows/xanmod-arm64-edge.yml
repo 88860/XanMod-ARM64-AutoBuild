@@ -129,6 +129,7 @@ jobs:
       ARCH: arm64
       LLVM: 1
       CROSS_COMPILE: aarch64-linux-gnu-
+
     steps:
       - name: Free Disk Space
         run: |
@@ -239,6 +240,28 @@ jobs:
             exit 1
           }
 
+          echo "=== ARM64 LLVM smoke test ==="
+          cat >/tmp/clang-arm64-test.c <<'EOF'
+          int test_function(void)
+          {
+              return 0;
+          }
+          EOF
+
+          clang \
+            --target=aarch64-linux-gnu \
+            -c \
+            /tmp/clang-arm64-test.c \
+            -o /tmp/clang-arm64-test.o
+
+          llvm-readelf -h /tmp/clang-arm64-test.o \
+            | grep -Eq 'Machine:.*AArch64|Machine:.*ARM64' || {
+              echo "ERROR: Clang failed to produce an ARM64 object."
+              exit 1
+            }
+
+          echo "ARM64 Clang smoke test passed."
+
       - name: Restore ccache
         uses: actions/cache@v4
         with:
@@ -289,6 +312,8 @@ jobs:
             exit 1
           }
 
+          mv .git .git.build-hidden
+
       - name: Configure Kernel
         run: |
           set -euo pipefail
@@ -324,8 +349,9 @@ jobs:
 
           make olddefconfig > /dev/null
 
-          ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
+          rm -f localversion
 
+          ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
           ./scripts/config --set-str CONFIG_LOCALVERSION "-${TAG#*-}-arm64-edge"
 
           for dbg in \
@@ -400,6 +426,18 @@ jobs:
             echo "ERROR: x86-specific CPU tuning detected."
             exit 1
           fi
+
+          echo "=== Compiler configuration ==="
+
+          grep -q '^CONFIG_CC_IS_CLANG=y$' .config || {
+            echo "ERROR: Kernel is not configured for Clang."
+            exit 1
+          }
+
+          grep -q '^CONFIG_LD_IS_LLD=y$' .config || {
+            echo "ERROR: Kernel is not configured for LLD."
+            exit 1
+          }
 
           echo "=== Prepare ==="
 
