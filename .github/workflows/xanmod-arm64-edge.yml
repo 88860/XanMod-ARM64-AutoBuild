@@ -26,95 +26,48 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           GITLAB_API="https://gitlab.com/api/v4/projects/xanmod%2Flinux"
-
           tag=""
           commit=""
-
           for page in $(seq 1 50); do
-            releases="$(
-              curl -fsSL \
-                --retry 5 \
-                --retry-delay 2 \
-                "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page"
-            )"
-
+            releases="$(curl -fsSL --retry 5 --retry-delay 2 "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page")"
             IFS=$'\t' read -r found_tag found_commit < <(
               jq -r '
                 limit(1;
                   .[]
                   | select(.upcoming_release == false)
-                  | select(
-                      .tag_name
-                      | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$")
-                    )
-                  | select(
-                      any(
-                        .assets.links[]?;
-                        (.url // "")
-                        | test(
-                            "sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$"
-                          )
-                      )
-                    )
-                  | [
-                      .tag_name,
-                      .commit.id
-                    ]
+                  | select(.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$"))
+                  | select(any(.assets.links[]?; (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/edge/[^/]+/?$")))
+                  | [.tag_name, .commit.id]
                   | @tsv
                 )
               ' <<< "$releases"
             ) || true
-
             if [[ -n "${found_tag:-}" ]]; then
               tag="$found_tag"
               commit="$found_commit"
               break
             fi
-
             [[ "$(jq 'length' <<< "$releases")" -lt 100 ]] && break
           done
-
           if [[ -z "$tag" || -z "$commit" ]]; then
-            echo "Failed to find a valid XanMod EDGE release." >&2
             exit 1
           fi
-
-          echo "Detected XanMod EDGE release:"
-          echo "  TAG:    $tag"
-          echo "  COMMIT: $commit"
-
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
-
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "GitHub Release $tag already exists."
-
-            assets="$(
-              gh release view "$tag" \
-                --json assets \
-                --jq '.assets[].name'
-            )"
-
+            assets="$(gh release view "$tag" --json assets --jq '.assets[].name')"
             complete=true
-
             grep -Eq '^linux-image-.*\.deb$' <<< "$assets" || complete=false
             grep -Eq '^linux-headers-.*\.deb$' <<< "$assets" || complete=false
             grep -Eq '^linux-libc-dev.*\.deb$' <<< "$assets" || complete=false
             grep -Fxq 'SHA256SUMS' <<< "$assets" || complete=false
-
             if [[ "$complete" == true ]]; then
-              echo "Existing release appears complete."
               echo "build_needed=false" >> "$GITHUB_OUTPUT"
             else
-              echo "Existing release is incomplete."
-              echo "A rebuild will be performed."
               echo "build_needed=true" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "GitHub Release $tag does not exist."
-            echo "Build required."
             echo "build_needed=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -133,23 +86,8 @@ jobs:
       - name: Check environment
         run: |
           set -euo pipefail
-
-          echo "=== Native ARM64 environment ==="
-          uname -m
-          dpkg --print-architecture
-          nproc
-          free -h
-          df -h /
-
-          [[ "$(uname -m)" == "aarch64" ]] || {
-            echo "ERROR: Runner is not ARM64."
-            exit 1
-          }
-
-          [[ "$(dpkg --print-architecture)" == "arm64" ]] || {
-            echo "ERROR: dpkg architecture is not arm64."
-            exit 1
-          }
+          [[ "$(uname -m)" == "aarch64" ]] || exit 1
+          [[ "$(dpkg --print-architecture)" == "arm64" ]] || exit 1
 
       - name: Checkout code
         uses: actions/checkout@v6
@@ -159,96 +97,24 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -euo pipefail
-
           sudo apt-get update
-
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
-
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            bc \
-            bison \
-            flex \
-            fakeroot \
-            kmod \
-            cpio \
-            lz4 \
-            xz-utils \
-            zstd \
-            clang-22 \
-            lld-22 \
-            llvm-22 \
-            rsync \
-            libelf-dev \
-            libssl-dev \
-            libdw-dev \
-            zlib1g-dev \
-            debhelper \
-            dpkg-dev \
-            dwarves \
-            ccache \
-            pkg-config \
-            python3 \
-            binutils
-
-          for tool in \
-            clang \
-            clang++ \
-            ld.lld \
-            llvm-ar \
-            llvm-nm \
-            llvm-objcopy \
-            llvm-objdump \
-            llvm-readelf \
-            llvm-strip
-          do
+            build-essential bc bison flex fakeroot kmod cpio lz4 xz-utils zstd \
+            clang-22 lld-22 llvm-22 rsync libelf-dev libssl-dev libdw-dev zlib1g-dev \
+            debhelper dpkg-dev dwarves ccache pkg-config python3 binutils
+          for tool in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
             sudo ln -sf "/usr/bin/${tool}-22" "/usr/bin/${tool}"
           done
-
           sudo ln -sf /usr/bin/ld.lld /usr/bin/ld
-
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-
-          echo "=== LLVM toolchain ==="
-          clang --version
-          ld.lld --version
-          llvm-ar --version
-
-          clang --version | grep -q '22\.' || {
-            echo "ERROR: Clang 22 was not selected."
-            exit 1
-          }
-
-          ld.lld --version | grep -q '22\.' || {
-            echo "ERROR: LLD 22 was not selected."
-            exit 1
-          }
-
-          echo "=== Target triple checks ==="
-          clang --target=aarch64-linux-gnu -dumpmachine
-          clang -print-target-triple
-
-          echo "=== ARM64 LLVM smoke test ==="
+          clang --version | grep -q '22\.' || exit 1
+          ld.lld --version | grep -q '22\.' || exit 1
           cat >/tmp/clang-arm64-test.c <<'EOF'
-          int test_function(void)
-          {
-              return 0;
-          }
+          int test_function(void) { return 0; }
           EOF
-
-          clang \
-            --target=aarch64-linux-gnu \
-            -c \
-            /tmp/clang-arm64-test.c \
-            -o /tmp/clang-arm64-test.o
-
-          llvm-readelf -h /tmp/clang-arm64-test.o \
-            | grep -Eq 'Machine:.*AArch64|Machine:.*ARM64' || {
-              echo "ERROR: Clang failed to produce an ARM64 object."
-              exit 1
-            }
-
-          echo "ARM64 Native Clang smoke test passed."
+          clang --target=aarch64-linux-gnu -c /tmp/clang-arm64-test.c -o /tmp/clang-arm64-test.o
+          llvm-readelf -h /tmp/clang-arm64-test.o | grep -Eq 'Machine:.*AArch64|Machine:.*ARM64' || exit 1
 
       - name: Restore ccache
         uses: actions/cache@v5
@@ -262,69 +128,30 @@ jobs:
       - name: Fetch source
         run: |
           set -euo pipefail
-
-          git clone \
-            --depth 1 \
-            --branch "$TAG" \
-            https://gitlab.com/xanmod/linux.git \
-            kernel
-
+          git clone --depth 1 --branch "$TAG" https://gitlab.com/xanmod/linux.git kernel
           cd kernel
-
           actual_commit="$(git rev-parse HEAD)"
-
-          echo "Expected commit: $EXPECTED_COMMIT"
-          echo "Actual commit:   $actual_commit"
-
-          [[ "$actual_commit" == "$EXPECTED_COMMIT" ]] || {
-            echo "ERROR: Source commit mismatch."
-            exit 1
-          }
-
-          [[ -f arch/arm64/configs/defconfig ]] || {
-            echo "ERROR: ARM64 defconfig not found."
-            exit 1
-          }
-
+          [[ "$actual_commit" == "$EXPECTED_COMMIT" ]] || exit 1
+          [[ -f arch/arm64/configs/defconfig ]] || exit 1
           xanmod_conf="$(find CONFIGS/x86_64 -maxdepth 1 -type f -name 'config*' | head -n1)"
           if [[ -z "$xanmod_conf" || ! -f "$xanmod_conf" ]]; then
-            echo "ERROR: XanMod x86_64 config not found."
             exit 1
           fi
-
-          echo "WARNING: Using x86_64 XanMod config only as feature template"
           echo "XANMOD_CONF=$xanmod_conf" >> "$GITHUB_ENV"
-
-          echo "=== Git working tree audit ==="
-
-          git status --short
-
-          [[ -z "$(git status --porcelain)" ]] || {
-            echo "ERROR: XanMod source tree is dirty."
-            exit 1
-          }
-
+          [[ -z "$(git status --porcelain)" ]] || exit 1
           mv .git .git.build-hidden
 
       - name: Configure kernel
         run: |
           set -euo pipefail
-
           cd kernel
-
-          echo "Using XanMod profile: $XANMOD_CONF"
-
-          echo "=== Generate ARM64 base defconfig ==="
           make ARCH=arm64 defconfig
           cp .config .config.arm64-base
-
-          echo "=== Extract available symbols from Kconfig tree ==="
           find . -name "Kconfig*" -type f -exec grep -hE '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' {} + | awk '{print "CONFIG_"$2}' | sort -u > .all-kconfig-symbols
-
-          echo "=== Filter x86 config against available ARM64 symbols ==="
           awk '
           NR==FNR { sym[$1]=1; next }
           {
+            if ($0 ~ /^[[:space:]]*CONFIG_LOCALVERSION=/) next;
             if ($0 ~ /^CONFIG_/) {
               split($0, a, "=")
               if (a[1] in sym) print $0
@@ -333,106 +160,41 @@ jobs:
             }
           }
           ' .all-kconfig-symbols "$XANMOD_CONF" > .xanmod-filtered
-
-          echo "=== First Kconfig merge ==="
-          ./scripts/kconfig/merge_config.sh \
-            -m \
-            .config \
-            .xanmod-filtered
-
-          echo "=== First Kconfig auto-resolution ==="
-          make ARCH=arm64 olddefconfig
-
-          echo "=== Remove x86 disabled leftovers ==="
-          grep -E '^# CONFIG_(X86 |X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config \
-            | sed -E 's/^# CONFIG_([^ ]+) .*/\1/' \
-            | while read -r conf; do
-                echo "Disable $conf"
-                ./scripts/config --disable "$conf" || true
+          ./scripts/kconfig/merge_config.sh -m .config .xanmod-filtered
+          make ARCH=arm64 olddefconfig || true
+          if grep -qE '^# CONFIG_(X86 |X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config 2>/dev/null; then
+            grep -E '^# CONFIG_(X86 |X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config | sed -E 's/^# CONFIG_([^ ]+) .*/\1/' | while read -r conf; do
+              ./scripts/config --disable "$conf" || true
             done
-
-          echo "=== Remove x86 enabled leftovers ==="
-          grep -E '^CONFIG_(X86=|X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config \
-            | cut -d= -f1 \
-            | while read -r conf; do
-                echo "Disable $conf"
-                ./scripts/config --disable "${conf#CONFIG_}" || true
+          fi
+          if grep -qE '^CONFIG_(X86=|X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config 2>/dev/null; then
+            grep -E '^CONFIG_(X86=|X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config | cut -d= -f1 | while read -r conf; do
+              ./scripts/config --disable "${conf#CONFIG_}" || true
             done
-
-          echo "=== Configuration adjustments (Debug & Version) ==="
+          fi
           rm -f localversion
-          ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
+          ./scripts/config --disable CONFIG_LOCALVERSION_AUTO || true
           printf '%s\n' "-${TAG#*-}-arm64-edge" > localversion
-
-          for dbg in \
-            DEBUG_INFO \
-            DEBUG_INFO_BTF \
-            DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
-            DEBUG_INFO_DWARF4 \
-            DEBUG_INFO_DWARF5
-          do
-            ./scripts/config -d "$dbg"
+          for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do
+            ./scripts/config -d "$dbg" || true
           done
-
-          echo "=== Final Kconfig auto-resolution ==="
           make ARCH=arm64 olddefconfig
           cp .config .config.final
-
-          echo "=== Verify Kernel Release ==="
           release="$(make -s ARCH=arm64 kernelrelease)"
-          echo "Expected: ${TAG}-arm64-edge"
-          echo "Actual:   $release"
-
-          [[ "$release" == "${TAG}-arm64-edge" ]] || {
-            echo "ERROR: Kernel release mismatch."
-            exit 1
-          }
+          [[ "$release" == "${TAG}-arm64-edge" ]] || exit 1
 
       - name: Audit configuration
         run: |
           set -euo pipefail
-
           cd kernel
-
-          echo "=== Architecture & CPU Tuning Audit ==="
           if grep -qE '^CONFIG_(X86|X86_64|INTEL|AMD|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config; then
-            echo "ERROR: x86 configuration or CPU tuning detected:"
-            grep -E '^CONFIG_(X86|X86_64|INTEL|AMD|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config
             exit 1
           fi
-
-          echo "=== Required ARM64 Configuration Audit ==="
-          for req in \
-            ARM64 \
-            64BIT \
-            MODULES \
-            NET \
-            INET \
-            PROC_FS \
-            SYSFS \
-            CGROUPS \
-            NAMESPACES \
-            BPF \
-            BPF_SYSCALL
-          do
-            grep -q "^CONFIG_${req}=y$" .config || {
-              echo "ERROR: CONFIG_${req}=y is required."
-              exit 1
-            }
+          for req in ARM64 64BIT MODULES NET INET PROC_FS SYSFS CGROUPS NAMESPACES BPF BPF_SYSCALL; do
+            grep -q "^CONFIG_${req}=y$" .config || exit 1
           done
-
-          echo "=== Compiler Configuration Audit ==="
-          grep -q '^CONFIG_CC_IS_CLANG=y$' .config || {
-            echo "ERROR: Kernel is not configured for Clang."
-            exit 1
-          }
-
-          grep -q '^CONFIG_LD_IS_LLD=y$' .config || {
-            echo "ERROR: Kernel is not configured for LLD."
-            exit 1
-          }
-
-          echo "=== Prepare ==="
+          grep -q '^CONFIG_CC_IS_CLANG=y$' .config || exit 1
+          grep -q '^CONFIG_LD_IS_LLD=y$' .config || exit 1
           make -s prepare
 
       - name: Build packages
@@ -444,219 +206,67 @@ jobs:
           DEBEMAIL: github-actions@users.noreply.github.com
         run: |
           set -euo pipefail
-
           cd kernel
-
-          echo "=== ccache configuration ==="
           ccache --set-config=cache_dir="$CCACHE_DIR"
-
-          echo "=== ccache before build ==="
-          ccache --show-stats || true
-
           ccache --zero-stats
-
-          echo "=== Building ==="
-
-          make \
-            ARCH=arm64 \
-            LLVM=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC="ccache clang --target=aarch64-linux-gnu" \
-            HOSTCC="ccache clang" \
-            LD=ld.lld \
-            KDEB_COMPRESS=gzip \
-            skipdbg=true \
-            -j"$(nproc)" \
-            bindeb-pkg
-
-          echo "=== ccache after build ==="
+          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
           ccache --show-stats
 
       - name: Verify packages
         run: |
           set -euo pipefail
-
           mkdir -p dist
-
           shopt -s nullglob
-
-          debug_packages=(
-            *dbg*.deb
-            *dbgsym*.deb
-          )
-
-          if ((${#debug_packages[@]} > 0)); then
-            echo "ERROR: Debug packages were generated:"
-            printf '  %s\n' "${debug_packages[@]}"
-            exit 1
-          fi
-
+          debug_packages=(*dbg*.deb *dbgsym*.deb)
+          if ((${#debug_packages[@]} > 0)); then exit 1; fi
           packages=(*.deb)
-
-          ((${#packages[@]} > 0)) || {
-            echo "ERROR: No Debian packages found."
-            exit 1
-          }
-
+          ((${#packages[@]} > 0)) || exit 1
           image_pkg=""
           headers_pkg=""
           libc_pkg=""
-
-          echo "=== Package inventory ==="
-
           for deb in "${packages[@]}"; do
-
             pkg_name="$(dpkg-deb --field "$deb" Package)"
             arch="$(dpkg-deb --field "$deb" Architecture)"
-
-            echo "Package: $pkg_name"
-            echo "Arch:    $arch"
-
             case "$pkg_name" in
-
               linux-image-*)
-                [[ "$arch" == "arm64" ]] || {
-                  echo "ERROR: linux-image package must be arm64."
-                  exit 1
-                }
-
-                [[ -z "$image_pkg" ]] || {
-                  echo "ERROR: Multiple linux-image packages found."
-                  exit 1
-                }
-
+                [[ "$arch" == "arm64" ]] || exit 1
+                [[ -z "$image_pkg" ]] || exit 1
                 image_pkg="$deb"
                 ;;
-
               linux-headers-*)
-                [[ "$arch" == "arm64" || "$arch" == "all" ]] || {
-                  echo "ERROR: Invalid linux-headers architecture."
-                  exit 1
-                }
-
-                [[ -z "$headers_pkg" ]] || {
-                  echo "ERROR: Multiple linux-headers packages found."
-                  exit 1
-                }
-
+                [[ "$arch" == "arm64" || "$arch" == "all" ]] || exit 1
+                [[ -z "$headers_pkg" ]] || exit 1
                 headers_pkg="$deb"
                 ;;
-
               linux-libc-dev)
-                [[ "$arch" == "arm64" ]] || {
-                  echo "ERROR: linux-libc-dev must be arm64."
-                  exit 1
-                }
-
-                [[ -z "$libc_pkg" ]] || {
-                  echo "ERROR: Multiple linux-libc-dev packages found."
-                  exit 1
-                }
-
+                [[ "$arch" == "arm64" ]] || exit 1
+                [[ -z "$libc_pkg" ]] || exit 1
                 libc_pkg="$deb"
                 ;;
-
-              *)
-                echo "ERROR: Unexpected Debian package: $pkg_name"
-                exit 1
-                ;;
+              *) exit 1 ;;
             esac
-
             mv "$deb" dist/
           done
-
-          [[ -n "$image_pkg" ]] || {
-            echo "ERROR: linux-image package missing."
-            exit 1
-          }
-
-          [[ -n "$headers_pkg" ]] || {
-            echo "ERROR: linux-headers package missing."
-            exit 1
-          }
-
-          [[ -n "$libc_pkg" ]] || {
-            echo "ERROR: linux-libc-dev package missing."
-            exit 1
-          }
-
+          [[ -n "$image_pkg" ]] || exit 1
+          [[ -n "$headers_pkg" ]] || exit 1
+          [[ -n "$libc_pkg" ]] || exit 1
           cd dist
-
           image_basename="$(basename "$image_pkg")"
           headers_basename="$(basename "$headers_pkg")"
-
-          echo "=== Package metadata ==="
-
           image_package="$(dpkg-deb --field "$image_basename" Package)"
           image_version="$(dpkg-deb --field "$image_basename" Version)"
-
-          echo "Image package: $image_package"
-          echo "Image version: $image_version"
-
-          [[ "$image_package" == *"-arm64-edge" ]] || {
-            echo "ERROR: Unexpected image package name."
-            exit 1
-          }
-
-          [[ "$image_version" == *"$TAG"* ]] || {
-            echo "ERROR: Package version does not contain expected TAG."
-            echo "Expected: $TAG"
-            echo "Actual:   $image_version"
-            exit 1
-          }
-
-          echo "=== Package contents ==="
-
-          dpkg-deb --contents "$image_basename" \
-            | grep -q '/boot/vmlinuz-' || {
-              echo "ERROR: Kernel image not found."
-              exit 1
-            }
-
-          dpkg-deb --contents "$image_basename" \
-            | grep -q '/lib/modules/' || {
-              echo "ERROR: /lib/modules not found."
-              exit 1
-            }
-
-          dpkg-deb --contents "$headers_basename" \
-            | grep -q '/usr/src/linux-headers-' || {
-              echo "ERROR: Kernel headers not found."
-              exit 1
-            }
-
-          echo "=== Verify embedded kernel configuration ==="
-
+          [[ "$image_package" == *"-arm64-edge" ]] || exit 1
+          [[ "$image_version" == *"$TAG"* ]] || exit 1
+          dpkg-deb --contents "$image_basename" | grep -q '/boot/vmlinuz-' || exit 1
+          dpkg-deb --contents "$image_basename" | grep -q '/lib/modules/' || exit 1
+          dpkg-deb --contents "$headers_basename" | grep -q '/usr/src/linux-headers-' || exit 1
           rm -rf verify-image
           mkdir verify-image
-
-          dpkg-deb --extract \
-            "$image_basename" \
-            verify-image
-
+          dpkg-deb --extract "$image_basename" verify-image
           expected_config="verify-image/boot/config-${TAG}-arm64-edge"
-
-          [[ -f "$expected_config" ]] || {
-            echo "ERROR: Expected kernel config not found:"
-            echo "       $expected_config"
-            exit 1
-          }
-
-          cmp -s \
-            "$expected_config" \
-            ../kernel/.config.final || {
-              echo "ERROR: Packaged kernel configuration differs from .config.final."
-              exit 1
-            }
-
-          echo "Embedded kernel configuration matches .config.final."
-
-          echo "=== SHA256 ==="
-
+          [[ -f "$expected_config" ]] || exit 1
+          cmp -s "$expected_config" ../kernel/.config.final || exit 1
           sha256sum *.deb > SHA256SUMS
-
-          cat SHA256SUMS
-
           cat <<EOF > RELEASE.md
           ## XanMod ARM64 EDGE: $TAG
 
@@ -676,34 +286,15 @@ jobs:
           \`\`\`
           EOF
 
-          echo "=== Release contents ==="
-          ls -lh
-
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Existing GitHub Release found."
-            echo "Uploading/replacing build assets..."
-
-            gh release upload "$TAG" \
-              dist/*.deb \
-              dist/SHA256SUMS \
-              --clobber
-
-            gh release edit "$TAG" \
-              --title "XanMod ${TAG} ARM64 EDGE" \
-              --notes-file dist/RELEASE.md
+            gh release upload "$TAG" dist/*.deb dist/SHA256SUMS --clobber
+            gh release edit "$TAG" --title "XanMod ${TAG} ARM64 EDGE" --notes-file dist/RELEASE.md
           else
-            echo "GitHub Release does not exist."
-            echo "Creating new release..."
-
-            gh release create "$TAG" \
-              dist/*.deb \
-              dist/SHA256SUMS \
-              --title "XanMod ${TAG} ARM64 EDGE" \
-              --notes-file dist/RELEASE.md
+            gh release create "$TAG" dist/*.deb dist/SHA256SUMS --title "XanMod ${TAG} ARM64 EDGE" --notes-file dist/RELEASE.md
           fi
+
