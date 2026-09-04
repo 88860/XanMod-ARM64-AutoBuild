@@ -352,7 +352,6 @@ jobs:
           rm -f localversion
 
           ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
-          ./scripts/config --set-str CONFIG_LOCALVERSION "-${TAG#*-}-arm64-edge"
 
           for dbg in \
             DEBUG_INFO \
@@ -366,19 +365,23 @@ jobs:
 
           ./scripts/config -e CONFIG_DEBUG_INFO_NONE
 
-          make olddefconfig > /dev/null
+          make olddefconfig
 
           cp .config .config.final
 
-          echo "=== Kernel release ==="
+          echo "=== Force kernel LOCALVERSION ==="
+
+          printf '%s\n' "-${TAG#*-}-arm64-edge" > localversion
+
+          echo "localversion:"
+          cat localversion
 
           release="$(make -s kernelrelease)"
-          expected="${TAG}-arm64-edge"
 
           echo "Actual:   $release"
-          echo "Expected: $expected"
+          echo "Expected: ${TAG}-arm64-edge"
 
-          [[ "$release" == "$expected" ]] || {
+          [[ "$release" == "${TAG}-arm64-edge" ]] || {
             echo "ERROR: Kernel release mismatch."
             exit 1
           }
