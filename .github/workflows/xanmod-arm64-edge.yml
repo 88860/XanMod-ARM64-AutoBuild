@@ -125,9 +125,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .ccache
-          key: ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-v1
+          key: ${{ runner.os }}-native-arm64-xanmod-edge-clang22-v1
           restore-keys: |
-            ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-
+            ${{ runner.os }}-native-arm64-xanmod-edge-clang22-
             ${{ runner.os }}-native-arm64-xanmod-edge-
 
       - name: Fetch source
@@ -138,7 +138,6 @@ jobs:
           actual_commit="$(git rev-parse HEAD^{commit})"
           [[ "$actual_commit" == "$EXPECTED_COMMIT" ]] || { echo "Commit mismatch"; exit 1; }
           
-          # 隐藏 .git 目录，彻底切断内核构建系统对 git 状态和 -dirty 后缀的追踪
           mv .git .git.build-hidden
           
           [[ -f arch/arm64/configs/defconfig ]] || { echo "Missing defconfig"; exit 1; }
@@ -180,10 +179,13 @@ jobs:
           }
           ' kernel.symbols "$XANMOD_CONF" > xanmod.arm64.fragment
           
+          sed -i -e '/^CONFIG_KVM=m$/c\CONFIG_KVM=y' xanmod.arm64.fragment
+          
           ./scripts/kconfig/merge_config.sh -m .config xanmod.arm64.fragment
           
           rm -f localversion
           ./scripts/config --disable LOCALVERSION_AUTO
+          ./scripts/config --set-str LOCALVERSION "-${TAG#*-}"
           printf '%s\n' "-arm64-edge" > localversion
           for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do
             ./scripts/config -d "$dbg" || true
