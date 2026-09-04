@@ -20,7 +20,7 @@ jobs:
       commit: ${{ steps.check.outputs.commit }}
       build_needed: ${{ steps.check.outputs.build_needed }}
     steps:
-      - name: Preflight Check
+      - name: Check release
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
@@ -130,7 +130,7 @@ jobs:
       LLVM: 1
 
     steps:
-      - name: Native Environment Audit
+      - name: Check environment
         run: |
           set -euo pipefail
 
@@ -151,10 +151,10 @@ jobs:
             exit 1
           }
 
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Install Dependencies
+      - name: Install dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -237,6 +237,7 @@ jobs:
           EOF
 
           clang \
+            --target=aarch64-linux-gnu \
             -c \
             /tmp/clang-arm64-test.c \
             -o /tmp/clang-arm64-test.o
@@ -258,7 +259,7 @@ jobs:
             ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-
             ${{ runner.os }}-native-arm64-xanmod-edge-
 
-      - name: Fetch XanMod Source
+      - name: Fetch source
         run: |
           set -euo pipefail
 
@@ -285,10 +286,14 @@ jobs:
             exit 1
           }
 
-          [[ -f CONFIGS/x86_64/config ]] || {
+          xanmod_conf="$(find CONFIGS/x86_64 -maxdepth 1 -type f -name 'config*' | head -n1)"
+          if [[ -z "$xanmod_conf" || ! -f "$xanmod_conf" ]]; then
             echo "ERROR: XanMod x86_64 config not found."
             exit 1
-          }
+          fi
+
+          echo "WARNING: Using x86_64 XanMod config only as feature template"
+          echo "XANMOD_CONF=$xanmod_conf" >> "$GITHUB_ENV"
 
           echo "=== Git working tree audit ==="
 
@@ -301,44 +306,66 @@ jobs:
 
           mv .git .git.build-hidden
 
-      - name: Configure Kernel
+      - name: Configure kernel
         run: |
           set -euo pipefail
 
           cd kernel
 
-          echo "=== ARM64 base defconfig ==="
-          make defconfig
+          echo "Using XanMod profile: $XANMOD_CONF"
 
+          echo "=== Generate ARM64 base defconfig ==="
+          make ARCH=arm64 defconfig
           cp .config .config.arm64-base
 
-          echo "=== Extract reusable XanMod configuration ==="
+          echo "=== Extract available symbols from Kconfig tree ==="
+          find . -name "Kconfig*" -type f -exec grep -hE '^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+' {} + | awk '{print "CONFIG_"$2}' | sort -u > .all-kconfig-symbols
 
+          echo "=== Filter x86 config against available ARM64 symbols ==="
           awk '
-            /^[[:space:]]*CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|".*")$/ {
-              if ($0 ~ /^[[:space:]]*CONFIG_LOCALVERSION=/)
-                next
-
-              sub(/^[[:space:]]+/, "")
-              print
+          NR==FNR { sym[$1]=1; next }
+          {
+            if ($0 ~ /^CONFIG_/) {
+              split($0, a, "=")
+              if (a[1] in sym) print $0
+            } else if ($0 ~ /^# CONFIG_.* is not set$/) {
+              if ($2 in sym) print $0
             }
-          ' CONFIGS/x86_64/config > .xanmod-candidates
+          }
+          ' .all-kconfig-symbols "$XANMOD_CONF" > .xanmod-filtered
 
-          echo "Candidate configuration entries:"
-          wc -l .xanmod-candidates
-
-          echo "=== Merge XanMod configuration ==="
-
+          echo "=== First Kconfig merge ==="
           ./scripts/kconfig/merge_config.sh \
             -m \
             .config \
-            .xanmod-candidates
+            .xanmod-filtered
 
-          make olddefconfig > /dev/null
+          echo "=== First Kconfig auto-resolution ==="
+          make ARCH=arm64 olddefconfig
 
+          echo "=== Remove x86 disabled leftovers ==="
+          grep -E '^# CONFIG_(X86 |X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config \
+            | sed -E 's/^# CONFIG_([^ ]+) .*/\1/' \
+            | while read -r conf; do
+                echo "Disable $conf"
+                ./scripts/config --disable "$conf" || true
+            done
+
+          echo "=== Remove x86 enabled leftovers ==="
+          grep -E '^CONFIG_(X86=|X86_|X86_64_|MCORE2|MZEN|MK8|MPSC)' .config \
+            | cut -d= -f1 \
+            | while read -r conf; do
+                echo "Disable $conf"
+                ./scripts/config --disable "${conf#CONFIG_}" || true
+            done
+
+          echo "=== Second Kconfig auto-resolution ==="
+          make ARCH=arm64 olddefconfig
+
+          echo "=== Configuration adjustments ==="
           rm -f localversion
-
           ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
+          printf '%s\n' "-${TAG#*-}-arm64-edge" > localversion
 
           for dbg in \
             DEBUG_INFO \
@@ -350,44 +377,51 @@ jobs:
             ./scripts/config -d "$dbg"
           done
 
-          ./scripts/config -e CONFIG_DEBUG_INFO_NONE
-
-          make olddefconfig
-
+          echo "=== Final Kconfig auto-resolution ==="
+          make ARCH=arm64 olddefconfig
           cp .config .config.final
 
-          echo "=== Force kernel LOCALVERSION ==="
+          echo "=== Final architecture residue audit ==="
+          if grep -qE '^CONFIG_(X86|X86_64|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config.final; then
+            echo "ERROR: x86 residue detected"
+            grep -E '^CONFIG_(X86|X86_64|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config.final
+            exit 1
+          fi
 
-          printf '%s\n' "-${TAG#*-}-arm64-edge" > localversion
+          echo "=== Verify ARM64 architecture ==="
+          grep -q '^CONFIG_ARM64=y$' .config.final || {
+            echo "ERROR: ARM64 kernel config missing"
+            exit 1
+          }
+          grep -q '^CONFIG_64BIT=y$' .config.final || {
+            echo "ERROR: 64bit config missing"
+            exit 1
+          }
 
-          echo "localversion:"
-          cat localversion
-
-          release="$(make -s kernelrelease)"
-
-          echo "Actual:   $release"
+          echo "=== Verify Kernel Release ==="
+          release="$(make -s ARCH=arm64 kernelrelease)"
           echo "Expected: ${TAG}-arm64-edge"
+          echo "Actual:   $release"
 
           [[ "$release" == "${TAG}-arm64-edge" ]] || {
             echo "ERROR: Kernel release mismatch."
             exit 1
           }
 
-      - name: Audit Kernel Configuration
+      - name: Audit configuration
         run: |
           set -euo pipefail
 
           cd kernel
 
           echo "=== Architecture audit ==="
-
-          if grep -Eq '^CONFIG_X86(=|_)|^CONFIG_X86_64(=_)' .config; then
-            echo "ERROR: X86 configuration detected."
+          if grep -qE '^CONFIG_(X86|X86_64|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config; then
+            echo "ERROR: x86 configuration or CPU tuning detected:"
+            grep -E '^CONFIG_(X86|X86_64|MCORE2|MZEN|MK8|MPSC|X86_NATIVE_CPU|X86_64_VERSION|RETPOLINE|CPU_SUP_INTEL|CPU_SUP_AMD)(=|_)' .config
             exit 1
           fi
 
           echo "=== Required configuration ==="
-
           for req in \
             ARM64 \
             64BIT \
@@ -407,18 +441,7 @@ jobs:
             }
           done
 
-          echo "=== CPU tuning audit ==="
-
-          if grep -qE \
-            '^CONFIG_(MCORE2|MZEN|X86_NATIVE_CPU|X86_64_VERSION)=' \
-            .config
-          then
-            echo "ERROR: x86-specific CPU tuning detected."
-            exit 1
-          fi
-
           echo "=== Compiler configuration ==="
-
           grep -q '^CONFIG_CC_IS_CLANG=y$' .config || {
             echo "ERROR: Kernel is not configured for Clang."
             exit 1
@@ -430,10 +453,9 @@ jobs:
           }
 
           echo "=== Prepare ==="
-
           make -s prepare
 
-      - name: Build Debian Packages
+      - name: Build packages
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           KBUILD_BUILD_USER: github-actions
@@ -457,6 +479,11 @@ jobs:
 
           make \
             ARCH=arm64 \
+            LLVM=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang --target=aarch64-linux-gnu" \
+            HOSTCC="ccache clang" \
+            LD=ld.lld \
             KDEB_COMPRESS=gzip \
             skipdbg=true \
             -j"$(nproc)" \
@@ -465,7 +492,7 @@ jobs:
           echo "=== ccache after build ==="
           ccache --show-stats
 
-      - name: Verify Packages
+      - name: Verify packages
         run: |
           set -euo pipefail
 
@@ -474,8 +501,8 @@ jobs:
           shopt -s nullglob
 
           debug_packages=(
-            kernel/*dbg*.deb
-            kernel/*dbgsym*.deb
+            *dbg*.deb
+            *dbgsym*.deb
           )
 
           if ((${#debug_packages[@]} > 0)); then
@@ -484,7 +511,7 @@ jobs:
             exit 1
           fi
 
-          packages=(kernel/*.deb)
+          packages=(*.deb)
 
           ((${#packages[@]} > 0)) || {
             echo "ERROR: No Debian packages found."
@@ -672,7 +699,7 @@ jobs:
           echo "=== Release contents ==="
           ls -lh
 
-      - name: Publish Release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -700,4 +727,3 @@ jobs:
               --title "XanMod ${TAG} ARM64 EDGE" \
               --notes-file dist/RELEASE.md
           fi
-
