@@ -445,6 +445,9 @@ jobs:
 
           cd kernel
 
+          echo "=== ccache configuration ==="
+          ccache --set-config=cache_dir="$CCACHE_DIR"
+
           echo "=== ccache before build ==="
           ccache --show-stats || true
 
@@ -635,9 +638,9 @@ jobs:
           cmp -s \
             "$expected_config" \
             ../kernel/.config.final || {
-            echo "ERROR: Packaged kernel configuration differs from .config.final."
-            exit 1
-          }
+              echo "ERROR: Packaged kernel configuration differs from .config.final."
+              exit 1
+            }
 
           echo "Embedded kernel configuration matches .config.final."
 
@@ -697,3 +700,4 @@ jobs:
               --title "XanMod ${TAG} ARM64 EDGE" \
               --notes-file dist/RELEASE.md
           fi
+
