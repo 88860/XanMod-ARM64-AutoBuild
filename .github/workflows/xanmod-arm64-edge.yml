@@ -92,10 +92,10 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           set -euo pipefail
-          
+
           sudo dpkg --add-architecture arm64
           sudo sed -i 's/^Types: deb/Types: deb\nArchitectures: amd64 i386/' /etc/apt/sources.list.d/ubuntu.sources
-          
+
           cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
           Types: deb
           URIs: http://ports.ubuntu.com/ubuntu-ports
@@ -104,23 +104,44 @@ jobs:
           Architectures: arm64
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
-          
+
           sudo apt-get update
 
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
+          if ! command -v clang-22 &> /dev/null; then
+            wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
+          fi
 
           sudo apt-get install -y --no-install-recommends \
             build-essential crossbuild-essential-arm64 \
+            gcc-12 g++-12 \
             bc bison flex fakeroot kmod cpio lz4 xz-utils zstd \
             clang-22 lld-22 llvm-22 rsync \
             libelf-dev libssl-dev libdw-dev zlib1g-dev \
             libelf-dev:arm64 libssl-dev:arm64 zlib1g-dev:arm64 \
-            debhelper dpkg-dev dwarves ccache pkg-config python3 binutils
+            debhelper dpkg-dev dwarves ccache pkg-config python3 \
+            binutils libtinfo-dev ncurses-dev pahole
 
-          for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+          for tool in aarch64-linux-gnu-gcc aarch64-linux-gnu-ld aarch64-linux-gnu-ar; do
+            if ! which "$tool" >/dev/null 2>&1; then
+              echo "ERROR: Cross-compiler tool missing: $tool"
+              exit 1
+            fi
+          done
+
+          for tool in clang lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
             sudo ln -sf "/usr/bin/${tool}-22" "/usr/bin/${tool}"
           done
-            
+
+          sudo rm -f /usr/bin/ld
+          sudo ln -sf /usr/bin/ld.bfd /usr/bin/ld
+
+          for tool in gcc ld cc; do
+            if ! which "$tool" >/dev/null 2>&1; then
+              echo "ERROR: Host tool missing: $tool"
+              exit 1
+            fi
+          done
+
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
       - name: Cache
@@ -128,10 +149,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ${{ runner.os }}-cross-arm64-xanmod-edge-${{ steps.xanmod.outputs.tag }}-clang22-${{ github.sha }}
+          key: ${{ runner.os }}-xanmod-edge-${{ steps.xanmod.outputs.tag }}-clang22
           restore-keys: |
-            ${{ runner.os }}-cross-arm64-xanmod-edge-${{ steps.xanmod.outputs.tag }}-clang22-
-            ${{ runner.os }}-cross-arm64-xanmod-edge-
+            ${{ runner.os }}-xanmod-edge-${{ steps.xanmod.outputs.tag }}-clang22
+            ${{ runner.os }}-xanmod-edge-
 
       - name: Source
         if: steps.published.outputs.skip != 'true'
@@ -142,7 +163,7 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch "$TAG" https://gitlab.com/xanmod/linux.git kernel
           cd kernel
-          
+
           [[ "$(git rev-parse HEAD)" == "$EXPECTED_COMMIT" ]] || exit 1
           [[ -f arch/arm64/configs/defconfig ]] && [[ -f CONFIGS/x86_64/config ]] || exit 1
 
@@ -157,34 +178,34 @@ jobs:
           set -euo pipefail
           cd kernel
           rm -rf .git
-          
+
           make defconfig
           cp .config .config.arm64-base
-          
+
           awk '/^[[:space:]]*CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|".*")$/ {
               if ($0 ~ /^[[:space:]]*CONFIG_LOCALVERSION=/) next;
               sub(/^[[:space:]]+/, "");
               print
           }' CONFIGS/x86_64/config > .xanmod-candidates
-          
+
           ./scripts/kconfig/merge_config.sh -m .config .xanmod-candidates > /dev/null 2>&1
-          make olddefconfig > /dev/null
-          
+          make olddefconfig
+
           ./scripts/config --disable LOCALVERSION_AUTO
           for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do
             ./scripts/config -d "$dbg"
           done
           ./scripts/config -e DEBUG_INFO_NONE
-          
+
           xanmod_suffix="${TAG#*-}"
           echo "-${xanmod_suffix}-arm64-edge" > localversion
-          
-          make olddefconfig > /dev/null
+
+          make olddefconfig
           cp .config .config.final
-          
+
           release="$(make -s kernelrelease)"
           expected="${TAG}-arm64-edge"
-          [[ "$release" == "$expected" ]] || exit 1
+          [[ "$release" == "$expected" ]] || { echo "Version mismatch: $release != $expected"; exit 1; }
 
       - name: Audit
         if: steps.published.outputs.skip != 'true'
@@ -195,16 +216,21 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          
+
           if grep -Eq '^CONFIG_X86(=|_)|^CONFIG_X86_64(=_)' .config; then
+            echo "ERROR: x86 config detected in ARM64 build"
             exit 1
           fi
-          
+
           for req in ARM64 64BIT MODULES NET INET PROC_FS SYSFS CGROUPS NAMESPACES BPF BPF_SYSCALL; do
-            grep -q "^CONFIG_${req}=y$" .config || exit 1
+            grep -q "^CONFIG_${req}=y$" .config || {
+              echo "ERROR: Missing required config: CONFIG_${req}=y"
+              exit 1
+            }
           done
 
           if grep -qE '^CONFIG_(MCORE2|MZEN|X86_NATIVE_CPU|X86_64_VERSION)=' .config; then
+            echo "ERROR: x86 CPU config detected in ARM64 build"
             exit 1
           fi
 
@@ -219,13 +245,32 @@ jobs:
           DEBFULLNAME: github-actions
           DEBEMAIL: github-actions@users.noreply.github.com
           KDEB_CHANGELOG_DIST: noble
+          ARCH: arm64
+          LLVM: 1
+          CROSS_COMPILE: aarch64-linux-gnu-
+          HOSTCC: gcc
+          HOSTCXX: g++
+          CC: clang
+          LD: aarch64-linux-gnu-ld.bfd
+          KBUILD_VERBOSE: 1
         run: |
           set -euo pipefail
           cd kernel
           ccache --zero-stats
-          
-          make -j"$(($(nproc) + 1))" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- HOSTLD=ld.lld HOSTAR=llvm-ar HOSTCFLAGS="-fuse-ld=lld" bindeb-pkg
-          
+
+          echo "=== Build Environment ==="
+          echo "ARCH: $ARCH"
+          echo "CROSS_COMPILE: $CROSS_COMPILE"
+          echo "CC: $(which $CC)"
+          echo "LD: $(which $LD)"
+          echo "HOSTCC: $(which $HOSTCC)"
+          echo "PATH: $PATH"
+          echo "=== End Environment ==="
+
+          make \
+            -j"$(($(nproc) + 1))" \
+            bindeb-pkg
+
           ccache --show-stats
 
       - name: Verify
@@ -235,10 +280,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          
+
           shopt -s nullglob
           packages=(*.deb)
-          ((${#packages[@]} > 0)) || exit 1
+          ((${#packages[@]} > 0)) || { echo "ERROR: No .deb packages generated"; exit 1; }
 
           image_pkg=""
           headers_pkg=""
@@ -246,8 +291,11 @@ jobs:
 
           for deb in "${packages[@]}"; do
             arch="$(dpkg-deb --field "$deb" Architecture)"
-            [[ "$arch" == "arm64" || "$arch" == "all" ]] || exit 1
-            
+            [[ "$arch" == "arm64" || "$arch" == "all" ]] || {
+              echo "ERROR: Package $deb has wrong architecture: $arch"
+              exit 1
+            }
+
             pkg_name="$(dpkg-deb --field "$deb" Package)"
             case "$pkg_name" in
               linux-image-*-dbg) continue ;;
@@ -258,26 +306,41 @@ jobs:
             mv "$deb" dist/
           done
 
-          [[ -n "$image_pkg" && -n "$headers_pkg" && -n "$libc_pkg" ]] || exit 1
+          [[ -n "$image_pkg" && -n "$headers_pkg" && -n "$libc_pkg" ]] || {
+            echo "ERROR: Missing required packages (image/headers/libc)"
+            exit 1
+          }
 
           cd dist
-          dpkg-deb --contents "$image_pkg" | grep -q '/boot/vmlinuz-' || exit 1
-          dpkg-deb --contents "$image_pkg" | grep -q '/lib/modules/' || exit 1
-          dpkg-deb --contents "$headers_pkg" | grep -q '/usr/src/linux-headers-' || exit 1
+          dpkg-deb --contents "$image_pkg" | grep -q '/boot/vmlinuz-' || {
+            echo "ERROR: vmlinuz not found in image package"
+            exit 1
+          }
+          dpkg-deb --contents "$image_pkg" | grep -q '/lib/modules/' || {
+            echo "ERROR: modules not found in image package"
+            exit 1
+          }
+          dpkg-deb --contents "$headers_pkg" | grep -q '/usr/src/linux-headers-' || {
+            echo "ERROR: headers not found in headers package"
+            exit 1
+          }
 
-          [[ "$(dpkg-deb --field "$image_pkg" Package)" == *"-arm64-edge" ]] || exit 1
+          [[ "$(dpkg-deb --field "$image_pkg" Package)" == *"-arm64-edge" ]] || {
+            echo "ERROR: Package name doesn't contain -arm64-edge suffix"
+            exit 1
+          }
 
           sha256sum *.deb > SHA256SUMS
 
           cat <<EOF > RELEASE.md
           ## XanMod ARM64 EDGE: $TAG
-          
+
           * **Kernel Release:** \`${TAG}-arm64-edge\`
           * **Architecture:** \`arm64\`
           * **Profile:** Full-Featured
           * **Channel:** EDGE
           * **Upstream Source:** [GitLab XanMod Linux](https://gitlab.com/xanmod/linux/-/releases/$TAG)
-          
+
           ### Checksums (SHA256)
           \`\`\`text
           $(cat SHA256SUMS)
@@ -291,7 +354,7 @@ jobs:
           TAG: ${{ steps.xanmod.outputs.tag }}
         run: |
           set -euo pipefail
-          
+
           gh release create "$TAG" \
             dist/*.deb dist/SHA256SUMS \
             --target "$GITHUB_SHA" \
