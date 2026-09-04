@@ -166,7 +166,7 @@ jobs:
               next
           }
           /^CONFIG_/ {
-              split($0,a,"=")
+              split($0,a,"="）
               if (a[1] in arm)
                   print
               next
@@ -185,7 +185,7 @@ jobs:
           
           rm -f localversion
           ./scripts/config --disable LOCALVERSION_AUTO
-          ./scripts/config --set-str LOCALVERSION "-${TAG#*-}-arm64-edge"
+          echo "-${TAG#*-}-arm64-edge" > localversion
           for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do
             ./scripts/config -d "$dbg" || true
           done
@@ -311,3 +311,4 @@ jobs:
           else
             gh release create "$RELEASE_TAG" dist/*.deb dist/SHA256SUMS --title "XanMod ${TAG} ARM64 EDGE" --notes-file dist/RELEASE.md
           fi
+
