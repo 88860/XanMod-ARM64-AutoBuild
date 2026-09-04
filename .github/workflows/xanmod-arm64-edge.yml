@@ -732,4 +732,196 @@ jobs:
           }
 
           [[ -n "$headers_pkg" ]] || {
-            echo "ERROR: linux-headers packag
+            echo "ERROR: linux-headers package missing."
+            exit 1
+          }
+
+          [[ -n "$libc_pkg" ]] || {
+            echo "ERROR: linux-libc-dev package missing."
+            exit 1
+          }
+
+          cd dist
+
+          image_basename="$(basename "$image_pkg")"
+          headers_basename="$(basename "$headers_pkg")"
+          libc_basename="$(basename "$libc_pkg")"
+
+          echo "=== Package metadata ==="
+
+          image_package="$(dpkg-deb --field "$image_basename" Package)"
+          image_version="$(dpkg-deb --field "$image_basename" Version)"
+          image_arch="$(dpkg-deb --field "$image_basename" Architecture)"
+          image_kernel_release="$(
+            dpkg-deb --field "$image_basename" Description \
+              | sed -n '1p' || true
+          )"
+
+          echo "Image package:  $image_package"
+          echo "Image version:  $image_version"
+          echo "Image arch:     $image_arch"
+          echo "Image release:  $image_kernel_release"
+
+          [[ "$image_package" == *"-arm64-edge" ]] || {
+            echo "ERROR: Unexpected image package name."
+            exit 1
+          }
+
+          [[ "$image_version" == "${TAG}"* ]] || {
+            echo "ERROR: Package version does not begin with expected TAG."
+            echo "Expected prefix: $TAG"
+            echo "Actual:          $image_version"
+            exit 1
+          }
+
+          [[ "$image_arch" == "arm64" ]] || {
+            echo "ERROR: Image package architecture is not arm64."
+            exit 1
+          }
+
+          echo "=== Package contents ==="
+
+          dpkg-deb --contents "$image_basename" \
+            | grep -q '/boot/vmlinuz-' || {
+            echo "ERROR: Kernel image not found."
+            exit 1
+          }
+
+          dpkg-deb --contents "$image_basename" \
+            | grep -q '/lib/modules/' || {
+            echo "ERROR: /lib/modules not found."
+            exit 1
+          }
+
+          dpkg-deb --contents "$headers_basename" \
+            | grep -q '/usr/src/linux-headers-' || {
+            echo "ERROR: Kernel headers not found."
+            exit 1
+          }
+
+          dpkg-deb --contents "$libc_basename" \
+            | grep -q '/usr/include/' || {
+            echo "ERROR: libc development headers not found."
+            exit 1
+          }
+
+          echo "=== Extract packaged kernel ==="
+
+          rm -rf verify-image
+          mkdir verify-image
+
+          dpkg-deb --extract \
+            "$image_basename" \
+            verify-image
+
+          expected_config="verify-image/boot/config-${TAG}-arm64-edge"
+
+          [[ -f "$expected_config" ]] || {
+            echo "ERROR: Expected kernel config not found:"
+            echo "       $expected_config"
+            exit 1
+          }
+
+          cmp -s \
+            "$expected_config" \
+            ../kernel/.config.final || {
+            echo "ERROR: Packaged kernel configuration differs from .config.final."
+            exit 1
+          }
+
+          echo "Embedded kernel configuration matches .config.final."
+
+          echo "=== Kernel module directory ==="
+
+          mapfile -t module_dirs < <(
+            find verify-image/lib/modules \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              -printf '%f\n' \
+              2>/dev/null || true
+          )
+
+          [[ "${#module_dirs[@]}" -eq 1 ]] || {
+            echo "ERROR: Expected exactly one kernel module directory."
+            printf '%s\n' "${module_dirs[@]:-}"
+            exit 1
+          }
+
+          [[ "${module_dirs[0]}" == "${TAG}-arm64-edge" ]] || {
+            echo "ERROR: Kernel module directory mismatch."
+            echo "Expected: ${TAG}-arm64-edge"
+            echo "Actual:   ${module_dirs[0]}"
+            exit 1
+          }
+
+          echo "Kernel module directory verified."
+
+          echo "=== Kernel image release ==="
+
+          kernel_release_from_config="$(
+            sed -n 's/^CONFIG_LOCALVERSION="\{0,1\}\(.*\)"\{0,1\}$/\1/p' \
+              ../kernel/.config.final
+          )"
+
+          echo "CONFIG_LOCALVERSION: ${kernel_release_from_config:-unset}"
+
+          echo "=== SHA256 ==="
+
+          sha256sum *.deb > SHA256SUMS
+
+          sha256sum -c SHA256SUMS
+
+          cat SHA256SUMS
+
+          cat <<EOF > RELEASE.md
+          ## XanMod ARM64 EDGE: $TAG
+
+          * **Kernel Release:** \`${TAG}-arm64-edge\`
+          * **Architecture:** \`arm64\`
+          * **Profile:** Full-Featured
+          * **Channel:** EDGE
+          * **Upstream Source:** [GitLab XanMod Linux](https://gitlab.com/xanmod/linux/-/releases/$TAG)
+          * **Upstream Commit:** \`${EXPECTED_COMMIT}\`
+          * **Compiler:** Clang 22 / LLD 22
+          * **Build:** GitHub Actions Native ARM64 compilation
+
+          ### Checksums (SHA256)
+
+          \`\`\`text
+          $(cat SHA256SUMS)
+          \`\`\`
+          EOF
+
+          echo "=== Release contents ==="
+
+          ls -lh
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Existing GitHub Release found."
+            echo "Uploading/replacing build assets..."
+
+            gh release upload "$TAG" \
+              dist/*.deb \
+              dist/SHA256SUMS \
+              --clobber
+
+            gh release edit "$TAG" \
+              --title "XanMod ${TAG} ARM64 EDGE" \
+              --notes-file dist/RELEASE.md
+          else
+            echo "GitHub Release does not exist."
+            echo "Creating new release..."
+
+            gh release create "$TAG" \
+              dist/*.deb \
+              dist/SHA256SUMS \
+              --title "XanMod ${TAG} ARM64 EDGE" \
+              --notes-file dist/RELEASE.md
+          fi
