@@ -35,7 +35,7 @@ jobs:
           commit=""
           for p in $(seq 1 50); do
             res="$(curl -fsSL --retry 5 "https://gitlab.com/api/v4/projects/xanmod%2Flinux/releases?order_by=released_at&sort=desc&per_page=100&page=$p")"
-            IFS=$'\t' read -r t c < <(jq -r --arg ch "$CHANNEL" 'limit(1; .[] | select(.upcoming_release == false and (.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$")) and any(.assets.links[]?; (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/\($ch)/[^/]+/?$"))) | [.tag_name, .commit.id] | @tsv)' <<< "$res") || true
+            IFS=$'\t' read -r t c < <(jq -r --arg ch "$CHANNEL" 'limit(1; .[] | select(.upcoming_release == false and (.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$")) and any(.assets.links[]?; (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/\\($ch)/[^/]+/?$"))) | [.tag_name, .commit.id] | @tsv)' <<< "$res") || true
             [[ -n "$t" ]] && { tag="$t"; commit="$c"; break; }
             [[ "$(jq 'length' <<< "$res")" -lt 100 ]] && break
           done
@@ -79,7 +79,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Cache
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
           path: .ccache
           key: ${{ runner.os }}-arm64-${{ env.CHANNEL }}-clang${{ env.LLVM_VER }}-${{ env.TAG }}
@@ -94,13 +94,30 @@ jobs:
           DEBEMAIL: github-actions@users.noreply.github.com
         run: |
           set -euo pipefail
+          
+          # 核心修复：定义全局统一的 Make 参数，确保配置阶段和编译阶段的编译器 100% 一致！
+          MAKE_ARGS=(
+            ARCH=arm64
+            LLVM=1
+            CROSS_COMPILE=aarch64-linux-gnu-
+            "CC=ccache clang --target=aarch64-linux-gnu"
+            "HOSTCC=ccache clang"
+            "HOSTCXX=ccache clang++"
+            HOSTLD=ld.lld
+            HOSTAR=llvm-ar
+            LD=ld.lld
+          )
+          
           git clone --filter=blob:none --branch "$TAG" https://gitlab.com/xanmod/linux.git kernel
           cd kernel
           [[ "$(git rev-parse HEAD^{commit})" == "$EXPECTED_COMMIT" ]] || exit 1
           mv .git .git.build-hidden
           if [[ -f "CONFIGS/x86_64/config" ]]; then xanmod_conf="CONFIGS/x86_64/config"; else xanmod_conf=$(find CONFIGS -type f -name "config" | grep -iE 'x86_64|x86-64-v' | head -n 1 || true); fi
           [[ -f "$xanmod_conf" ]] || exit 1
-          make ARCH=arm64 defconfig
+          
+          # 修复点：配置基线时传入 LLVM 环境
+          make "${MAKE_ARGS[@]}" defconfig
+          
           find . -name "Kconfig*" -type f -exec grep -hE '^[[:space:]]*(config|menuconfig)[[:space:]]+[A-Za-z0-9_]+' {} + | awk '{print "CONFIG_"$2}' | sort -u > kernel.symbols
           awk 'NR==FNR{arm[$1]=1;next}/^CONFIG_/{split($0,a,"=");if(a[1] in arm)print;next}/^# CONFIG_/{match($0,/CONFIG_[A-Za-z0-9_]+/);sym=substr($0,RSTART,RLENGTH);if(sym in arm)print}' kernel.symbols "$xanmod_conf" > xanmod.arm64.fragment
           sed -i -E 's/^CONFIG_KVM=m$/CONFIG_KVM=y/' xanmod.arm64.fragment
@@ -110,14 +127,20 @@ jobs:
           ./scripts/config --disable LOCALVERSION_AUTO
           echo "-${TAG#*-}-arm64-${CHANNEL}" > localversion
           for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do ./scripts/config -d "$dbg" || true; done
-          make ARCH=arm64 olddefconfig
+          
+          # 修复点：合并完成后，再次用相同的 LLVM 参数刷新配置
+          make "${MAKE_ARGS[@]}" olddefconfig
           cp .config .config.final
           touch .scmversion
-          kernel_rel="$(make -s ARCH=arm64 kernelrelease)"
+          
+          kernel_rel="$(make -s "${MAKE_ARGS[@]}" kernelrelease)"
           [[ "$kernel_rel" == "${TAG}-arm64-${CHANNEL}" ]] || exit 1
+          
           ccache --set-config=cache_dir="$CCACHE_DIR"
-          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld -s prepare
-          make ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_DEBARCH=arm64 KDEB_PKGVERSION="${kernel_rel}-1" CC="ccache clang --target=aarch64-linux-gnu" HOSTCC="ccache clang" HOSTCXX="ccache clang++" HOSTLD=ld.lld HOSTAR=llvm-ar LD=ld.lld KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
+          
+          # 编译阶段同样复用相同的 LLVM 参数数组
+          make "${MAKE_ARGS[@]}" -s prepare
+          make "${MAKE_ARGS[@]}" KDEB_PKGVERSION="${kernel_rel}-1" KDEB_COMPRESS=gzip skipdbg=true -j"$(nproc)" bindeb-pkg
 
       - name: Publish
         env:
@@ -168,4 +191,3 @@ jobs:
           gh release list --limit 50 | awk '{print $1}' | grep "\-arm64-${CHANNEL}$" | grep -v "^${RELEASE_TAG}$" | while read -r old_tag; do
             gh release delete "$old_tag" --cleanup-tag -y || true
           done
-
