@@ -121,31 +121,35 @@ jobs:
   build:
     needs: preflight
     if: needs.preflight.outputs.build_needed == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
       EXPECTED_COMMIT: ${{ needs.preflight.outputs.commit }}
       ARCH: arm64
       LLVM: 1
-      CROSS_COMPILE: aarch64-linux-gnu-
 
     steps:
-      - name: Free Disk Space
+      - name: Native Environment Audit
         run: |
           set -euo pipefail
 
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /opt/hostedtoolcache/CodeQL
+          echo "=== Native ARM64 environment ==="
+          uname -m
+          dpkg --print-architecture
+          nproc
+          free -h
+          df -h /
 
-          sudo docker image prune --all --force
-          sudo apt-get clean
+          [[ "$(uname -m)" == "aarch64" ]] || {
+            echo "ERROR: Runner is not ARM64."
+            exit 1
+          }
 
-          echo "=== Disk space ==="
-          df -h
+          [[ "$(dpkg --print-architecture)" == "arm64" ]] || {
+            echo "ERROR: dpkg architecture is not arm64."
+            exit 1
+          }
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -156,28 +160,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          sudo dpkg --add-architecture arm64
-
-          sudo sed -i \
-            's/^Types: deb/Types: deb\nArchitectures: amd64/' \
-            /etc/apt/sources.list.d/ubuntu.sources
-
-          cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
-          Types: deb
-          URIs: http://ports.ubuntu.com/ubuntu-ports
-          Suites: noble noble-updates noble-security
-          Components: main restricted universe multiverse
-          Architectures: arm64
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-          EOF
-
           sudo apt-get update
 
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
 
           sudo apt-get install -y --no-install-recommends \
             build-essential \
-            crossbuild-essential-arm64 \
             bc \
             bison \
             flex \
@@ -191,7 +179,6 @@ jobs:
             lld-22 \
             llvm-22 \
             rsync \
-            binutils-aarch64-linux-gnu \
             libelf-dev \
             libssl-dev \
             libdw-dev \
@@ -227,9 +214,6 @@ jobs:
           ld.lld --version
           llvm-ar --version
 
-          echo "=== Cross compiler ==="
-          aarch64-linux-gnu-gcc --version
-
           clang --version | grep -q '22\.' || {
             echo "ERROR: Clang 22 was not selected."
             exit 1
@@ -240,6 +224,10 @@ jobs:
             exit 1
           }
 
+          echo "=== Target triple checks ==="
+          clang --target=aarch64-linux-gnu -dumpmachine
+          clang -print-target-triple
+
           echo "=== ARM64 LLVM smoke test ==="
           cat >/tmp/clang-arm64-test.c <<'EOF'
           int test_function(void)
@@ -249,7 +237,6 @@ jobs:
           EOF
 
           clang \
-            --target=aarch64-linux-gnu \
             -c \
             /tmp/clang-arm64-test.c \
             -o /tmp/clang-arm64-test.o
@@ -260,16 +247,16 @@ jobs:
               exit 1
             }
 
-          echo "ARM64 Clang smoke test passed."
+          echo "ARM64 Native Clang smoke test passed."
 
       - name: Restore ccache
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ${{ runner.os }}-cross-arm64-xanmod-edge-${{ env.TAG }}-clang22-v1
+          key: ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-v1
           restore-keys: |
-            ${{ runner.os }}-cross-arm64-xanmod-edge-${{ env.TAG }}-clang22-
-            ${{ runner.os }}-cross-arm64-xanmod-edge-
+            ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-
+            ${{ runner.os }}-native-arm64-xanmod-edge-
 
       - name: Fetch XanMod Source
         run: |
@@ -450,7 +437,7 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           KBUILD_BUILD_USER: github-actions
-          KBUILD_BUILD_HOST: github-arm64-cross
+          KBUILD_BUILD_HOST: github-arm64-native
           DEBFULLNAME: github-actions
           DEBEMAIL: github-actions@users.noreply.github.com
         run: |
@@ -465,7 +452,12 @@ jobs:
 
           echo "=== Building ==="
 
-          make -j"$(nproc)" bindeb-pkg DPKG_FLAGS="-d"
+          make \
+            ARCH=arm64 \
+            KDEB_COMPRESS=gzip \
+            skipdbg=true \
+            -j"$(nproc)" \
+            bindeb-pkg
 
           echo "=== ccache after build ==="
           ccache --show-stats
@@ -476,11 +468,18 @@ jobs:
 
           mkdir -p dist
 
-          rm -f \
-            kernel/*dbg*.deb \
-            kernel/*dbgsym*.deb
-
           shopt -s nullglob
+
+          debug_packages=(
+            kernel/*dbg*.deb
+            kernel/*dbgsym*.deb
+          )
+
+          if ((${#debug_packages[@]} > 0)); then
+            echo "ERROR: Debug packages were generated:"
+            printf '  %s\n' "${debug_packages[@]}"
+            exit 1
+          fi
 
           packages=(kernel/*.deb)
 
@@ -658,7 +657,7 @@ jobs:
           * **Upstream Source:** [GitLab XanMod Linux](https://gitlab.com/xanmod/linux/-/releases/$TAG)
           * **Upstream Commit:** \`${EXPECTED_COMMIT}\`
           * **Compiler:** Clang 22 / LLD 22
-          * **Build:** GitHub Actions x86_64 → ARM64 cross compilation
+          * **Build:** GitHub Actions Native ARM64 compilation
 
           ### Checksums (SHA256)
 
@@ -698,4 +697,3 @@ jobs:
               --title "XanMod ${TAG} ARM64 EDGE" \
               --notes-file dist/RELEASE.md
           fi
-
