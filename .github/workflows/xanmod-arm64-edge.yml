@@ -35,7 +35,7 @@ jobs:
           commit=""
           for p in $(seq 1 50); do
             res="$(curl -fsSL --retry 5 "https://gitlab.com/api/v4/projects/xanmod%2Flinux/releases?order_by=released_at&sort=desc&per_page=100&page=$p")"
-            IFS=$'\t' read -r t c < <(jq -r --arg ch "$CHANNEL" 'limit(1; .[] | select(.upcoming_release == false and (.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$")) and any(.assets.links[]?; (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/\\($ch)/[^/]+/?$"))) | [.tag_name, .commit.id] | @tsv)' <<< "$res") || true
+            IFS=$'\t' read -r t c < <(jq -r --arg ch "$CHANNEL" 'limit(1; .[] | select(.upcoming_release == false and (.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$")) and any(.assets.links[]?; (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/\($ch)/[^/]+/?$"))) | [.tag_name, .commit.id] | @tsv)' <<< "$res") || true
             [[ -n "$t" ]] && { tag="$t"; commit="$c"; break; }
             [[ "$(jq 'length' <<< "$res")" -lt 100 ]] && break
           done
@@ -168,3 +168,4 @@ jobs:
           gh release list --limit 50 | awk '{print $1}' | grep "\-arm64-${CHANNEL}$" | grep -v "^${RELEASE_TAG}$" | while read -r old_tag; do
             gh release delete "$old_tag" --cleanup-tag -y || true
           done
+
