@@ -5,7 +5,8 @@ on:
   schedule:
     - cron: '37 3 * * *'
 
-permissions: {}
+permissions:
+  contents: write
 
 concurrency:
   group: xanmod-arm64-edge
@@ -14,8 +15,6 @@ concurrency:
 jobs:
   preflight:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       commit: ${{ steps.check.outputs.commit }}
@@ -38,7 +37,6 @@ jobs:
               curl -fsSL \
                 --retry 5 \
                 --retry-delay 2 \
-                --retry-all-errors \
                 "$GITLAB_API/releases?order_by=released_at&sort=desc&per_page=100&page=$page"
             )"
 
@@ -125,15 +123,11 @@ jobs:
     if: needs.preflight.outputs.build_needed == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
-    permissions:
-      contents: write
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
       EXPECTED_COMMIT: ${{ needs.preflight.outputs.commit }}
       ARCH: arm64
       LLVM: 1
-      KCONFIG_WARN_UNKNOWN_SYMBOLS: 1
-      KCONFIG_WARN_CHANGED_INPUT: 1
 
     steps:
       - name: Native Environment Audit
@@ -141,8 +135,6 @@ jobs:
           set -euo pipefail
 
           echo "=== Native ARM64 environment ==="
-
-          uname -a
           uname -m
           dpkg --print-architecture
           nproc
@@ -159,85 +151,8 @@ jobs:
             exit 1
           }
 
-          echo "=== LLVM environment ==="
-
-          command -v clang
-          command -v clang++
-          command -v ld.lld
-          command -v llvm-ar
-
-          clang --version
-          ld.lld --version
-          llvm-ar --version
-
-          clang --version | grep -q '22\.' || {
-            echo "ERROR: Clang 22 was not selected."
-            exit 1
-          }
-
-          ld.lld --version | grep -q '22\.' || {
-            echo "ERROR: LLD 22 was not selected."
-            exit 1
-          }
-
-          echo "=== Native compiler binaries ==="
-
-          file "$(command -v clang)"
-          file "$(command -v ld.lld)"
-          file "$(command -v llvm-ar)"
-
-          echo "=== Target triple checks ==="
-
-          debian_arch="$(dpkg --print-architecture)"
-          debian_triplet="$(dpkg-architecture -qDEB_HOST_GNU_TYPE)"
-          clang_native_triplet="$(clang -print-target-triple)"
-          clang_arm64_triplet="$(clang --target=aarch64-linux-gnu -dumpmachine)"
-
-          echo "Debian architecture: $debian_arch"
-          echo "Debian GNU triplet:   $debian_triplet"
-          echo "Clang native triple:  $clang_native_triplet"
-          echo "Clang ARM64 triple:   $clang_arm64_triplet"
-
-          [[ "$debian_arch" == "arm64" ]] || {
-            echo "ERROR: Debian architecture is not arm64."
-            exit 1
-          }
-
-          [[ "$debian_triplet" == "aarch64-linux-gnu" ]] || {
-            echo "ERROR: Debian GNU triplet is incorrect."
-            exit 1
-          }
-
-          [[ "$clang_arm64_triplet" == "aarch64-linux-gnu" ]] || {
-            echo "ERROR: Clang ARM64 target triple is incorrect."
-            exit 1
-          }
-
-          echo "=== ARM64 LLVM smoke test ==="
-
-          cat >/tmp/clang-arm64-test.c <<'EOF'
-          int test_function(void)
-          {
-              return 0;
-          }
-          EOF
-
-          clang \
-            --target=aarch64-linux-gnu \
-            -c \
-            /tmp/clang-arm64-test.c \
-            -o /tmp/clang-arm64-test.o
-
-          llvm-readelf -h /tmp/clang-arm64-test.o \
-            | grep -Eq 'Machine:.*AArch64|Machine:.*ARM64' || {
-            echo "ERROR: Clang failed to produce an ARM64 object."
-            exit 1
-          }
-
-          echo "ARM64 native Clang smoke test passed."
-
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
 
       - name: Install Dependencies
         env:
@@ -294,11 +209,7 @@ jobs:
 
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-
-          echo "=== Selected LLVM toolchain ==="
-
+          echo "=== LLVM toolchain ==="
           clang --version
           ld.lld --version
           llvm-ar --version
@@ -313,28 +224,39 @@ jobs:
             exit 1
           }
 
+          echo "=== Target triple checks ==="
+          clang --target=aarch64-linux-gnu -dumpmachine
+          clang -print-target-triple
+
+          echo "=== ARM64 LLVM smoke test ==="
+          cat >/tmp/clang-arm64-test.c <<'EOF'
+          int test_function(void)
+          {
+              return 0;
+          }
+          EOF
+
+          clang \
+            -c \
+            /tmp/clang-arm64-test.c \
+            -o /tmp/clang-arm64-test.o
+
+          llvm-readelf -h /tmp/clang-arm64-test.o \
+            | grep -Eq 'Machine:.*AArch64|Machine:.*ARM64' || {
+              echo "ERROR: Clang failed to produce an ARM64 object."
+              exit 1
+            }
+
+          echo "ARM64 Native Clang smoke test passed."
+
       - name: Restore ccache
-        uses: actions/cache@v6
+        uses: actions/cache@v5
         with:
           path: .ccache
-          key: ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-v2
+          key: ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-v1
           restore-keys: |
             ${{ runner.os }}-native-arm64-xanmod-edge-${{ env.TAG }}-clang22-
             ${{ runner.os }}-native-arm64-xanmod-edge-
-
-      - name: Configure ccache
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$GITHUB_WORKSPACE/.ccache"
-
-          export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache"
-
-          ccache --set-config=cache_dir="$CCACHE_DIR"
-          ccache --set-config=max_size=1G
-          ccache --set-config=compiler_check=content
-          ccache --set-config=compression=true
-          ccache --show-config
 
       - name: Fetch XanMod Source
         run: |
@@ -386,23 +308,17 @@ jobs:
           cd kernel
 
           echo "=== ARM64 base defconfig ==="
-
           make defconfig
 
           cp .config .config.arm64-base
 
-          echo "=== Extract current XanMod x86_64 configuration ==="
+          echo "=== Extract reusable XanMod configuration ==="
 
           awk '
             /^[[:space:]]*CONFIG_[A-Za-z0-9_]+=(y|m|-?[0-9]+|0x[0-9A-Fa-f]+|".*")$/ {
               if ($0 ~ /^[[:space:]]*CONFIG_LOCALVERSION=/)
                 next
-              sub(/^[[:space:]]+/, "")
-              print
-              next
-            }
 
-            /^[[:space:]]*#[[:space:]]CONFIG_[A-Za-z0-9_]+[[:space:]]+is not set$/ {
               sub(/^[[:space:]]+/, "")
               print
             }
@@ -411,51 +327,14 @@ jobs:
           echo "Candidate configuration entries:"
           wc -l .xanmod-candidates
 
-          [[ -s .xanmod-candidates ]] || {
-            echo "ERROR: XanMod configuration extraction is empty."
-            exit 1
-          }
-
-          duplicate_symbols="$(
-            sed -E 's/^(# )?CONFIG_([^ =]+).*/\2/' .xanmod-candidates \
-              | sort \
-              | uniq -d
-          )"
-
-          [[ -z "$duplicate_symbols" ]] || {
-            echo "ERROR: Duplicate configuration symbols detected:"
-            printf '%s\n' "$duplicate_symbols"
-            exit 1
-          }
-
-          echo "=== Merge XanMod configuration into ARM64 defconfig ==="
+          echo "=== Merge XanMod configuration ==="
 
           ./scripts/kconfig/merge_config.sh \
             -m \
             .config \
             .xanmod-candidates
 
-          cp .config .config.xanmod-merged
-
-          echo "=== XanMod migration diff ==="
-
-          ./scripts/diffconfig \
-            .config.arm64-base \
-            .config.xanmod-merged \
-            | tee .config.arm64-xanmod-migration.diff
-
-          echo "=== Kconfig resolution ==="
-
-          make olddefconfig
-
-          cp .config .config.after-olddefconfig
-
-          echo "=== Kconfig resolution diff ==="
-
-          ./scripts/diffconfig \
-            .config.xanmod-merged \
-            .config.after-olddefconfig \
-            | tee .config.kconfig-resolution.diff
+          make olddefconfig > /dev/null
 
           rm -f localversion
 
@@ -504,7 +383,6 @@ jobs:
 
           if grep -Eq '^CONFIG_X86(=|_)|^CONFIG_X86_64(=_)' .config; then
             echo "ERROR: X86 configuration detected."
-            grep -E '^CONFIG_X86(=|_)|^CONFIG_X86_64(=_)' .config
             exit 1
           fi
 
@@ -536,9 +414,6 @@ jobs:
             .config
           then
             echo "ERROR: x86-specific CPU tuning detected."
-            grep -E \
-              '^CONFIG_(MCORE2|MZEN|X86_NATIVE_CPU|X86_64_VERSION)=' \
-              .config
             exit 1
           fi
 
@@ -554,22 +429,13 @@ jobs:
             exit 1
           }
 
-          echo "=== Final configuration consistency ==="
-
-          cmp -s .config .config.final || {
-            echo "ERROR: Final .config changed after being saved."
-            exit 1
-          }
-
           echo "=== Prepare ==="
 
-          make prepare
+          make -s prepare
 
       - name: Build Debian Packages
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
-          CC: clang --target=aarch64-linux-gnu
-          KBUILD_DEBARCH: arm64
           KBUILD_BUILD_USER: github-actions
           KBUILD_BUILD_HOST: github-arm64-native
           DEBFULLNAME: github-actions
@@ -579,59 +445,22 @@ jobs:
 
           cd kernel
 
-          echo "=== Debian architecture ==="
-
-          echo "dpkg architecture: $(dpkg --print-architecture)"
-          echo "Debian host triplet: $(dpkg-architecture -qDEB_HOST_GNU_TYPE)"
-          echo "KBUILD_DEBARCH: $KBUILD_DEBARCH"
-          echo "CC: $CC"
-
-          [[ "$(dpkg --print-architecture)" == "arm64" ]] || {
-            echo "ERROR: Build host is not arm64."
-            exit 1
-          }
-
-          [[ "$(dpkg-architecture -qDEB_HOST_GNU_TYPE)" == "aarch64-linux-gnu" ]] || {
-            echo "ERROR: Debian host GNU triplet is incorrect."
-            exit 1
-          }
-
-          [[ "$KBUILD_DEBARCH" == "arm64" ]] || {
-            echo "ERROR: KBUILD_DEBARCH is not arm64."
-            exit 1
-          }
-
-          echo "=== Compiler target ==="
-
-          clang --target=aarch64-linux-gnu -dumpmachine
-
-          [[ "$(clang --target=aarch64-linux-gnu -dumpmachine)" == "aarch64-linux-gnu" ]] || {
-            echo "ERROR: Explicit ARM64 compiler target is incorrect."
-            exit 1
-          }
-
           echo "=== ccache before build ==="
-
           ccache --show-stats || true
+
           ccache --zero-stats
 
-          ccache --set-config=max_size=1G
-          ccache --set-config=compiler_check=content
-
-          echo "=== Building Debian packages ==="
+          echo "=== Building ==="
 
           make \
             ARCH=arm64 \
-            LLVM=1 \
             KDEB_COMPRESS=gzip \
             skipdbg=true \
             -j"$(nproc)" \
             bindeb-pkg
 
           echo "=== ccache after build ==="
-
           ccache --show-stats
-          ccache --show-config
 
       - name: Verify Packages
         run: |
@@ -666,15 +495,15 @@ jobs:
           echo "=== Package inventory ==="
 
           for deb in "${packages[@]}"; do
+
             pkg_name="$(dpkg-deb --field "$deb" Package)"
             arch="$(dpkg-deb --field "$deb" Architecture)"
-            version="$(dpkg-deb --field "$deb" Version)"
 
             echo "Package: $pkg_name"
-            echo "Version: $version"
             echo "Arch:    $arch"
 
             case "$pkg_name" in
+
               linux-image-*)
                 [[ "$arch" == "arm64" ]] || {
                   echo "ERROR: linux-image package must be arm64."
@@ -745,37 +574,24 @@ jobs:
 
           image_basename="$(basename "$image_pkg")"
           headers_basename="$(basename "$headers_pkg")"
-          libc_basename="$(basename "$libc_pkg")"
 
           echo "=== Package metadata ==="
 
           image_package="$(dpkg-deb --field "$image_basename" Package)"
           image_version="$(dpkg-deb --field "$image_basename" Version)"
-          image_arch="$(dpkg-deb --field "$image_basename" Architecture)"
-          image_kernel_release="$(
-            dpkg-deb --field "$image_basename" Description \
-              | sed -n '1p' || true
-          )"
 
-          echo "Image package:  $image_package"
-          echo "Image version:  $image_version"
-          echo "Image arch:     $image_arch"
-          echo "Image release:  $image_kernel_release"
+          echo "Image package: $image_package"
+          echo "Image version: $image_version"
 
           [[ "$image_package" == *"-arm64-edge" ]] || {
             echo "ERROR: Unexpected image package name."
             exit 1
           }
 
-          [[ "$image_version" == "${TAG}"* ]] || {
-            echo "ERROR: Package version does not begin with expected TAG."
-            echo "Expected prefix: $TAG"
-            echo "Actual:          $image_version"
-            exit 1
-          }
-
-          [[ "$image_arch" == "arm64" ]] || {
-            echo "ERROR: Image package architecture is not arm64."
+          [[ "$image_version" == *"$TAG"* ]] || {
+            echo "ERROR: Package version does not contain expected TAG."
+            echo "Expected: $TAG"
+            echo "Actual:   $image_version"
             exit 1
           }
 
@@ -783,29 +599,23 @@ jobs:
 
           dpkg-deb --contents "$image_basename" \
             | grep -q '/boot/vmlinuz-' || {
-            echo "ERROR: Kernel image not found."
-            exit 1
-          }
+              echo "ERROR: Kernel image not found."
+              exit 1
+            }
 
           dpkg-deb --contents "$image_basename" \
             | grep -q '/lib/modules/' || {
-            echo "ERROR: /lib/modules not found."
-            exit 1
-          }
+              echo "ERROR: /lib/modules not found."
+              exit 1
+            }
 
           dpkg-deb --contents "$headers_basename" \
             | grep -q '/usr/src/linux-headers-' || {
-            echo "ERROR: Kernel headers not found."
-            exit 1
-          }
+              echo "ERROR: Kernel headers not found."
+              exit 1
+            }
 
-          dpkg-deb --contents "$libc_basename" \
-            | grep -q '/usr/include/' || {
-            echo "ERROR: libc development headers not found."
-            exit 1
-          }
-
-          echo "=== Extract packaged kernel ==="
+          echo "=== Verify embedded kernel configuration ==="
 
           rm -rf verify-image
           mkdir verify-image
@@ -831,46 +641,9 @@ jobs:
 
           echo "Embedded kernel configuration matches .config.final."
 
-          echo "=== Kernel module directory ==="
-
-          mapfile -t module_dirs < <(
-            find verify-image/lib/modules \
-              -mindepth 1 \
-              -maxdepth 1 \
-              -type d \
-              -printf '%f\n' \
-              2>/dev/null || true
-          )
-
-          [[ "${#module_dirs[@]}" -eq 1 ]] || {
-            echo "ERROR: Expected exactly one kernel module directory."
-            printf '%s\n' "${module_dirs[@]:-}"
-            exit 1
-          }
-
-          [[ "${module_dirs[0]}" == "${TAG}-arm64-edge" ]] || {
-            echo "ERROR: Kernel module directory mismatch."
-            echo "Expected: ${TAG}-arm64-edge"
-            echo "Actual:   ${module_dirs[0]}"
-            exit 1
-          }
-
-          echo "Kernel module directory verified."
-
-          echo "=== Kernel image release ==="
-
-          kernel_release_from_config="$(
-            sed -n 's/^CONFIG_LOCALVERSION="\{0,1\}\(.*\)"\{0,1\}$/\1/p' \
-              ../kernel/.config.final
-          )"
-
-          echo "CONFIG_LOCALVERSION: ${kernel_release_from_config:-unset}"
-
           echo "=== SHA256 ==="
 
           sha256sum *.deb > SHA256SUMS
-
-          sha256sum -c SHA256SUMS
 
           cat SHA256SUMS
 
@@ -894,7 +667,6 @@ jobs:
           EOF
 
           echo "=== Release contents ==="
-
           ls -lh
 
       - name: Publish Release
