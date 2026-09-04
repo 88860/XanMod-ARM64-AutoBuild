@@ -15,12 +15,10 @@ concurrency:
 jobs:
   preflight:
     runs-on: ubuntu-latest
-
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       commit: ${{ steps.check.outputs.commit }}
       build_needed: ${{ steps.check.outputs.build_needed }}
-
     steps:
       - name: Preflight Check
         id: check
@@ -122,21 +120,15 @@ jobs:
 
   build:
     needs: preflight
-
     if: needs.preflight.outputs.build_needed == 'true'
-
     runs-on: ubuntu-24.04
-
     timeout-minutes: 360
-
     env:
       TAG: ${{ needs.preflight.outputs.tag }}
       EXPECTED_COMMIT: ${{ needs.preflight.outputs.commit }}
-
       ARCH: arm64
       LLVM: 1
       CROSS_COMPILE: aarch64-linux-gnu-
-
     steps:
       - name: Free Disk Space
         run: |
@@ -288,6 +280,15 @@ jobs:
             exit 1
           }
 
+          echo "=== Git working tree audit ==="
+
+          git status --short
+
+          [[ -z "$(git status --porcelain)" ]] || {
+            echo "ERROR: XanMod source tree is dirty."
+            exit 1
+          }
+
       - name: Configure Kernel
         run: |
           set -euo pipefail
@@ -319,12 +320,13 @@ jobs:
           ./scripts/kconfig/merge_config.sh \
             -m \
             .config \
-            .xanmod-candidates \
-            > /dev/null 2>&1
+            .xanmod-candidates
 
           make olddefconfig > /dev/null
 
-          ./scripts/config --disable LOCALVERSION_AUTO
+          ./scripts/config --disable CONFIG_LOCALVERSION_AUTO
+
+          ./scripts/config --set-str CONFIG_LOCALVERSION "-${TAG#*-}-arm64-edge"
 
           for dbg in \
             DEBUG_INFO \
@@ -336,22 +338,19 @@ jobs:
             ./scripts/config -d "$dbg"
           done
 
-          ./scripts/config -e DEBUG_INFO_NONE
-
-          xanmod_suffix="${TAG#*-}"
-
-          echo "-${xanmod_suffix}-arm64-edge" > localversion
+          ./scripts/config -e CONFIG_DEBUG_INFO_NONE
 
           make olddefconfig > /dev/null
 
           cp .config .config.final
 
+          echo "=== Kernel release ==="
+
           release="$(make -s kernelrelease)"
           expected="${TAG}-arm64-edge"
 
-          echo "Kernel release:"
-          echo "  Actual:   $release"
-          echo "  Expected: $expected"
+          echo "Actual:   $release"
+          echo "Expected: $expected"
 
           [[ "$release" == "$expected" ]] || {
             echo "ERROR: Kernel release mismatch."
@@ -658,3 +657,4 @@ jobs:
               --title "XanMod ${TAG} ARM64 EDGE" \
               --notes-file dist/RELEASE.md
           fi
+
