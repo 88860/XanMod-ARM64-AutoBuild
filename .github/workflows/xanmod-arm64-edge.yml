@@ -189,7 +189,6 @@ jobs:
             gh release create "$RELEASE_TAG" *.deb SHA256SUMS --title "XanMod ${TAG} ARM64 ${CHANNEL^^}" --notes-file RELEASE.md
           fi
           
-          # 核心修复：在清理循环最后增加 || true，防止找不到旧包时 grep 返回 1 导致流水线在最后一步报错！
           gh release list --limit 50 --json tagName -q '.[].tagName' | grep "\-arm64-${CHANNEL}$" | grep -v "^${RELEASE_TAG}$" | while read -r old_tag; do
             gh release delete "$old_tag" --cleanup-tag -y || true
           done || true
