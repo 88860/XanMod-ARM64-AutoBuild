@@ -35,10 +35,7 @@ jobs:
           commit=""
           for p in $(seq 1 50); do
             res="$(curl -fsSL --retry 5 "https://gitlab.com/api/v4/projects/xanmod%2Flinux/releases?order_by=released_at&sort=desc&per_page=100&page=$p")"
-            
-            # 核心修复：使用 " + $ch + " 纯字符串拼接，彻底消灭正则字符串中的括号，百分百物理免疫括号报错！
             IFS=$'\t' read -r t c < <(jq -r --arg ch "$CHANNEL" 'limit(1; .[] | select(.upcoming_release == false and (.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-xanmod[0-9]+$")) and any(.assets.links[]?; (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/" + $ch + "/[^/]+/?$"))) | [.tag_name, .commit.id] | @tsv)' <<< "$res") || true
-            
             [[ -n "$t" ]] && { tag="$t"; commit="$c"; break; }
             [[ "$(jq 'length' <<< "$res")" -lt 100 ]] && break
           done
@@ -50,7 +47,7 @@ jobs:
           build=true
           if gh release view "$rel_tag" >/dev/null 2>&1; then
             assets="$(gh release view "$rel_tag" --json assets --jq '.assets[].name')"
-            grep -Eq '^linux-image-.*\.deb$' <<< "$assets" && grep -Eq '^linux-headers-.*\.deb$' <<< "$assets" && grep -Eq '^linux-libc-dev.*\.deb$' <<< "$assets" && grep -Fxq 'SHA256SUMS' <<< "$assets" && build=false || true
+            grep -E '^linux-image-.*\.deb$' <<< "$assets" >/dev/null && grep -E '^linux-headers-.*\.deb$' <<< "$assets" >/dev/null && grep -E '^linux-libc-dev.*\.deb$' <<< "$assets" >/dev/null && grep -Fx 'SHA256SUMS' <<< "$assets" >/dev/null && build=false || true
           fi
           echo "build_needed=$build" >> "$GITHUB_OUTPUT"
 
@@ -79,10 +76,10 @@ jobs:
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Cache
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
           path: .ccache
           key: ${{ runner.os }}-arm64-${{ env.CHANNEL }}-clang${{ env.LLVM_VER }}-${{ env.TAG }}
@@ -164,10 +161,14 @@ jobs:
           cd dist
           
           [[ "$(dpkg-deb --field "$img" Package)" == *"-arm64-${CHANNEL}" ]] || exit 1
-          [[ "$(echo "$(dpkg-deb --field "$img" Version)" | tr -d '-~_+.')" == *"$(echo "$TAG" | tr -d '-~_+.')"* ]] || exit 1
-          dpkg-deb --contents "$img" | grep -q '/boot/vmlinuz-' || exit 1
-          dpkg-deb --contents "$img" | grep -q '/lib/modules/' || exit 1
-          dpkg-deb --contents "$hdr" | grep -q '/usr/src/linux-headers-' || exit 1
+          
+          # 核心修复：把 - 放到 tr 参数的最后面
+          [[ "$(echo "$(dpkg-deb --field "$img" Version)" | tr -d '~_+.-')" == *"$(echo "$TAG" | tr -d '~_+.-')"* ]] || exit 1
+          
+          # 核心修复：替换 grep -q，防止 Broken pipe 报错
+          dpkg-deb --contents "$img" | grep '/boot/vmlinuz-' >/dev/null || exit 1
+          dpkg-deb --contents "$img" | grep '/lib/modules/' >/dev/null || exit 1
+          dpkg-deb --contents "$hdr" | grep '/usr/src/linux-headers-' >/dev/null || exit 1
           
           mkdir verify-image
           dpkg-deb --extract "$img" verify-image
