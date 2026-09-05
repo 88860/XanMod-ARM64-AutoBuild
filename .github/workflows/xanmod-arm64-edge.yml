@@ -76,10 +76,10 @@ jobs:
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Cache
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
           path: .ccache
           key: ${{ runner.os }}-arm64-${{ env.CHANNEL }}-clang${{ env.LLVM_VER }}-${{ env.TAG }}
@@ -161,11 +161,8 @@ jobs:
           cd dist
           
           [[ "$(dpkg-deb --field "$img" Package)" == *"-arm64-${CHANNEL}" ]] || exit 1
-          
-          # 核心修复：把 - 放到 tr 参数的最后面
           [[ "$(echo "$(dpkg-deb --field "$img" Version)" | tr -d '~_+.-')" == *"$(echo "$TAG" | tr -d '~_+.-')"* ]] || exit 1
           
-          # 核心修复：替换 grep -q，防止 Broken pipe 报错
           dpkg-deb --contents "$img" | grep '/boot/vmlinuz-' >/dev/null || exit 1
           dpkg-deb --contents "$img" | grep '/lib/modules/' >/dev/null || exit 1
           dpkg-deb --contents "$hdr" | grep '/usr/src/linux-headers-' >/dev/null || exit 1
@@ -192,6 +189,7 @@ jobs:
             gh release create "$RELEASE_TAG" *.deb SHA256SUMS --title "XanMod ${TAG} ARM64 ${CHANNEL^^}" --notes-file RELEASE.md
           fi
           
+          # 核心修复：在清理循环最后增加 || true，防止找不到旧包时 grep 返回 1 导致流水线在最后一步报错！
           gh release list --limit 50 --json tagName -q '.[].tagName' | grep "\-arm64-${CHANNEL}$" | grep -v "^${RELEASE_TAG}$" | while read -r old_tag; do
             gh release delete "$old_tag" --cleanup-tag -y || true
-          done
+          done || true
