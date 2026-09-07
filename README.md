@@ -8,4 +8,5 @@
 
 ### 下载与安装
 ```bash
-curl -sSL https://raw.githubusercontent.com/88860/XanMod-ARM64-AutoBuild/main/xanmod-main-install.sh | bash
+curl -sSL -o /tmp/xanmod-install.sh https://raw.githubusercontent.com/88860/XanMod-ARM64-AutoBuild/main/xanmod-main-install.sh && bash /tmp/xanmod-install.sh; rm -f /tmp/xanmod-install.sh
+
