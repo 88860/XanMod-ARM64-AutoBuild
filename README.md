@@ -11,11 +11,5 @@
 
 ## 下载与安装
 
-1. 访问本仓库的 Releases 页面。
-2. 选择你需要的版本（EDGE / MAIN / LTS），下载对应的 3 个 .deb 文件：
-   * linux-image-*.deb
-   * linux-headers-*.deb
-   * linux-libc-dev-*.deb
-3. 在终端中执行安装：
-   ```bash
-   sudo dpkg -i *.deb
+   curl -sSL https://raw.githubusercontent.com/88860/XanMod-ARM64-AutoBuild/main/xanmod-main-install.sh | bash
+
