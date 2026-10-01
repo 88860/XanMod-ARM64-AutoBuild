@@ -6,7 +6,7 @@
 * **三通道同步**：全自动追踪并编译 XanMod 的 EDGE、MAIN、LTS 最新版本。
 * **开箱即用**：提供标准 Debian 打包（.deb），极致精简剥离无用调试符号。
 
-### 下载与安装
+### 下载与安装 MAIN
 ```bash
 curl -sSL -o /tmp/xanmod-install.sh https://raw.githubusercontent.com/88860/XanMod-ARM64-AutoBuild/main/xanmod-main-install.sh && bash /tmp/xanmod-install.sh; rm -f /tmp/xanmod-install.sh
 
