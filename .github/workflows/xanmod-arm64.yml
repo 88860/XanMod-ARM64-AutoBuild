@@ -16,7 +16,7 @@ on:
       enable_btf:
         description: 'Enable DEBUG_INFO_BTF (DWARF4 + BTF; uses more runner disk)'
         required: false
-        default: false
+        default: true
         type: boolean
   schedule:
     - cron: '37 3 * * *'
@@ -126,7 +126,7 @@ jobs:
       TAG: ${{ matrix.tag }}
       EXPECTED_COMMIT: ${{ matrix.commit }}
       RELEASE_TAG: ${{ matrix.release_tag }}
-      ENABLE_BTF: ${{ inputs.enable_btf == true }}
+      ENABLE_BTF: ${{ github.event_name != 'workflow_dispatch' || inputs.enable_btf == true }}
     steps:
       - name: Setup
         env:
@@ -138,12 +138,15 @@ jobs:
           sudo apt-get install -y --no-install-recommends curl wget ca-certificates gnupg lsb-release software-properties-common
           curl -fsSL --retry 5 --retry-delay 2 https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
           sudo bash /tmp/llvm.sh "$LLVM_VER"
+          sudo apt-get purge -y "lldb-$LLVM_VER" "clangd-$LLVM_VER" || true
+          sudo apt-get autoremove -y --purge
           sudo apt-get install -y --no-install-recommends build-essential bc bison flex fakeroot kmod cpio lz4 xz-utils zstd clang-$LLVM_VER lld-$LLVM_VER llvm-$LLVM_VER rsync libelf-dev libssl-dev libdw-dev zlib1g-dev debhelper dpkg-dev dwarves pkg-config python3 binutils openssl
           for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-link; do
             sudo ln -sf "/usr/bin/$t-$LLVM_VER" "/usr/bin/$t"
           done
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
+          df -h
 
       - name: Config & Build
         env:
@@ -176,10 +179,8 @@ jobs:
 
           make "${MAKE_ARGS[@]}" defconfig
 
-          # Only collect generic + arm64 Kconfig files so arch-specific x86/riscv symbols are excluded
           find . \( -path './arch/*' -a ! -path './arch/arm64/*' \) -prune -o -name 'Kconfig*' -type f -print > kconfig.files
 
-          # Port all supported XanMod options plus choice-group overrides and safe debug-off flags
           python3 - kconfig.files "$xanmod_conf" > xanmod.arm64.fragment <<'PYEOF'
           import re, sys
 
@@ -221,8 +222,6 @@ jobs:
               elif line.startswith("# CONFIG_") and line.endswith(" is not set"):
                   xm_unset.add(line[2:-len(" is not set")])
 
-          # For any Kconfig choice where XanMod selected an ARM64-valid =y winner,
-          # also emit the disabled choice siblings (except DEBUG_INFO_*, managed explicitly below)
           choice_unsets = set()
           for grp in choice_groups:
               if any(sym in arm_syms and xm_set.get(sym) == "y" for sym in grp):
@@ -254,7 +253,6 @@ jobs:
                       print(line)
           PYEOF
 
-          # Preserve arm64 defconfig built-in (=y) drivers (KVM, VIRTIO_*, etc.) while applying all XanMod optimizations
           ./scripts/kconfig/merge_config.sh -m -y .config xanmod.arm64.fragment
 
           rm -f localversion*
@@ -263,8 +261,8 @@ jobs:
           ./scripts/config --disable LOCALVERSION_AUTO
 
           if [[ "$ENABLE_BTF" == "true" ]]; then
-            ./scripts/config -d DEBUG_INFO_NONE -d DEBUG_INFO_DWARF5 -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT -d DEBUG_INFO_SPLIT -d DEBUG_INFO_REDUCED || true
-            ./scripts/config -e DEBUG_INFO -e DEBUG_INFO_DWARF4 -e DEBUG_INFO_BTF -e DEBUG_INFO_BTF_MODULES || true
+            ./scripts/config -d DEBUG_INFO_NONE -d DEBUG_INFO_DWARF5 -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT -d DEBUG_INFO_SPLIT -d DEBUG_INFO_REDUCED -d DEBUG_INFO_COMPRESSED_ZLIB -d DEBUG_INFO_COMPRESSED_ZSTD || true
+            ./scripts/config -e DEBUG_INFO -e DEBUG_INFO_DWARF4 -e DEBUG_INFO_COMPRESSED_NONE -e DEBUG_INFO_BTF -e DEBUG_INFO_BTF_MODULES || true
           else
             for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do
               ./scripts/config -d "$dbg" || true
@@ -274,6 +272,9 @@ jobs:
 
           make "${MAKE_ARGS[@]}" olddefconfig
           grep -q '^CONFIG_CC_IS_CLANG=y$' .config || exit 1
+          if [[ "$ENABLE_BTF" == "true" ]]; then
+            grep -Fxq 'CONFIG_DEBUG_INFO_BTF=y' .config || { echo "CONFIG_DEBUG_INFO_BTF=y failed to enable" >&2; exit 1; }
+          fi
           make "${MAKE_ARGS[@]}" syncconfig
 
           {
@@ -295,13 +296,17 @@ jobs:
               CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=y \
               CONFIG_ZSWAP_DEFAULT_ON=y \
               CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y \
-              CONFIG_HZ_250=y; do
+              CONFIG_HZ_250=y \
+              CONFIG_DEBUG_INFO_BTF=y \
+              CONFIG_DEBUG_INFO_BTF_MODULES=y; do
               in_frag="absent"
               in_final="no"
               grep -Fxq "$opt" xanmod.arm64.fragment && in_frag="present" || true
               grep -Fxq "$opt" .config && in_final="yes" || true
               echo "| \`$opt\` | $in_frag | $in_final |"
-              if [[ "$in_frag" == "present" && "$in_final" != "yes" ]]; then
+              if [[ "$in_frag" == "present" && "$in_final" != "yes" && "$ENABLE_BTF" == "true" ]]; then
+                echo "::warning::XanMod option $opt was requested in fragment but did not survive olddefconfig"
+              elif [[ "$in_frag" == "present" && "$in_final" != "yes" && "$opt" != CONFIG_DEBUG_INFO_BTF* ]]; then
                 echo "::warning::XanMod option $opt was requested in fragment but did not survive olddefconfig"
               fi
             done
