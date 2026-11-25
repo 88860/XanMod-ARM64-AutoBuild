@@ -42,42 +42,40 @@
 ## 构建流水线
 
 
-### 三通道并行构建
+### 三通道统一自动构建
 
-平台维护三个独立的 GitHub Actions 工作流，分别对应 XanMod 上游的 **EDGE**、**MAIN**、**LTS** 通道。每条流水线独立运行，互不阻塞：
+平台维护一个统一的 GitHub Actions 工作流（`xanmod-arm64.yml`），通过动态矩阵并行追踪并构建 XanMod 上游的 **EDGE**、**MAIN**、**LTS** 三个通道，各通道构建彼此独立互不阻塞（`fail-fast: false`）：
 
-| 工作流 | 上游通道 | 触发方式 | 定时 (UTC) |
+| 工作流 | 覆盖通道 | 触发方式 | 定时 (UTC) |
 | :--- | :--- | :--- | :--- |
-| `xanmod-arm64-edge.yml` | EDGE | `workflow_dispatch` + `schedule` | 每日 03:37 |
-| `xanmod-arm64-main.yml` | MAIN | `workflow_dispatch` + `schedule` | 每日 03:37 |
-| `xanmod-arm64-lts.yml` | LTS | `workflow_dispatch` + `schedule` | 每日 03:37 |
+| `xanmod-arm64.yml` | `edge` / `main` / `lts` | `workflow_dispatch`（可选 `all` 或单通道、`enable_btf`）+ `schedule` | 每日 03:37 |
 
 
 ### 构建阶段拆解
 
-每条流水线分为三个顺序执行的阶段：
+流水线分为预检与矩阵构建两个阶段：
 
 **1. Preflight（预检）**
-- 从 GitLab XanMod Linux 仓库拉取最新 Release 列表
-- 筛选出符合通道版本号格式（`[0-9]+.[0-9]+.[0-9]+-xanmod[0-9]+`）且包含 SourceForge 资产链接的稳定版本
+- 单次分页请求 GitLab XanMod Linux 仓库 Release 列表，解析目标通道的最新稳定版
+- 筛选符合通道版本号格式（`[0-9]+.[0-9]+(.[0-9]+)?-xanmod[0-9]+`）且包含对应 SourceForge 资产链接的稳定版本
 - 提取对应 Git Commit ID 作为构建基准
-- 检查 GitHub Release 是否已存在并包含完整 deb 资产（`linux-image`、`linux-headers`、`linux-libc-dev`、`SHA256SUMS`），若齐全则跳过本次构建
+- 检查 GitHub Release 是否已存在并包含完整 deb 资产（`linux-image`、`linux-headers`、`linux-libc-dev`、`SHA256SUMS`），仅将需要构建的通道加入构建矩阵
 
 **2. Build（原生编译）**
 - 运行器：`ubuntu-24.04-arm`（原生 aarch64，非交叉编译）
-- 工具链：LLVM/Clang 22（`clang`、`lld`、`llvm-ar` 等），启用 `ccache` 加速二次构建
-- 内核源码：从 `gitlab.com/xanmod/linux` 按指定 Tag 克隆，并校验 Commit ID 一致性
-- 配置合并：将 XanMod x86_64 基础配置与 ARM64 Kconfig 符号集合取交集，生成 `xanmod.arm64.fragment`，并通过 `merge_config.sh` 合并进内核 `.config`
-- 关键配置调整：`CONFIG_KVM=y`，禁用 `DEBUG_INFO*` 系列，启用 `DEBUG_INFO_NONE`，`LOCALVERSION_AUTO` 禁用
-- 编译参数：`ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-`，使用 `ccache clang --target=aarch64-linux-gnu`，链接器为 `ld.lld`
-- 输出验证：`make kernelrelease` 必须等于 `<TAG>-arm64-<CHANNEL>`，确保版本字符串一致
-- 打包：`bindeb-pkg` 目标，启用 `skipdbg=true`、`INSTALL_MOD_STRIP=1`、`KDEB_COMPRESS=gzip`
+- 工具链：LLVM/Clang 22（`clang`、`lld`、`llvm-ar` 等），原生编译（不传 `CROSS_COMPILE`，避免 `linux-headers` 混编 GCC）
+- 内核源码：从 `gitlab.com/xanmod/linux` 按指定 Tag 浅克隆，并校验 Commit ID 一致性
+- 配置移植：在 `arm64 defconfig` 基础上，筛选通用与 `arm64` Kconfig 符号，从 XanMod `CONFIGS/x86_64/config` 提取全量可用优化项及安全的调度/抢占/内存/HZ 单选组禁用项，使用 `merge_config.sh -m -y` 合并（保留 ARM64 内建 `=y` 驱动不降级）
+- 关键配置调整：保留上游 `localversion` 并设置 `CONFIG_LOCALVERSION="-arm64"`，`LOCALVERSION_AUTO` 禁用；默认启用 `DEBUG_INFO_NONE`（手动触发时可通过 `enable_btf` 开启 `DWARF4 + BTF`）
+- 编译参数：`ARCH=arm64 LLVM=1`
+- 输出验证：`make kernelrelease` 必须等于 `<kernel_version>-arm64-<xanmod_suffix>`（与官方除架构外完全同步，如 `7.3.6-arm64-xanmod1`），并在 Job Summary 输出关键优化项生效状态
+- 打包：`bindeb-pkg` 目标，设置 `KDEB_PKGVERSION="<kernelrelease>-0~<YYYYMMDD>.g<7位SHA>"`，`KDEB_COMPRESS=xz`
 
 **3. Publish（发布）**
 - 资产校验：通过 `dpkg-deb` 检查 `linux-image` 包包含 `/boot/vmlinuz-` 和 `/lib/modules/`，`linux-headers` 包包含 `/usr/src/linux-headers-`
 - 配置比对：提取 deb 内的 `boot/config-<version>` 与构建时的 `.config.final` 做二进制比对 (`cmp`)，确保运行时配置与构建配置完全一致
 - 签名：对所有 `.deb` 生成 `SHA256SUMS`
-- 发布：通过 `gh release` 创建或覆盖 GitHub Release，附带 `RELEASE.md` 说明（架构、通道、上游链接、编译器版本）
+- 发布：通过 `gh release` 创建或覆盖 GitHub Release（Tag 为 `<kernelrelease>-<channel>` 以隔离三通道），附带 `RELEASE.md` 说明（架构、通道、内核版本、包版本、上游链接、编译器版本）
 - 清理：删除同通道下除当前版本外的旧 Release 及其 Git 标签
 
 
@@ -90,9 +88,9 @@
 
 | 产物 | 说明 |
 | :--- | :--- |
-| `linux-image-*-arm64-<channel>.deb` | 内核镜像与模块，包含 `/boot/vmlinuz-` 与 `/lib/modules/` |
-| `linux-headers-*-arm64-<channel>.deb` | 内核头文件，用于编译外部模块 |
-| `linux-libc-dev_*.deb` | 内核 libc 开发头文件 |
+| `linux-image-<ver>-arm64-xanmod<N>_..._arm64.deb` | 内核镜像与模块，包含 `/boot/vmlinuz-` 与 `/lib/modules/` |
+| `linux-headers-<ver>-arm64-xanmod<N>_..._arm64.deb` | 内核头文件，用于编译外部模块 |
+| `linux-libc-dev_<ver>-arm64-xanmod<N>-..._arm64.deb` | 内核 libc 开发头文件 |
 | `SHA256SUMS` | 所有 `.deb` 的 SHA-256 校验和 |
 | `RELEASE.md` | 发布说明（架构、通道、上游 Tag、编译器版本） |
 

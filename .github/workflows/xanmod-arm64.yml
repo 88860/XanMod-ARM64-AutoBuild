@@ -1,0 +1,379 @@
+name: XanMod ARM64 Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Channel to build (all / edge / main / lts)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - edge
+          - main
+          - lts
+      enable_btf:
+        description: 'Enable DEBUG_INFO_BTF (DWARF4 + BTF; uses more runner disk)'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '37 3 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xanmod-arm64-${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  LLVM_VER: 22
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      has_builds: ${{ steps.check.outputs.has_builds }}
+      matrix: ${{ steps.check.outputs.matrix }}
+    steps:
+      - name: Preflight
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_CHANNEL: ${{ inputs.channel || 'all' }}
+        run: |
+          set -euo pipefail
+          if [[ "$INPUT_CHANNEL" == "all" ]]; then
+            channels=(edge main lts)
+          else
+            channels=("$INPUT_CHANNEL")
+          fi
+
+          declare -A found_tag found_commit
+          for p in $(seq 1 50); do
+            res="$(curl -fsSL --retry 5 --retry-delay 2 "https://gitlab.com/api/v4/projects/xanmod%2Flinux/releases?order_by=released_at&sort=desc&per_page=100&page=$p")"
+            for ch in "${channels[@]}"; do
+              [[ -n "${found_tag[$ch]:-}" ]] && continue
+              IFS=$'\t' read -r t c < <(jq -r --arg ch "$ch" '
+                limit(1; .[]
+                  | select(.upcoming_release == false
+                    and (.tag_name | test("^[0-9]+\\.[0-9]+(\\.[0-9]+)?-xanmod[0-9]+$"))
+                    and any(.assets.links[]?; (.url // "") | test("sourceforge\\.net/projects/xanmod/files/releases/" + $ch + "/[^/]+/?$")))
+                  | [.tag_name, .commit.id] | @tsv)
+              ' <<< "$res") || true
+              if [[ -n "${t:-}" && -n "${c:-}" ]]; then
+                found_tag[$ch]="$t"
+                found_commit[$ch]="$c"
+              fi
+            done
+            all_found=true
+            for ch in "${channels[@]}"; do
+              [[ -n "${found_tag[$ch]:-}" ]] || { all_found=false; break; }
+            done
+            $all_found && break
+            [[ "$(jq 'length' <<< "$res")" -lt 100 ]] && break
+          done
+
+          include_json="[]"
+          for ch in "${channels[@]}"; do
+            tag="${found_tag[$ch]:-}"
+            commit="${found_commit[$ch]:-}"
+            [[ -n "$tag" && -n "$commit" ]] || { echo "Failed to resolve upstream release for channel: $ch" >&2; exit 1; }
+            kernel_rel="${tag%%-*}-arm64-${tag#*-}"
+            rel_tag="${kernel_rel}-${ch}"
+            build=true
+            if assets="$(gh release view "$rel_tag" --json assets --jq '.assets[].name' 2>/dev/null)"; then
+              if grep -E "^linux-image-${kernel_rel//./\\.}_.*_arm64\.deb$" <<< "$assets" >/dev/null \
+                && grep -E "^linux-headers-${kernel_rel//./\\.}_.*_arm64\.deb$" <<< "$assets" >/dev/null \
+                && grep -E '^linux-libc-dev_.*_arm64\.deb$' <<< "$assets" >/dev/null \
+                && grep -Fx 'SHA256SUMS' <<< "$assets" >/dev/null; then
+                build=false
+              fi
+            fi
+            echo "Channel ${ch}: tag=${tag}, kernel_rel=${kernel_rel}, release_tag=${rel_tag}, build_needed=${build}"
+            if [[ "$build" == "true" ]]; then
+              include_json="$(jq -cn \
+                --argjson arr "$include_json" \
+                --arg ch "$ch" \
+                --arg tag "$tag" \
+                --arg commit "$commit" \
+                --arg rtag "$rel_tag" \
+                '$arr + [{"channel": $ch, "tag": $tag, "commit": $commit, "release_tag": $rtag}]')"
+            fi
+          done
+
+          has_builds="false"
+          if [[ "$(jq 'length' <<< "$include_json")" -gt 0 ]]; then
+            has_builds="true"
+          fi
+          echo "has_builds=$has_builds" >> "$GITHUB_OUTPUT"
+          echo "matrix=$include_json" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.channel }})
+    needs: preflight
+    if: needs.preflight.outputs.has_builds == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.preflight.outputs.matrix) }}
+    env:
+      CHANNEL: ${{ matrix.channel }}
+      TAG: ${{ matrix.tag }}
+      EXPECTED_COMMIT: ${{ matrix.commit }}
+      RELEASE_TAG: ${{ matrix.release_tag }}
+      ENABLE_BTF: ${{ inputs.enable_btf == true }}
+    steps:
+      - name: Setup
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == "aarch64" && "$(dpkg --print-architecture)" == "arm64" ]] || exit 1
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl wget ca-certificates gnupg lsb-release software-properties-common
+          curl -fsSL --retry 5 --retry-delay 2 https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          sudo bash /tmp/llvm.sh "$LLVM_VER"
+          sudo apt-get install -y --no-install-recommends build-essential bc bison flex fakeroot kmod cpio lz4 xz-utils zstd clang-$LLVM_VER lld-$LLVM_VER llvm-$LLVM_VER rsync libelf-dev libssl-dev libdw-dev zlib1g-dev debhelper dpkg-dev dwarves pkg-config python3 binutils openssl
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip llvm-link; do
+            sudo ln -sf "/usr/bin/$t-$LLVM_VER" "/usr/bin/$t"
+          done
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
+
+      - name: Config & Build
+        env:
+          LLVM: 1
+          KDEB_COMPRESS: xz
+          KBUILD_BUILD_USER: github-actions
+          KBUILD_BUILD_HOST: github-arm64-native
+          DEBFULLNAME: github-actions
+          DEBEMAIL: github-actions@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          MAKE_ARGS=(
+            ARCH=arm64
+            LLVM=1
+          )
+
+          git clone --depth=1 --branch "$TAG" https://gitlab.com/xanmod/linux.git kernel
+          cd kernel
+          [[ "$(git rev-parse HEAD^{commit})" == "$EXPECTED_COMMIT" ]] || exit 1
+          commit_short="$(git rev-parse --short=7 HEAD)"
+          commit_date="$(git show -s --date=format:'%Y%m%d' --format=%cd)"
+          rm -rf .git
+
+          if [[ -f "CONFIGS/x86_64/config" ]]; then
+            xanmod_conf="CONFIGS/x86_64/config"
+          else
+            xanmod_conf=$(find CONFIGS -type f -name "config" | grep -iE 'x86_64|x86-64-v' | head -n 1 || true)
+          fi
+          [[ -f "$xanmod_conf" ]] || exit 1
+
+          make "${MAKE_ARGS[@]}" defconfig
+
+          # Only collect generic + arm64 Kconfig files so arch-specific x86/riscv symbols are excluded
+          find . \( -path './arch/*' -a ! -path './arch/arm64/*' \) -prune -o -name 'Kconfig*' -type f -print > kconfig.files
+
+          # Port all supported XanMod options plus choice-group overrides and safe debug-off flags
+          python3 - kconfig.files "$xanmod_conf" > xanmod.arm64.fragment <<'PYEOF'
+          import re, sys
+
+          kconfig_list_file, xanmod_conf_file = sys.argv[1], sys.argv[2]
+          arm_syms = set()
+          choice_groups = []
+
+          with open(kconfig_list_file) as fl:
+              kfiles = [line.strip() for line in fl if line.strip()]
+
+          for kf in kfiles:
+              in_choice = False
+              cur_choice = set()
+              with open(kf, errors="replace") as f:
+                  for raw in f:
+                      m_sym = re.match(r"^\s*(?:config|menuconfig)\s+([A-Za-z0-9_]+)", raw)
+                      if m_sym:
+                          sym = "CONFIG_" + m_sym.group(1)
+                          arm_syms.add(sym)
+                          if in_choice:
+                              cur_choice.add(sym)
+                          continue
+                      if re.match(r"^\s*choice\b", raw):
+                          in_choice = True
+                          cur_choice = set()
+                      elif in_choice and re.match(r"^\s*endchoice\b", raw):
+                          if cur_choice:
+                              choice_groups.append(cur_choice)
+                          in_choice = False
+                          cur_choice = set()
+
+          xm_lines = open(xanmod_conf_file, errors="replace").read().splitlines()
+          xm_set = {}
+          xm_unset = set()
+          for line in xm_lines:
+              if line.startswith("CONFIG_") and "=" in line:
+                  k, v = line.split("=", 1)
+                  xm_set[k] = v
+              elif line.startswith("# CONFIG_") and line.endswith(" is not set"):
+                  xm_unset.add(line[2:-len(" is not set")])
+
+          # For any Kconfig choice where XanMod selected an ARM64-valid =y winner,
+          # also emit the disabled choice siblings (except DEBUG_INFO_*, managed explicitly below)
+          choice_unsets = set()
+          for grp in choice_groups:
+              if any(sym in arm_syms and xm_set.get(sym) == "y" for sym in grp):
+                  for sym in grp:
+                      if sym in xm_unset and sym in arm_syms and not sym.startswith("CONFIG_DEBUG_INFO"):
+                          choice_unsets.add(sym)
+
+          safe_unsets = {
+              "CONFIG_DEBUG_PREEMPT",
+              "CONFIG_PREEMPT_TRACER",
+              "CONFIG_PREEMPTIRQ_DELAY_TEST",
+              "CONFIG_RCU_LAZY_DEFAULT_OFF",
+              "CONFIG_RCU_NOCB_CPU_DEFAULT_ALL",
+              "CONFIG_INIT_ON_FREE_DEFAULT_ON",
+              "CONFIG_WERROR",
+              "CONFIG_OBJTOOL_WERROR",
+          }
+
+          for line in xm_lines:
+              if line.startswith("CONFIG_") and "=" in line:
+                  k = line.split("=", 1)[0]
+                  if k == "CONFIG_NR_CPUS":
+                      continue
+                  if k in arm_syms:
+                      print(line)
+              elif line.startswith("# CONFIG_") and line.endswith(" is not set"):
+                  k = line[2:-len(" is not set")]
+                  if k in choice_unsets or (k in safe_unsets and k in arm_syms):
+                      print(line)
+          PYEOF
+
+          # Preserve arm64 defconfig built-in (=y) drivers (KVM, VIRTIO_*, etc.) while applying all XanMod optimizations
+          ./scripts/kconfig/merge_config.sh -m -y .config xanmod.arm64.fragment
+
+          rm -f localversion*
+          printf '%s\n' "-${TAG#*-}" > localversion
+          ./scripts/config --set-str LOCALVERSION "-arm64"
+          ./scripts/config --disable LOCALVERSION_AUTO
+
+          if [[ "$ENABLE_BTF" == "true" ]]; then
+            ./scripts/config -d DEBUG_INFO_NONE -d DEBUG_INFO_DWARF5 -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT -d DEBUG_INFO_SPLIT -d DEBUG_INFO_REDUCED || true
+            ./scripts/config -e DEBUG_INFO -e DEBUG_INFO_DWARF4 -e DEBUG_INFO_BTF -e DEBUG_INFO_BTF_MODULES || true
+          else
+            for dbg in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT DEBUG_INFO_DWARF4 DEBUG_INFO_DWARF5; do
+              ./scripts/config -d "$dbg" || true
+            done
+            ./scripts/config -e DEBUG_INFO_NONE || true
+          fi
+
+          make "${MAKE_ARGS[@]}" olddefconfig
+          grep -q '^CONFIG_CC_IS_CLANG=y$' .config || exit 1
+          make "${MAKE_ARGS[@]}" syncconfig
+
+          {
+            echo "### XanMod ARM64 ${CHANNEL^^} (${TAG})"
+            echo ""
+            echo "| Optimization | Fragment | Final \`.config\` |"
+            echo "| :--- | :--- | :--- |"
+            for opt in \
+              CONFIG_PREEMPT_LAZY=y \
+              CONFIG_SCHED_CLASS_EXT=y \
+              CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y \
+              CONFIG_IOMMU_DEFAULT_DMA_LAZY=y \
+              CONFIG_RCU_LAZY=y \
+              CONFIG_TCP_CONG_BBR=y \
+              'CONFIG_DEFAULT_TCP_CONG="bbr"' \
+              CONFIG_NET_SCH_FQ=y \
+              'CONFIG_DEFAULT_NET_SCH="fq"' \
+              CONFIG_LRU_GEN_ENABLED=y \
+              CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=y \
+              CONFIG_ZSWAP_DEFAULT_ON=y \
+              CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y \
+              CONFIG_HZ_250=y; do
+              in_frag="absent"
+              in_final="no"
+              grep -Fxq "$opt" xanmod.arm64.fragment && in_frag="present" || true
+              grep -Fxq "$opt" .config && in_final="yes" || true
+              echo "| \`$opt\` | $in_frag | $in_final |"
+              if [[ "$in_frag" == "present" && "$in_final" != "yes" ]]; then
+                echo "::warning::XanMod option $opt was requested in fragment but did not survive olddefconfig"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          cp .config .config.final
+          expected_rel="${TAG%%-*}-arm64-${TAG#*-}"
+          kernel_rel="$(make -s "${MAKE_ARGS[@]}" kernelrelease)"
+          [[ "$kernel_rel" == "$expected_rel" ]] || exit 1
+          pkg_ver="${kernel_rel}-0~${commit_date}.g${commit_short}"
+          echo "KERNEL_RELEASE=${kernel_rel}" >> "$GITHUB_ENV"
+          echo "KDEB_PKGVERSION=${pkg_ver}" >> "$GITHUB_ENV"
+
+          make "${MAKE_ARGS[@]}" KDEB_PKGVERSION="${pkg_ver}" KDEB_COMPRESS=xz -j"$(nproc)" bindeb-pkg
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          dbg_pkgs=(*dbg*.deb *dbgsym*.deb)
+          ((${#dbg_pkgs[@]} == 0)) || exit 1
+          packages=(*.deb)
+          ((${#packages[@]} > 0)) || exit 1
+
+          img="" hdr="" libc=""
+          for deb in "${packages[@]}"; do
+            case "$(dpkg-deb --field "$deb" Package)" in
+              linux-image-*) [[ -z "$img" ]] && img="$(basename "$deb")" ;;
+              linux-headers-*) [[ -z "$hdr" ]] && hdr="$(basename "$deb")" ;;
+              linux-libc-dev) [[ -z "$libc" ]] && libc="$(basename "$deb")" ;;
+            esac
+            mv "$deb" dist/
+          done
+          [[ -n "$img" && -n "$hdr" && -n "$libc" ]] || exit 1
+          cd dist
+
+          [[ "$(dpkg-deb --field "$img" Package)" == "linux-image-${KERNEL_RELEASE}" ]] || exit 1
+          [[ "$(dpkg-deb --field "$hdr" Package)" == "linux-headers-${KERNEL_RELEASE}" ]] || exit 1
+          [[ "$(dpkg-deb --field "$img" Version)" == "$KDEB_PKGVERSION" ]] || exit 1
+
+          dpkg-deb --contents "$img" | grep "/boot/vmlinuz-${KERNEL_RELEASE}" >/dev/null || exit 1
+          dpkg-deb --contents "$img" | grep "/lib/modules/${KERNEL_RELEASE}/" >/dev/null || exit 1
+          dpkg-deb --contents "$hdr" | grep "/usr/src/linux-headers-${KERNEL_RELEASE}" >/dev/null || exit 1
+
+          mkdir verify-image
+          dpkg-deb --extract "$img" verify-image
+          [[ -f "verify-image/boot/config-${KERNEL_RELEASE}" ]] || exit 1
+          cmp -s "verify-image/boot/config-${KERNEL_RELEASE}" ../kernel/.config.final || exit 1
+          rm -rf verify-image
+
+          sha256sum *.deb > SHA256SUMS
+          sed 's/^          //' <<EOF > RELEASE.md
+          ## XanMod ARM64 ${CHANNEL^^}: $TAG
+          * **Architecture:** \`arm64\`
+          * **Channel:** ${CHANNEL^^}
+          * **Kernel Release:** \`${KERNEL_RELEASE}\`
+          * **Package Version:** \`${KDEB_PKGVERSION}\`
+          * **Upstream:** [GitLab XanMod Linux](https://gitlab.com/xanmod/linux/-/releases/$TAG)
+          * **Compiler:** Clang ${LLVM_VER}
+          * **Build:** GitHub Actions Native ARM64
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" *.deb SHA256SUMS --clobber
+            gh release edit "$RELEASE_TAG" --title "XanMod ${TAG} ARM64 ${CHANNEL^^}" --notes-file RELEASE.md
+          else
+            gh release create "$RELEASE_TAG" *.deb SHA256SUMS --title "XanMod ${TAG} ARM64 ${CHANNEL^^}" --notes-file RELEASE.md
+          fi
+
+          gh release list --limit 50 --json tagName -q '.[].tagName' | grep -E -- "-arm64(-[^-]+)?-${CHANNEL}$" | grep -Fxv "$RELEASE_TAG" | while read -r old_tag; do
+            gh release delete "$old_tag" --cleanup-tag -y || true
+          done || true

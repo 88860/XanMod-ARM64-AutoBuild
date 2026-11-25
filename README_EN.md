@@ -42,41 +42,39 @@
 ## Build Pipeline
 
 
-### Three Independent Build Channels
+### Unified Multi-Channel Build
 
-The platform maintains three standalone GitHub Actions workflows, one per XanMod upstream channel (**EDGE**, **MAIN**, **LTS**). Each runs on its own schedule and does not block the others:
+The platform maintains a single unified GitHub Actions workflow (`xanmod-arm64.yml`) using a dynamic matrix to track and build XanMod upstream's **EDGE**, **MAIN**, and **LTS** channels independently (`fail-fast: false`):
 
-| Workflow | Upstream Channel | Trigger | Schedule (UTC) |
+| Workflow | Channels | Trigger | Schedule (UTC) |
 | :--- | :--- | :--- | :--- |
-| `xanmod-arm64-edge.yml` | EDGE | `workflow_dispatch` + `schedule` | Daily 03:37 |
-| `xanmod-arm64-main.yml` | MAIN | `workflow_dispatch` + `schedule` | Daily 03:37 |
-| `xanmod-arm64-lts.yml` | LTS | `workflow_dispatch` + `schedule` | Daily 03:37 |
+| `xanmod-arm64.yml` | `edge` / `main` / `lts` | `workflow_dispatch` (`all` or single channel, `enable_btf`) + `schedule` | Daily 03:37 |
 
 
 ### Stage Breakdown
 
-Each pipeline executes three sequential stages:
+The pipeline executes preflight resolution followed by a parallel matrix build:
 
 **1. Preflight**
-- Polls GitLab `xanmod/linux` releases for the latest stable tag matching the version format (`[0-9]+.[0-9]+.[0-9]+-xanmod[0-9]+`) and containing SourceForge asset links for the target channel.
+- Polls GitLab `xanmod/linux` releases in a single pass for the latest stable tags matching `[0-9]+.[0-9]+(.[0-9]+)?-xanmod[0-9]+` with SourceForge links for each target channel.
 - Extracts the corresponding Git commit ID as the build baseline.
-- Checks whether a GitHub Release with the channel tag already exists and contains all required deb assets (`linux-image`, `linux-headers`, `linux-libc-dev`, `SHA256SUMS`). If complete, the build is skipped.
+- Checks whether the channel's GitHub Release already exists with all required deb assets (`linux-image`, `linux-headers`, `linux-libc-dev`, `SHA256SUMS`), and includes only channels needing a build in the matrix.
 
 **2. Build (Native Compilation)**
 - Runner: `ubuntu-24.04-arm` (native aarch64, no cross-compilation).
-- Toolchain: LLVM/Clang 22 (`clang`, `lld`, `llvm-ar`, etc.), with `ccache` for incremental build acceleration.
-- Kernel source: cloned from `gitlab.com/xanmod/linux` at the specified tag; commit ID is verified against the expected baseline.
-- Configuration merge: XanMod x86_64 base config is intersected with ARM64 Kconfig symbols to produce `xanmod.arm64.fragment`, then merged into `.config` via `merge_config.sh`.
-- Key config adjustments: `CONFIG_KVM=y`; `DEBUG_INFO*` families disabled; `DEBUG_INFO_NONE` enabled; `LOCALVERSION_AUTO` disabled.
-- Build flags: `ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu-`, compiler `ccache clang --target=aarch64-linux-gnu`, linker `ld.lld`.
-- Output validation: `make kernelrelease` must equal `<TAG>-arm64-<CHANNEL>` to guarantee version string consistency.
-- Packaging: `bindeb-pkg` target with `skipdbg=true`, `INSTALL_MOD_STRIP=1`, `KDEB_COMPRESS=gzip`.
+- Toolchain: LLVM/Clang 22 (`clang`, `lld`, `llvm-ar`, etc.), built natively without `CROSS_COMPILE` so `linux-headers` host tools stay purely Clang-built.
+- Kernel source: shallow-cloned from `gitlab.com/xanmod/linux` at the specified tag; commit ID is verified against the expected baseline.
+- Configuration port: intersects XanMod `CONFIGS/x86_64/config` with generic + `arm64` Kconfig symbols (plus safe optimization-choice disables), merged via `merge_config.sh -m -y` to preserve ARM64 built-in `=y` drivers.
+- Key config adjustments: upstream `localversion` preserved with `CONFIG_LOCALVERSION="-arm64"`; `LOCALVERSION_AUTO` disabled; `DEBUG_INFO_NONE` enabled by default (optional `enable_btf` dispatch input enables `DWARF4 + BTF`).
+- Build flags: `ARCH=arm64 LLVM=1`.
+- Output validation: `make kernelrelease` must equal `<kernel_version>-arm64-<xanmod_suffix>` (fully synced with upstream except architecture, e.g., `7.3.6-arm64-xanmod1`), and reports applied XanMod optimizations to the Job Summary.
+- Packaging: `bindeb-pkg` target with `KDEB_PKGVERSION="<kernelrelease>-0~<YYYYMMDD>.g<7-char-SHA>"` and `KDEB_COMPRESS=xz`.
 
 **3. Publish**
 - Asset validation: `dpkg-deb` checks that `linux-image` contains `/boot/vmlinuz-` and `/lib/modules/`, and `linux-headers` contains `/usr/src/linux-headers-`.
 - Config comparison: extracts `boot/config-<version>` from the built image and byte-compares (`cmp`) it against `.config.final`; any mismatch aborts the publish.
 - Signing: generates `SHA256SUMS` for all `.deb` artifacts.
-- Release: creates or overwrites the GitHub Release via `gh release`, attaching `RELEASE.md` (architecture, channel, upstream link, compiler version).
+- Release: creates or overwrites the GitHub Release via `gh release` (tagged `<kernelrelease>-<channel>` to isolate the three channels), attaching `RELEASE.md` (architecture, channel, kernel release, package version, upstream link, compiler version).
 - Cleanup: deletes previous releases and tags for the same channel, retaining only the latest.
 
 
@@ -89,9 +87,9 @@ Each successful build publishes the following assets to the corresponding channe
 
 | Artifact | Description |
 | :--- | :--- |
-| `linux-image-*-arm64-<channel>.deb` | Kernel image and modules, including `/boot/vmlinuz-` and `/lib/modules/` |
-| `linux-headers-*-arm64-<channel>.deb` | Kernel headers for out-of-tree module compilation |
-| `linux-libc-dev_*.deb` | Kernel libc development headers |
+| `linux-image-<ver>-arm64-xanmod<N>_..._arm64.deb` | Kernel image and modules, including `/boot/vmlinuz-` and `/lib/modules/` |
+| `linux-headers-<ver>-arm64-xanmod<N>_..._arm64.deb` | Kernel headers for out-of-tree module compilation |
+| `linux-libc-dev_<ver>-arm64-xanmod<N>-..._arm64.deb` | Kernel libc development headers |
 | `SHA256SUMS` | SHA-256 checksums for all `.deb` packages |
 | `RELEASE.md` | Release notes (architecture, channel, upstream tag, compiler version) |
 

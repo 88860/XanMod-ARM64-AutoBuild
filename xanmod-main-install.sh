@@ -81,22 +81,20 @@ elif [ "$ARCH" = "arm64" ]; then
             | select(.draft == false)
             | select(.prerelease == false)
             | select(
-                ((.tag_name // "") | ascii_downcase | contains("main"))
+                ((.tag_name // "") | ascii_downcase | endswith("-main"))
                 or
-                ((.name // "") | ascii_downcase | contains("main"))
-                or
-                ((.body // "") | ascii_downcase | contains("main"))
+                ((.name // "") | ascii_downcase | contains("arm64 main"))
             )
             | .tag_name
         ' |
         head -n1
     )
     [ -n "$RELEASE_TAG" ] || die "没有找到 ARM64 MAIN Release"
-    ONLINE_VERSION="$RELEASE_TAG"
+    ONLINE_VERSION="${RELEASE_TAG%-main}"
 
     INSTALLED_XANMOD=$(get_xanmod_kernel)
     if [ -n "$INSTALLED_XANMOD" ]; then
-        INSTALLED_VERSION="${INSTALLED_XANMOD%-arm64-main}"
+        INSTALLED_VERSION="$INSTALLED_XANMOD"
     fi
 fi
 
