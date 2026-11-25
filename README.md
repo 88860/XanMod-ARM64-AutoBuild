@@ -11,7 +11,7 @@
 
 **简体中文** | [English](README_EN.md)
 
-[项目概览](#项目概览) · [特性说明](#特性说明) · [命名规范与上游对齐](#命名规范与上游对齐) · [x86_64 配置移植机制](#x86_64-配置移植机制) · [构建流水线](#构建流水线) · [发布产物与手动安装](#发布产物与手动安装) · [安装脚本](#安装脚本xanmod-installsh) · [安全与校验](#安全与校验) · [常见问题与注意事项](#常见问题与注意事项)
+[项目概览](#项目概览) · [特性说明](#特性说明) · [命名规范与上游对齐](#命名规范与上游对齐) · [x86_64 配置移植机制](#x86_64-配置移植机制) · [构建流水线](#构建流水线) · [发布产物与安装方式](#发布产物与安装方式) · [安装脚本](#安装脚本xanmod-installsh) · [安全与校验](#安全与校验) · [常见问题与注意事项](#常见问题与注意事项)
 
 </div>
 
@@ -34,6 +34,7 @@
 * **Kconfig 作用域与互斥组移植**：以 `arm64 defconfig` 为基础配置，按 Kconfig 架构作用域与 `choice ... endchoice` 互斥组规则移植 XanMod 的调度、抢占、网络、内存、I/O 与加固选项，保留 ARM64 引导与基础设备驱动。
 * **原生 LLVM/Clang 构建**：全程使用 `ARCH=arm64 LLVM=1`（`clang-22`、`ld.lld-22`、`llvm-ar-22` 等），不设置 `CROSS_COMPILE`，避免 `linux-headers` 阶段生成 GCC 主机工具。
 * **构建后验证**：发布前执行上游 Commit SHA 核对、`.config.final` 字节比对、`dpkg-deb` 包结构检查及 `SHA256SUMS` 生成。
+* **签名 APT 仓库与元包**：为 `main` / `edge` / `lts` 生成对应通道元包（`linux-xanmod[-edge|-lts]-arm64`），并通过 GitHub Pages 发布 GPG 签名 APT 仓库以支持 `apt update && apt upgrade` 自动升级。
 
 ---
 
@@ -50,7 +51,7 @@
 | **内核镜像包 (`Package`)** | `linux-image-7.3.6-x64v3-xanmod1` | `linux-image-7.3.6-arm64-xanmod1` |
 | **头文件包 (`Package`)** | `linux-headers-7.3.6-x64v3-xanmod1` | `linux-headers-7.3.6-arm64-xanmod1` |
 | **`.deb` 文件名示例** | `linux-image-7.3.6-x64v3-xanmod1_7.3.6-x64v3-xanmod1-0~20261123.g6b041b1_amd64.deb` | `linux-image-7.3.6-arm64-xanmod1_7.3.6-arm64-xanmod1-0~20261123.g6b041b1_arm64.deb` |
-| **通道隔离标识** | APT 元包（`linux-xanmod[-edge\|-lts]-x64v3`）与 SourceForge 分目录 | GitHub Release Tag 末尾附加通道名（`<KERNELRELEASE>-<channel>`） |
+| **通道隔离标识** | APT 元包（`linux-xanmod[-edge\|-lts]-x64v3`）与 SourceForge 分目录 | APT 元包（`linux-xanmod[-edge\|-lts]-arm64`）及 Release Tag 后缀（`<KERNELRELEASE>-<channel>`） |
 
 > [!NOTE]
 > **关于同版本通道隔离**：XanMod 官方内核名及 `.deb` 包名本身不携带 `main`/`edge`/`lts` 后缀。本项目仅在 **GitHub Release Tag** 上附加 `-${CHANNEL}`（例如 `7.3.6-arm64-xanmod1-main`、`7.3.1-arm64-xanmod1-edge`、`6.18.65-arm64-xanmod1-lts`），确保三个通道在同一仓库共存时不会互相覆盖或误删旧版；若 `edge` 与 `main` 恰好追踪到同一个上游 Tag，二者在本机对应同一份同配置内核包。
@@ -98,7 +99,7 @@ XanMod 的行为调整来自两部分：**内核源码补丁**（如 BBRv3、`PR
 | 触发事件 | 说明 |
 | :--- | :--- |
 | **`schedule`** | 每日 `03:37 UTC` 自动运行，检查并构建 `edge`、`main`、`lts` 三个通道 |
-| **`workflow_dispatch`** | 手动触发，支持两个输入参数：<br>• `channel`：选择 `all`（默认）、`edge`、`main` 或 `lts`<br>• `enable_btf`：布尔值（默认 `true`），默认采用 `DWARF4 + BTF` 编译以生成 `/sys/kernel/btf/vmlinux`（若需进一步节省运行器磁盘，可手动设为 `false`） |
+| **`workflow_dispatch`** | 手动触发，支持三个输入参数：<br>• `channel`：选择 `all`（默认）、`edge`、`main` 或 `lts`<br>• `enable_btf`：布尔值（默认 `true`），默认采用 `DWARF4 + BTF` 编译以生成 `/sys/kernel/btf/vmlinux`（若需进一步节省运行器磁盘，可手动设为 `false`）<br>• `sync_apt`：布尔值（默认 `false`），在无需重新编译内核时基于现有 Releases 重建并部署 GitHub Pages APT 仓库 |
 
 ### 执行阶段
 
@@ -109,11 +110,14 @@ XanMod 的行为调整来自两部分：**内核源码补丁**（如 BBRv3、`PR
 2. **`build`（矩阵并行，运行于 `ubuntu-24.04-arm`，`fail-fast: false`，超时 360 分钟）**：
    * **Setup**：校验运行器为 `aarch64` / `arm64`；通过 `apt.llvm.org/llvm.sh` 安装 LLVM/Clang 22 与内核构建依赖并建立版本软链（不覆写系统 `/usr/bin/ld`），随后清理 APT 缓存释放磁盘空间。
    * **Config & Build**：浅克隆目标 Tag，校验 `HEAD^{commit}` 一致后提取 7 位短哈希与提交日期并删除 `.git`；执行配置移植与 `olddefconfig` / `syncconfig`；校验 `make -s kernelrelease` 等于 `<ver>-arm64-xanmod<N>`；使用 `ARCH=arm64 LLVM=1 KDEB_PKGVERSION="<kernel_rel>-0~<YYYYMMDD>.g<short7>" KDEB_COMPRESS=xz` 执行 `bindeb-pkg`。
-   * **Publish**：校验无 `-dbg`/`-dbgsym` 包、包名/版本号/关键路径完整，解包校验 `/boot/config-<KERNEL_RELEASE>` 与 `.config.final` 字节一致；生成 `SHA256SUMS` 与无前导缩进的 `RELEASE.md`；创建或更新 GitHub Release；按 `-arm64(-[^-]+)?-${CHANNEL}$` 精确清理当前通道的历史旧版 Release 与 Tag。
+   * **Publish**：校验无 `-dbg`/`-dbgsym` 包、包名/版本号/关键路径完整，解包校验 `/boot/config-<KERNEL_RELEASE>` 与 `.config.final` 字节一致；构建当前通道元包 `linux-xanmod[-edge|-lts]-arm64_${TAG}-0_arm64.deb`；生成 `SHA256SUMS` 与无前导缩进的 `RELEASE.md`；创建或更新 GitHub Release；按 `-arm64(-[^-]+)?-${CHANNEL}$` 精确清理当前通道的历史旧版 Release 与 Tag。
+3. **`publish-apt`（运行于 `ubuntu-latest`）**：
+   * 检测仓库 Secret `APT_GPG_PRIVATE_KEY`（未配置时输出告警并跳过部署，不影响 Release 发布）。
+   * 从各通道最新 Release 拉取镜像、头文件与元包（并校验 `SHA256SUMS`），生成 `pool/main` 与 `dists/stable/main/binary-arm64` 索引，使用 GPG 私钥签发 `Release.gpg` / `InRelease` 并以 `gpgv` 自验后，部署至 GitHub Pages。
 
 ---
 
-## 发布产物与手动安装
+## 发布产物与安装方式
 
 ### Release 资产说明
 
@@ -121,11 +125,30 @@ XanMod 的行为调整来自两部分：**内核源码补丁**（如 BBRv3、`PR
 | :--- | :--- |
 | `linux-image-<ver>-arm64-xanmod<N>_<pkgver>_arm64.deb` | 内核镜像与模块，包含 `/boot/vmlinuz-*`、`/boot/config-*`、`/boot/System.map-*` 与 `/lib/modules/*` |
 | `linux-headers-<ver>-arm64-xanmod<N>_<pkgver>_arm64.deb` | 内核头文件及纯 Clang 构建的主机辅助工具，用于 DKMS 与外部内核模块编译 |
+| `linux-xanmod[-edge\|-lts]-arm64_<tag>-0_arm64.deb` | 通道元包（依赖当前最新 `linux-image-*` 与 `linux-headers-*`），供 APT 跟踪通道自动升级 |
 | `linux-libc-dev_<pkgver>_arm64.deb` | 用户态 UAPI 开发头文件（一般日常升级内核无需安装此包） |
 | `SHA256SUMS` | 上述全部 `.deb` 包的 SHA-256 校验和清单 |
-| Release 正文 | 由构建生成的 `RELEASE.md` 渲染，记录架构、通道、Kernel Release、Package Version、上游链接与编译器版本 |
+| Release 正文 | 由构建生成的 `RELEASE.md` 渲染，记录架构、通道、Kernel Release、Package Version、元包、上游链接与编译器版本 |
 
-### 手动下载、校验与安装（支持 `edge` / `main` / `lts` 任意通道）
+### 方式 A：通过 GitHub Pages APT 源安装并由 `apt` 自动管理（推荐）
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://88860.github.io/XanMod-ARM64-AutoBuild/xanmod-arm64.gpg | sudo tee /etc/apt/keyrings/xanmod-arm64.gpg >/dev/null
+sudo chmod 0644 /etc/apt/keyrings/xanmod-arm64.gpg
+echo "deb [signed-by=/etc/apt/keyrings/xanmod-arm64.gpg arch=arm64] https://88860.github.io/XanMod-ARM64-AutoBuild stable main" | sudo tee /etc/apt/sources.list.d/xanmod-arm64.list
+
+sudo apt update
+# 按需选择一条通道安装：
+sudo apt install -y linux-xanmod-arm64       # MAIN
+# sudo apt install -y linux-xanmod-edge-arm64  # EDGE
+# sudo apt install -y linux-xanmod-lts-arm64   # LTS
+sudo update-grub && sudo reboot
+```
+
+后续可通过 `sudo apt update && sudo apt upgrade` 自动更新内核。
+
+### 方式 B：手动下载 Release 校验与安装（支持 `edge` / `main` / `lts`）
 
 ```bash
 # 1. 下载目标 Release 中的 linux-image、linux-headers 与 SHA256SUMS 到临时目录
@@ -170,7 +193,7 @@ rm -f /tmp/xanmod-install.sh
    * `3. 退出`：退出脚本，未安装内核时不对 `/etc/apt` 或系统软件环境作任何改动。
 2. **架构适配与零额外依赖机制**：
    * **下载与解析回退**：按优先级复用系统已有的 `curl` / `wget` / `python3` / APT 内置 `apt-helper`；解析 GitHub Releases JSON 时优先复用 `jq` / `python3`，缺失时自动回退至内置 `awk` 流式解析器；导入 `amd64` 仓库公钥时若无 `gpg`，使用 `awk + base64` 直接转换 OpenPGP keyring。
-   * **`arm64`**：通过 GitHub Releases API 检测 `MAIN` / `EDGE` / `LTS` 最新 Release，下载 `linux-image-*_arm64.deb` 与 `linux-headers-*_arm64.deb` 并依据 `SHA256SUMS` 校验后安装。
+   * **`arm64`**：优先检测 GitHub Pages APT 源（`https://88860.github.io/XanMod-ARM64-AutoBuild`），确认安装后写入 `/etc/apt/sources.list.d/xanmod-arm64.list` 与公钥并安装对应通道元包（`linux-xanmod[-edge|-lts]-arm64`）由 `apt` 托管更新；若 APT 源暂未部署或不可达，则自动回退至 GitHub Releases API 下载 `linux-image-*_arm64.deb` 与 `linux-headers-*_arm64.deb` 并校验 `SHA256SUMS` 后安装。
    * **`amd64`**：结合 `LC_ALL=C` 下动态链接器 `ld-linux-x86-64.so.2 --help` 与 `/proc/cpuinfo` ISA 标志位双重检测 `x86-64-v3` / `x86-64-v2` / `x86-64-v1` 支持等级（官方源仅提供 `x64v1`–`x64v3`，其中 `MAIN`/`EDGE` 仅提供 `x64v2`/`x64v3`，`LTS` 兼容 `x64v1`–`x64v3`，硬件支持 `v4`/AVX-512 时自动匹配 `x64v3`），查询 `http://deb.xanmod.org` 可用版本并在确认安装时写入源配置与公钥。
 3. **GRUB 默认启动项配置**：
    * 运行 `update-grub`，从 `/boot/grub/grub.cfg` 提取目标内核的非 `recovery` 菜单 ID（支持 `submenu_id>menuentry_id`）；

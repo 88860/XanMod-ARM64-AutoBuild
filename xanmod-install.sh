@@ -1,5 +1,8 @@
 #!/bin/bash
 ARM64_REPO="88860/XanMod-ARM64-AutoBuild"
+ARM64_APT_URL="https://88860.github.io/XanMod-ARM64-AutoBuild"
+ARM64_KEYRING="/etc/apt/keyrings/xanmod-arm64.gpg"
+ARM64_SOURCE_LIST="/etc/apt/sources.list.d/xanmod-arm64.list"
 XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
 XANMOD_SOURCE_LIST="/etc/apt/sources.list.d/xanmod-release.list"
 CHANNELS=("main" "edge" "lts")
@@ -15,11 +18,13 @@ XANMOD_TIER=""
 OS_PRETTY_NAME="Unknown Linux"
 OS_CODENAME=""
 TMP_WORK_DIR=""
+ARM64_USE_APT=0
 
 declare -A CH_ONLINE_VER
 declare -A CH_TARGET_KERNEL
 declare -A CH_PKG_OR_TAG
 declare -A CH_INSTALLED_VER
+declare -A CH_META_INSTALLED
 declare -A CH_UNAVAIL_REASON
 declare -A CH_IMG_URL
 declare -A CH_HDR_URL
@@ -749,11 +754,13 @@ configure_grub_for_kernel() {
 
 reset_channel_cache() {
     local ch
+    ARM64_USE_APT=0
     for ch in "${CHANNELS[@]}"; do
         CH_ONLINE_VER[$ch]=""
         CH_TARGET_KERNEL[$ch]=""
         CH_PKG_OR_TAG[$ch]=""
         CH_INSTALLED_VER[$ch]=""
+        CH_META_INSTALLED[$ch]=""
         CH_UNAVAIL_REASON[$ch]=""
         CH_IMG_URL[$ch]=""
         CH_HDR_URL[$ch]=""
@@ -766,6 +773,65 @@ reset_channel_cache() {
 extract_image_krel_from_depends() {
     local deps="$1"
     sed -n 's/.*linux-image-\([0-9][^ ,|()]*\).*/\1/p' <<< "$deps" | head -n1
+}
+
+lookup_apt_metapkg() {
+    local repo_txt="$1"
+    local pkg="$2"
+    awk -v pkg="$pkg" '
+        BEGIN { RS=""; FS="\n" }
+        {
+            p=""; v=""; d=""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^Package: /)  p = substr($i, 10)
+                if ($i ~ /^Version: /)  v = substr($i, 10)
+                if ($i ~ /^Depends: /)  d = substr($i, 10)
+            }
+            if (p == pkg && v != "") {
+                print v "\t" d
+            }
+        }
+    ' "$repo_txt" | sort -V | tail -n1
+}
+
+record_apt_metapkg_state() {
+    local ch="$1"
+    local pkg="$2"
+    local repo_txt="$3"
+    local missing_msg="$4"
+    local installed_imgs="${5:-}"
+
+    CH_PKG_OR_TAG[$ch]="$pkg"
+
+    local parsed_line=""
+    parsed_line=$(lookup_apt_metapkg "$repo_txt" "$pkg")
+    if [ -n "$parsed_line" ]; then
+        CH_ONLINE_VER[$ch]="${parsed_line%%$'\t'*}"
+        local deps="${parsed_line#*$'\t'}"
+        CH_TARGET_KERNEL[$ch]=$(extract_image_krel_from_depends "$deps")
+    else
+        CH_UNAVAIL_REASON[$ch]="$missing_msg"
+    fi
+
+    local meta_info=""
+    meta_info=$(dpkg-query -W -f='${db:Status-Abbrev}\t${Version}\n' "$pkg" 2>/dev/null || true)
+    if [[ "$meta_info" == ii* || "$meta_info" == hi* ]]; then
+        CH_META_INSTALLED[$ch]="${meta_info#*$'\t'}"
+        CH_INSTALLED_VER[$ch]="${CH_META_INSTALLED[$ch]}"
+    elif [ -n "$installed_imgs" ] && [ -n "${CH_TARGET_KERNEL[$ch]}" ]; then
+        local target_k="${CH_TARGET_KERNEL[$ch]}"
+        local online_mm=""
+        if [[ "$target_k" =~ ^([0-9]+\.[0-9]+)\. ]]; then
+            online_mm="${BASH_REMATCH[1]}"
+        fi
+        if grep -Fxq "$target_k" <<< "$installed_imgs" || [ -d "/lib/modules/${target_k}" ]; then
+            CH_INSTALLED_VER[$ch]="$target_k"
+        elif [ -n "$online_mm" ]; then
+            local same_series=""
+            same_series=$(grep -E "^${online_mm}\." <<< "$installed_imgs" | sort -V | tail -n1 || true)
+            [ -n "$same_series" ] && CH_INSTALLED_VER[$ch]="$same_series"
+        fi
+    fi
 }
 
 fetch_amd64_channels() {
@@ -812,46 +878,61 @@ fetch_amd64_channels() {
                 pkg="linux-xanmod-lts-${XANMOD_TIER}"
                 ;;
         esac
-
-        CH_PKG_OR_TAG[$ch]="$pkg"
-
-        local parsed_line=""
-        parsed_line=$(
-            awk -v pkg="$pkg" '
-                BEGIN { RS=""; FS="\n" }
-                {
-                    p=""; v=""; d=""
-                    for (i = 1; i <= NF; i++) {
-                        if ($i ~ /^Package: /)  p = substr($i, 10)
-                        if ($i ~ /^Version: /)  v = substr($i, 10)
-                        if ($i ~ /^Depends: /)  d = substr($i, 10)
-                    }
-                    if (p == pkg && v != "") {
-                        print v "\t" d
-                    }
-                }
-            ' "$repo_txt" | sort -V | tail -n1
-        )
-
-        if [ -n "$parsed_line" ]; then
-            CH_ONLINE_VER[$ch]="${parsed_line%%$'\t'*}"
-            local deps="${parsed_line#*$'\t'}"
-            CH_TARGET_KERNEL[$ch]=$(extract_image_krel_from_depends "$deps")
-        else
-            CH_UNAVAIL_REASON[$ch]="源 '${OS_CODENAME}' 暂未收录 ${pkg}"
-        fi
-
-        local meta_info=""
-        meta_info=$(dpkg-query -W -f='${db:Status-Abbrev}\t${Version}\n' "$pkg" 2>/dev/null || true)
-        if [[ "$meta_info" == ii* || "$meta_info" == hi* ]]; then
-            CH_INSTALLED_VER[$ch]="${meta_info#*$'\t'}"
-        fi
+        record_apt_metapkg_state "$ch" "$pkg" "$repo_txt" "源 '${OS_CODENAME}' 暂未收录 ${pkg}"
     done
 
     return 0
 }
 
+arm64_metapkg_name() {
+    case "$1" in
+        main) printf 'linux-xanmod-arm64' ;;
+        edge) printf 'linux-xanmod-edge-arm64' ;;
+        lts)  printf 'linux-xanmod-lts-arm64' ;;
+    esac
+}
+
+fetch_arm64_apt_channels() {
+    ensure_tmp_dir
+    local repo_gz="${TMP_WORK_DIR}/arm64-Packages.gz"
+    local repo_txt="${TMP_WORK_DIR}/arm64-Packages"
+    local repo_url="${ARM64_APT_URL}/dists/stable/main/binary-arm64/Packages.gz"
+
+    info "正在从 GitHub Pages APT 源 (${C_BCYAN}${ARM64_APT_URL}${C_RESET}) 检测 ARM64 最新可用版本..."
+    if ! http_get "$repo_url" "$repo_gz" 20 1; then
+        return 1
+    fi
+    if ! gzip -dc "$repo_gz" > "$repo_txt" 2>/dev/null || [ ! -s "$repo_txt" ]; then
+        return 1
+    fi
+
+    local installed_imgs=""
+    installed_imgs=$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' 'linux-image-*xanmod*' 2>/dev/null |
+        awk '$1 ~ /^(ii|hi)$/ { sub(/^linux-image-/, "", $2); print $2 }' || true)
+
+    local ch pkg found_any=0
+    for ch in "${CHANNELS[@]}"; do
+        pkg=$(arm64_metapkg_name "$ch")
+        record_apt_metapkg_state "$ch" "$pkg" "$repo_txt" "APT 源暂未收录 ${pkg}" "$installed_imgs"
+        if [ -n "${CH_ONLINE_VER[$ch]}" ]; then
+            found_any=1
+        fi
+    done
+
+    if [ "$found_any" -eq 0 ]; then
+        return 1
+    fi
+    ARM64_USE_APT=1
+    return 0
+}
+
 fetch_arm64_channels() {
+    if fetch_arm64_apt_channels; then
+        return 0
+    fi
+    reset_channel_cache
+    warn "GitHub Pages APT 源暂不可用或尚未部署，回退至 GitHub Releases 检测..."
+
     ensure_tmp_dir
     local api_url="https://api.github.com/repos/${ARM64_REPO}/releases?per_page=100"
     local rel_json="${TMP_WORK_DIR}/arm64-releases.json"
@@ -956,40 +1037,71 @@ print_installed_xanmod_summary() {
     fi
 }
 
-setup_amd64_apt_repo() {
-    ensure_tmp_dir
-    local key_tmp="${TMP_WORK_DIR}/xanmod-archive.key"
+setup_apt_repo() {
+    local label="$1"
+    local key_url="$2"
+    local keyring="$3"
+    local source_line="$4"
+    local source_file="$5"
 
-    info "正在配置 XanMod 官方 APT 密钥与软件源 (${OS_CODENAME})..."
-    if ! http_get "https://dl.xanmod.org/archive.key" "$key_tmp" 30 1; then
-        err "下载 XanMod GPG 密钥失败"
+    ensure_tmp_dir
+    local key_tmp="${TMP_WORK_DIR}/apt-archive.key"
+
+    info "正在配置 ${label} APT 密钥与软件源..."
+    if ! http_get "$key_url" "$key_tmp" 30 1; then
+        err "下载 ${label} GPG 密钥失败: $key_url"
+        return 1
+    fi
+
+    if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$key_tmp" 2>/dev/null; then
+        err "获取的 GPG 公钥格式无效: $key_url"
         return 1
     fi
 
     install -d -m 0755 /etc/apt/keyrings
-    if ! dearmor_pgp_key "$key_tmp" "$XANMOD_KEYRING"; then
-        err "导入 XanMod GPG 密钥失败"
+    if ! dearmor_pgp_key "$key_tmp" "$keyring"; then
+        err "导入 ${label} GPG 密钥失败"
         return 1
     fi
-    chmod 0644 "$XANMOD_KEYRING"
-    printf '%s\n' "deb [signed-by=${XANMOD_KEYRING}] http://deb.xanmod.org ${OS_CODENAME} main" > "$XANMOD_SOURCE_LIST"
+    chmod 0644 "$keyring"
+    printf '%s\n' "$source_line" > "$source_file"
 
     if ! apt-get update; then
-        err "apt-get update 失败，请检查 XanMod 软件源配置"
+        err "apt-get update 失败，请检查 ${label} 软件源配置"
         return 1
     fi
     return 0
 }
 
-install_amd64_channel() {
+setup_amd64_apt_repo() {
+    setup_apt_repo \
+        "XanMod 官方 (${OS_CODENAME})" \
+        "https://dl.xanmod.org/archive.key" \
+        "$XANMOD_KEYRING" \
+        "deb [signed-by=${XANMOD_KEYRING}] http://deb.xanmod.org ${OS_CODENAME} main" \
+        "$XANMOD_SOURCE_LIST"
+}
+
+setup_arm64_apt_repo() {
+    setup_apt_repo \
+        "XanMod ARM64 (GitHub Pages)" \
+        "${ARM64_APT_URL}/archive.key" \
+        "$ARM64_KEYRING" \
+        "deb [signed-by=${ARM64_KEYRING} arch=arm64] ${ARM64_APT_URL} stable main" \
+        "$ARM64_SOURCE_LIST"
+}
+
+install_apt_channel() {
     local ch="$1"
+    local repo_arch="$2"
     local pkg="${CH_PKG_OR_TAG[$ch]}"
     local online_ver="${CH_ONLINE_VER[$ch]}"
     local installed_ver="${CH_INSTALLED_VER[$ch]}"
+    local meta_installed="${CH_META_INSTALLED[$ch]}"
     local target_k="${CH_TARGET_KERNEL[$ch]}"
 
     local do_apt_install=1
-    if [ -n "$installed_ver" ] && [ "$installed_ver" = "$online_ver" ]; then
+    if [ -n "$meta_installed" ] && [ "$meta_installed" = "$online_ver" ]; then
         if [ -n "$target_k" ] && [ "$CURRENT_KERNEL" = "$target_k" ]; then
             ok "通道 ${ch^^} (${pkg}) 已安装最新版本 ${online_ver}，且当前正在运行该内核。"
             read -r -p "  是否仍要重新配置 GRUB 并确认启动项？[y/N]: " regrub
@@ -1007,8 +1119,12 @@ install_amd64_channel() {
         fi
     else
         echo ""
-        if [ -n "$installed_ver" ]; then
-            info "准备将 ${C_BCYAN}${pkg}${C_RESET} 从 ${C_YELLOW}${installed_ver}${C_RESET} 升级至 ${C_BGREEN}${online_ver}${C_RESET}"
+        if [ -n "$meta_installed" ]; then
+            info "准备将 ${C_BCYAN}${pkg}${C_RESET} 从 ${C_YELLOW}${meta_installed}${C_RESET} 升级至 ${C_BGREEN}${online_ver}${C_RESET}"
+        elif [ -n "$installed_ver" ] && [ "$installed_ver" = "$target_k" ]; then
+            info "本机已安装内核 ${C_BGREEN}${target_k}${C_RESET}，将配置 APT 源并安装元包 ${C_BCYAN}${pkg}${C_RESET} (${C_BGREEN}${online_ver}${C_RESET}) 纳入 apt 管理"
+        elif [ -n "$installed_ver" ]; then
+            info "准备安装元包 ${C_BCYAN}${pkg}${C_RESET} (${C_BGREEN}${online_ver}${C_RESET})，替换/升级同系内核 ${C_YELLOW}${installed_ver}${C_RESET}"
         else
             info "准备安装 ${C_BCYAN}${pkg}${C_RESET} (${C_BGREEN}${online_ver}${C_RESET})"
         fi
@@ -1020,7 +1136,11 @@ install_amd64_channel() {
     fi
 
     if [ "$do_apt_install" -eq 1 ]; then
-        setup_amd64_apt_repo || return 1
+        if [ "$repo_arch" = "arm64" ]; then
+            setup_arm64_apt_repo || return 1
+        else
+            setup_amd64_apt_repo || return 1
+        fi
         echo ""
         info "正在安装 ${C_BGREEN}${pkg}${C_RESET} ..."
         if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"; then
@@ -1044,7 +1164,15 @@ install_amd64_channel() {
     prompt_enter_reboot "XanMod ${ch^^} (${target_k}) 安装与 GRUB 配置完成。"
 }
 
+install_amd64_channel() {
+    install_apt_channel "$1" "amd64"
+}
+
 install_arm64_channel() {
+    if [ "$ARM64_USE_APT" -eq 1 ]; then
+        install_apt_channel "$1" "arm64"
+        return $?
+    fi
     local ch="$1"
     local tag="${CH_PKG_OR_TAG[$ch]}"
     local online_ver="${CH_ONLINE_VER[$ch]}"
@@ -1201,8 +1329,11 @@ install_xanmod_menu() {
                 echo -e "     ${status_text}"
             else
                 local state_badge=""
+                local meta_inst="${CH_META_INSTALLED[$ch]}"
                 if [ -n "$inst_v" ] && { [ "$inst_v" = "$online_v" ] || [ "$inst_v" = "$target_k" ]; }; then
-                    if [ -n "$target_k" ] && [ "$CURRENT_KERNEL" = "$target_k" ]; then
+                    if [ "$ARCH" = "arm64" ] && [ "$ARM64_USE_APT" -eq 1 ] && [ -z "$meta_inst" ]; then
+                        state_badge="${C_BYELLOW}[已安装·未纳管元包]${C_RESET}"
+                    elif [ -n "$target_k" ] && [ "$CURRENT_KERNEL" = "$target_k" ]; then
                         state_badge="${C_BGREEN}[已是最新且运行中]${C_RESET}"
                     else
                         state_badge="${C_BCYAN}[已是最新·未重启切换]${C_RESET}"
@@ -1214,7 +1345,7 @@ install_xanmod_menu() {
                 fi
 
                 echo -e "  ${C_BOLD}${idx}.${C_RESET} ${color}${label}${C_RESET}  ${state_badge}"
-                if [ "$ARCH" = "amd64" ]; then
+                if [ "$ARCH" = "amd64" ] || [ "$ARM64_USE_APT" -eq 1 ]; then
                     echo -e "     ${C_DIM}在线最新:${C_RESET} ${C_BGREEN}${online_v}${C_RESET}  ${C_DIM}| 元包:${C_RESET} ${pkg_tag}${target_k:+  ${C_DIM}| 内核:${C_RESET} ${target_k}}"
                 else
                     echo -e "     ${C_DIM}在线最新:${C_RESET} ${C_BGREEN}${online_v}${C_RESET}  ${C_DIM}| Release:${C_RESET} ${pkg_tag}"
@@ -1322,7 +1453,7 @@ is_kernel_metapkg() {
             return 1
             ;;
     esac
-    if [[ "$pkg" =~ ^linux-xanmod(-edge|-lts)?(-x64v[1-3])?$ ]]; then
+    if [[ "$pkg" =~ ^linux-xanmod(-edge|-lts)?(-x64v[1-3]|-arm64)?$ ]]; then
         return 0
     fi
     if [[ "$pkg" =~ ^(linux-image|linux-headers|linux-generic|linux-lowlatency|linux-virtual|linux-oem|linux-cloud|linux-rt|linux-aws|linux-azure|linux-gcp|linux-oracle|linux-zabbly|proxmox-default-kernel|pve-kernel) ]]; then

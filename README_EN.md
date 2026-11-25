@@ -11,7 +11,7 @@
 
 [简体中文](README.md) | **English**
 
-[Overview](#overview) · [Features](#features) · [Upstream-Aligned Naming](#upstream-aligned-naming) · [x86_64 Config Porting](#x86_64-config-porting) · [Build Pipeline](#build-pipeline) · [Release Artifacts & Manual Install](#release-artifacts--manual-install) · [Install Script](#install-script-xanmod-installsh) · [Verification](#verification) · [Notes & FAQ](#notes--faq)
+[Overview](#overview) · [Features](#features) · [Upstream-Aligned Naming](#upstream-aligned-naming) · [x86_64 Config Porting](#x86_64-config-porting) · [Build Pipeline](#build-pipeline) · [Release Artifacts & Installation](#release-artifacts--installation) · [Install Script](#install-script-xanmod-installsh) · [Verification](#verification) · [Notes & FAQ](#notes--faq)
 
 </div>
 
@@ -34,6 +34,7 @@
 * **Architecture-Scoped Kconfig Porting**: Starts from `arm64 defconfig` and parses Kconfig symbols plus `choice ... endchoice` blocks to apply XanMod scheduler, preemption, network, memory, I/O, and hardening options while keeping ARM64 boot drivers intact.
 * **Native LLVM/Clang Build**: Compiles with `ARCH=arm64 LLVM=1` (`clang-22`, `ld.lld-22`, `llvm-ar-22`, etc.) without `CROSS_COMPILE`, preventing host tools in `linux-headers` from being built with GCC.
 * **Post-Build Verification**: Verifies upstream Commit SHA pinning, byte-level `.config.final` parity inside `linux-image`, `dpkg-deb` contents, and `SHA256SUMS`.
+* **Signed APT Repo & Metapackages**: Builds channel metapackages (`linux-xanmod[-edge|-lts]-arm64`) and publishes a GPG-signed APT repository via GitHub Pages for standard `apt update && apt upgrade` maintenance.
 
 ---
 
@@ -50,7 +51,7 @@ Following upstream `xanmod/linux` (`.gitlab-ci.yml`, `scripts/setlocalversion`, 
 | **Image `Package`** | `linux-image-7.3.6-x64v3-xanmod1` | `linux-image-7.3.6-arm64-xanmod1` |
 | **Headers `Package`** | `linux-headers-7.3.6-x64v3-xanmod1` | `linux-headers-7.3.6-arm64-xanmod1` |
 | **`.deb` Filename** | `linux-image-7.3.6-x64v3-xanmod1_7.3.6-x64v3-xanmod1-0~20261123.g6b041b1_amd64.deb` | `linux-image-7.3.6-arm64-xanmod1_7.3.6-arm64-xanmod1-0~20261123.g6b041b1_arm64.deb` |
-| **Channel Isolation** | APT metapackages (`linux-xanmod[-edge\|-lts]-x64v3`) & SourceForge dirs | Channel suffix on GitHub Release Tag (`<KERNELRELEASE>-<channel>`) |
+| **Channel Isolation** | APT metapackages (`linux-xanmod[-edge\|-lts]-x64v3`) & SourceForge dirs | APT metapackages (`linux-xanmod[-edge\|-lts]-arm64`) & GitHub Release Tag suffix (`<KERNELRELEASE>-<channel>`) |
 
 > [!NOTE]
 > **Channel Isolation Note**: Official XanMod kernel versions and `.deb` package names do not contain `main`/`edge`/`lts`. This repo appends `-${CHANNEL}` only to the **GitHub Release Tag** (e.g., `7.3.6-arm64-xanmod1-main`, `7.3.1-arm64-xanmod1-edge`, `6.18.65-arm64-xanmod1-lts`) so all three channels coexist in one repository without colliding or purging each other. If `edge` and `main` resolve to the same upstream tag, both produce the identical kernel package.
@@ -97,7 +98,7 @@ Workflow file: [`/.github/workflows/xanmod-arm64.yml`](.github/workflows/xanmod-
 | Trigger | Behavior |
 | :--- | :--- |
 | **`schedule`** | Runs daily at `03:37 UTC`, checking and building `edge`, `main`, and `lts` |
-| **`workflow_dispatch`** | Manual trigger with two inputs:<br>• `channel`: `all` (default), `edge`, `main`, or `lts`<br>• `enable_btf`: boolean (default `true`); builds with `DWARF4 + BTF` by default to emit `/sys/kernel/btf/vmlinux` (set to `false` manually if runner disk space is constrained) |
+| **`workflow_dispatch`** | Manual trigger with three inputs:<br>• `channel`: `all` (default), `edge`, `main`, or `lts`<br>• `enable_btf`: boolean (default `true`); builds with `DWARF4 + BTF` by default to emit `/sys/kernel/btf/vmlinux` (set to `false` manually if runner disk space is constrained)<br>• `sync_apt`: boolean (default `false`); rebuilds and deploys the GitHub Pages APT repository from existing Releases without recompiling kernels |
 
 ### Stages
 
@@ -108,11 +109,14 @@ Workflow file: [`/.github/workflows/xanmod-arm64.yml`](.github/workflows/xanmod-
 2. **`build` (matrix on `ubuntu-24.04-arm`, `fail-fast: false`, 360 min timeout)**:
    * **Setup**: Asserts `aarch64` / `arm64`; installs LLVM/Clang 22 via `apt.llvm.org/llvm.sh` and build dependencies, symlinks LLVM tools without replacing system `/usr/bin/ld`, and clears APT lists/cache to preserve disk space.
    * **Config & Build**: Shallow-clones the tag, verifies `HEAD^{commit}`, records 7-char commit SHA & commit date, removes `.git`, applies optimization porting + `olddefconfig` / `syncconfig`, validates `make -s kernelrelease`, and packages via `ARCH=arm64 LLVM=1 KDEB_PKGVERSION="<kernel_rel>-0~<YYYYMMDD>.g<short7>" KDEB_COMPRESS=xz bindeb-pkg`.
-   * **Publish**: Ensures no `-dbg`/`-dbgsym` packages exist, verifies package names, versions, `/boot/vmlinuz-*`, `/lib/modules/*`, `/usr/src/linux-headers-*`, and byte-compares extracted `boot/config-*` against `.config.final`; writes `SHA256SUMS` and `RELEASE.md`, creates/updates the GitHub Release, and deletes older Releases/Tags matching `-arm64(-[^-]+)?-${CHANNEL}$` for the same channel only.
+   * **Publish**: Ensures no `-dbg`/`-dbgsym` packages exist, verifies package names, versions, `/boot/vmlinuz-*`, `/lib/modules/*`, `/usr/src/linux-headers-*`, and byte-compares extracted `boot/config-*` against `.config.final`; builds channel metapackage `linux-xanmod[-edge|-lts]-arm64_${TAG}-0_arm64.deb`; writes `SHA256SUMS` and `RELEASE.md`, creates/updates the GitHub Release, and deletes older Releases/Tags matching `-arm64(-[^-]+)?-${CHANNEL}$` for the same channel only.
+3. **`publish-apt` (`ubuntu-latest`)**:
+   * Checks repository Secret `APT_GPG_PRIVATE_KEY` (emits a warning and skips Pages deployment without failing kernel Releases if absent).
+   * Downloads latest `image`, `headers`, and metapackage `.deb` files per channel from Releases (verifying `SHA256SUMS`), builds `pool/main` and `dists/stable/main/binary-arm64` metadata, signs `Release.gpg` / `InRelease`, verifies via `gpgv`, and deploys to GitHub Pages.
 
 ---
 
-## Release Artifacts & Manual Install
+## Release Artifacts & Installation
 
 ### Release Assets
 
@@ -120,11 +124,30 @@ Workflow file: [`/.github/workflows/xanmod-arm64.yml`](.github/workflows/xanmod-
 | :--- | :--- |
 | `linux-image-<ver>-arm64-xanmod<N>_<pkgver>_arm64.deb` | Kernel image and stripped modules (`/boot/vmlinuz-*`, `/boot/config-*`, `/boot/System.map-*`, `/lib/modules/*`) |
 | `linux-headers-<ver>-arm64-xanmod<N>_<pkgver>_arm64.deb` | Kernel headers and pure Clang-built host scripts for DKMS / out-of-tree modules |
+| `linux-xanmod[-edge\|-lts]-arm64_<tag>-0_arm64.deb` | Channel metapackage depending on the latest `linux-image-*` and `linux-headers-*` for APT tracking |
 | `linux-libc-dev_<pkgver>_arm64.deb` | Userspace kernel UAPI headers (optional; not required for normal kernel upgrades) |
 | `SHA256SUMS` | SHA-256 checksums for all `.deb` artifacts |
-| Release Notes | Rendered from `RELEASE.md` (architecture, channel, Kernel Release, Package Version, upstream link, Clang version) |
+| Release Notes | Rendered from `RELEASE.md` (architecture, channel, Kernel Release, Package Version, metapackage, upstream link, Clang version) |
 
-### Manual Download, Verification & Install (`edge` / `main` / `lts`)
+### Option A: Managed via GitHub Pages APT Repository (Recommended)
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://88860.github.io/XanMod-ARM64-AutoBuild/xanmod-arm64.gpg | sudo tee /etc/apt/keyrings/xanmod-arm64.gpg >/dev/null
+sudo chmod 0644 /etc/apt/keyrings/xanmod-arm64.gpg
+echo "deb [signed-by=/etc/apt/keyrings/xanmod-arm64.gpg arch=arm64] https://88860.github.io/XanMod-ARM64-AutoBuild stable main" | sudo tee /etc/apt/sources.list.d/xanmod-arm64.list
+
+sudo apt update
+# Install one channel metapackage:
+sudo apt install -y linux-xanmod-arm64       # MAIN
+# sudo apt install -y linux-xanmod-edge-arm64  # EDGE
+# sudo apt install -y linux-xanmod-lts-arm64   # LTS
+sudo update-grub && sudo reboot
+```
+
+Future updates are then delivered automatically via `sudo apt update && sudo apt upgrade`.
+
+### Option B: Manual Download, Verification & Install (`edge` / `main` / `lts`)
 
 ```bash
 # 1. Download linux-image, linux-headers, and SHA256SUMS from the target Release
@@ -169,7 +192,7 @@ rm -f /tmp/xanmod-install.sh
    * `3. 退出` (Exit): Exits without altering `/etc/apt` or system packages if no install or cleanup was run.
 2. **Architecture Handling & Built-in Fallbacks**:
    * **Zero-package fallbacks**: Reuses preinstalled `curl`, `wget`, `python3`, or APT's `/usr/lib/apt/apt-helper` for HTTP downloads; parses GitHub Releases JSON via `jq`, `python3`, or a built-in `awk` streaming parser; converts ASCII-armored `amd64` GPG keys via `awk + base64` when `gpg` is absent.
-   * **`arm64`**: Queries GitHub Releases API across **MAIN** / **EDGE** / **LTS**, downloads `linux-image-*_arm64.deb` and `linux-headers-*_arm64.deb`, verifies them against `SHA256SUMS` when provided, and installs via APT.
+   * **`arm64`**: Queries the GitHub Pages APT repository (`https://88860.github.io/XanMod-ARM64-AutoBuild`) first, configuring `/etc/apt/sources.list.d/xanmod-arm64.list` and keyring upon install confirmation to install the channel metapackage (`linux-xanmod[-edge|-lts]-arm64`) for ongoing `apt` updates; falls back automatically to downloading `linux-image-*_arm64.deb` and `linux-headers-*_arm64.deb` with `SHA256SUMS` verification from GitHub Releases if the APT repo is unreachable.
    * **`amd64`**: Probes `x86-64-v3` / `x86-64-v2` / `x86-64-v1` using both `LC_ALL=C ld-linux-x86-64.so.2 --help` and `/proc/cpuinfo` ISA flags (official XanMod provides `x64v1`–`x64v3` only; `MAIN`/`EDGE` support `x64v2`/`x64v3`, `LTS` supports `x64v1`–`x64v3`, and `v4`/AVX-512 CPUs map to `x64v3`), checks `http://deb.xanmod.org`, and configures the APT source and keyring only after install confirmation.
 3. **GRUB Configuration**:
    * Runs `update-grub` and extracts the non-recovery menu ID for the installed kernel from `/boot/grub/grub.cfg` (supports `submenu_id>menuentry_id` nesting);
