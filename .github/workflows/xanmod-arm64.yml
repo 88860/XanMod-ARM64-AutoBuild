@@ -18,11 +18,13 @@ on:
         required: false
         default: true
         type: boolean
+      sync_apt:
+        description: 'Rebuild and deploy GitHub Pages APT repository from existing releases'
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: '37 3 * * *'
-
-permissions:
-  contents: write
 
 concurrency:
   group: xanmod-arm64-${{ github.workflow }}
@@ -30,10 +32,13 @@ concurrency:
 
 env:
   LLVM_VER: 22
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       has_builds: ${{ steps.check.outputs.has_builds }}
       matrix: ${{ steps.check.outputs.matrix }}
@@ -116,6 +121,8 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.has_builds == 'true'
     runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -360,6 +367,34 @@ jobs:
           cmp -s "verify-image/boot/config-${KERNEL_RELEASE}" ../kernel/.config.final || exit 1
           rm -rf verify-image
 
+          case "$CHANNEL" in
+            main) meta_pkg="linux-xanmod-arm64" ;;
+            edge) meta_pkg="linux-xanmod-edge-arm64" ;;
+            lts)  meta_pkg="linux-xanmod-lts-arm64" ;;
+            *)    exit 1 ;;
+          esac
+          meta_ver="${TAG}-0"
+          meta_dir="meta-${meta_pkg}"
+          mkdir -p "${meta_dir}/DEBIAN"
+          sed 's/^          //' <<EOF > "${meta_dir}/DEBIAN/control"
+          Package: ${meta_pkg}
+          Source: linux-upstream
+          Version: ${meta_ver}
+          Architecture: arm64
+          Maintainer: github-actions <github-actions@users.noreply.github.com>
+          Section: kernel
+          Priority: optional
+          Depends: linux-image-${KERNEL_RELEASE}, linux-headers-${KERNEL_RELEASE}
+          Provides: linux-image-xanmod
+          Description: XanMod Linux kernel and headers (${CHANNEL^^}) for ARM64
+           Metapackage for XanMod ${CHANNEL^^} Linux kernel image and headers packages.
+          EOF
+          chmod 0755 "${meta_dir}/DEBIAN"
+          meta_deb="${meta_pkg}_${meta_ver}_arm64.deb"
+          dpkg-deb --root-owner-group --build "$meta_dir" "$meta_deb"
+          rm -rf "$meta_dir"
+          [[ "$(dpkg-deb --field "$meta_deb" Package)" == "$meta_pkg" ]] || exit 1
+
           sha256sum *.deb > SHA256SUMS
           sed 's/^          //' <<EOF > RELEASE.md
           ## XanMod ARM64 ${CHANNEL^^}: $TAG
@@ -367,6 +402,7 @@ jobs:
           * **Channel:** ${CHANNEL^^}
           * **Kernel Release:** \`${KERNEL_RELEASE}\`
           * **Package Version:** \`${KDEB_PKGVERSION}\`
+          * **Metapackage:** \`${meta_pkg}\` (\`${meta_ver}\`)
           * **Upstream:** [GitLab XanMod Linux](https://gitlab.com/xanmod/linux/-/releases/$TAG)
           * **Compiler:** Clang ${LLVM_VER}
           * **Build:** GitHub Actions Native ARM64
@@ -382,3 +418,212 @@ jobs:
           gh release list --limit 50 --json tagName -q '.[].tagName' | grep -E -- "-arm64(-[^-]+)?-${CHANNEL}$" | grep -Fxv "$RELEASE_TAG" | while read -r old_tag; do
             gh release delete "$old_tag" --cleanup-tag -y || true
           done || true
+
+  publish-apt:
+    name: Publish APT (GitHub Pages)
+    needs: [preflight, build]
+    if: always() && needs.preflight.result == 'success' && needs.build.result != 'cancelled' && (needs.preflight.outputs.has_builds == 'true' || (github.event_name == 'workflow_dispatch' && inputs.sync_apt == true))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check GPG signing secret
+        id: gpg_check
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${APT_GPG_PRIVATE_KEY// }" ]]; then
+            echo "::warning::APT_GPG_PRIVATE_KEY secret is not configured; skipping GitHub Pages APT deployment."
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Pages
+        id: pages
+        if: steps.gpg_check.outputs.has_key == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Build Signed APT Repository
+        if: steps.gpg_check.outputs.has_key == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          PAGES_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils gnupg xz-utils
+
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          chmod 0700 "$GNUPGHOME"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+
+          key_file="$(mktemp)"
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" > "$key_file"
+          if grep -q 'BEGIN PGP PRIVATE KEY BLOCK' "$key_file"; then
+            gpg --batch --import "$key_file"
+          else
+            tr -d '[:space:]' < "$key_file" | base64 -d | gpg --batch --import
+          fi
+          rm -f "$key_file"
+
+          gpg_fpr="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')"
+          [[ -n "$gpg_fpr" ]] || { echo "No secret GPG key found in APT_GPG_PRIVATE_KEY" >&2; exit 1; }
+
+          rm -rf apt-site stage-debs
+          mkdir -p apt-site/pool/main apt-site/dists/stable/main/binary-arm64 stage-debs
+
+          releases_json="$(gh release list --limit 100 --json tagName,isDraft,isPrerelease)"
+          channel_summary=""
+
+          for ch in edge main lts; do
+            rtag="$(jq -r --arg ch "$ch" '[.[] | select(.isDraft == false and .isPrerelease == false and (.tagName | test("-arm64(-[^-]+)?-" + $ch + "$")))][0].tagName // ""' <<< "$releases_json")"
+            [[ -n "$rtag" ]] || continue
+
+            ch_dir="stage-debs/${ch}"
+            mkdir -p "$ch_dir"
+            gh release download "$rtag" --dir "$ch_dir" \
+              --pattern 'linux-image-*_arm64.deb' \
+              --pattern 'linux-headers-*_arm64.deb' \
+              --pattern 'linux-xanmod*-arm64_*_arm64.deb' \
+              --pattern 'SHA256SUMS' || true
+
+            if [[ -f "${ch_dir}/SHA256SUMS" ]]; then
+              (cd "$ch_dir" && sha256sum --ignore-missing -c SHA256SUMS)
+            fi
+
+            shopt -s nullglob
+            imgs=("${ch_dir}"/linux-image-*_arm64.deb)
+            hdrs=("${ch_dir}"/linux-headers-*_arm64.deb)
+            metas=("${ch_dir}"/linux-xanmod*-arm64_*_arm64.deb)
+            shopt -u nullglob
+            ((${#imgs[@]} > 0 && ${#hdrs[@]} > 0)) || continue
+
+            img_pkg="$(dpkg-deb --field "${imgs[0]}" Package)"
+            hdr_pkg="$(dpkg-deb --field "${hdrs[0]}" Package)"
+            krel="${img_pkg#linux-image-}"
+            case "$ch" in
+              main) meta_pkg="linux-xanmod-arm64" ;;
+              edge) meta_pkg="linux-xanmod-edge-arm64" ;;
+              lts)  meta_pkg="linux-xanmod-lts-arm64" ;;
+            esac
+
+            if ((${#metas[@]} == 0)); then
+              tag_base="${rtag%-${ch}}"
+              if [[ "$tag_base" == *-arm64 ]]; then
+                up_ver="${tag_base%-arm64}"
+              else
+                up_ver="${tag_base%%-*}-${tag_base#*-arm64-}"
+              fi
+              meta_ver="${up_ver}-0"
+              meta_dir="${ch_dir}/meta-${meta_pkg}"
+              mkdir -p "${meta_dir}/DEBIAN"
+              cat <<EOF > "${meta_dir}/DEBIAN/control"
+          Package: ${meta_pkg}
+          Source: linux-upstream
+          Version: ${meta_ver}
+          Architecture: arm64
+          Maintainer: github-actions <github-actions@users.noreply.github.com>
+          Section: kernel
+          Priority: optional
+          Depends: ${img_pkg}, ${hdr_pkg}
+          Provides: linux-image-xanmod
+          Description: XanMod Linux kernel and headers (${ch^^}) for ARM64
+           Metapackage for XanMod ${ch^^} Linux kernel image and headers packages.
+          EOF
+              chmod 0755 "${meta_dir}/DEBIAN"
+              dpkg-deb --root-owner-group --build "$meta_dir" "${ch_dir}/${meta_pkg}_${meta_ver}_arm64.deb"
+              rm -rf "$meta_dir"
+              metas=("${ch_dir}/${meta_pkg}_${meta_ver}_arm64.deb")
+            fi
+
+            cp -f "${imgs[0]}" apt-site/pool/main/
+            cp -f "${hdrs[0]}" apt-site/pool/main/
+            cp -f "${metas[0]}" apt-site/pool/main/
+            meta_ver_actual="$(dpkg-deb --field "${metas[0]}" Version)"
+            channel_summary="${channel_summary}<li><code>${meta_pkg}</code> (<strong>${ch^^}</strong>): <code>${meta_ver_actual}</code> &rarr; <code>${krel}</code></li>"
+          done
+
+          shopt -s nullglob
+          pool_debs=(apt-site/pool/main/*.deb)
+          shopt -u nullglob
+          ((${#pool_debs[@]} > 0)) || { echo "No ARM64 .deb packages found across releases" >&2; exit 1; }
+
+          gpg --batch --armor --export "$gpg_fpr" > apt-site/archive.key
+          gpg --batch --export "$gpg_fpr" > apt-site/xanmod-arm64.gpg
+
+          (
+            cd apt-site
+            apt-ftparchive packages pool/main > dists/stable/main/binary-arm64/Packages
+            gzip -kf -9 dists/stable/main/binary-arm64/Packages
+            xz -kf -9 dists/stable/main/binary-arm64/Packages
+          )
+
+          cat <<'EOF' > apt-site/dists/stable/main/binary-arm64/Release
+          Archive: stable
+          Component: main
+          Origin: XanMod-ARM64-AutoBuild
+          Label: XanMod ARM64 Kernel Repository
+          Architecture: arm64
+          EOF
+          sed -i 's/^          //' apt-site/dists/stable/main/binary-arm64/Release
+
+          cat <<'EOF' > apt-release.conf
+          APT::FTPArchive::Release {
+            Origin "XanMod-ARM64-AutoBuild";
+            Label "XanMod ARM64 Kernel Repository";
+            Suite "stable";
+            Codename "stable";
+            Architectures "arm64";
+            Components "main";
+            Description "XanMod ARM64 APT Repository (MAIN / EDGE / LTS)";
+          };
+          EOF
+
+          apt-ftparchive -c apt-release.conf release apt-site/dists/stable > apt-site/dists/stable/Release
+          rm -f apt-release.conf
+
+          gpg --batch --yes --digest-algo SHA256 -u "$gpg_fpr" --armor --detach-sign -o apt-site/dists/stable/Release.gpg apt-site/dists/stable/Release
+          gpg --batch --yes --digest-algo SHA256 -u "$gpg_fpr" --clearsign -o apt-site/dists/stable/InRelease apt-site/dists/stable/Release
+          gpgv --keyring apt-site/xanmod-arm64.gpg apt-site/dists/stable/InRelease
+
+          base_url="${PAGES_URL%/}"
+          cat <<EOF > apt-site/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head><meta charset="utf-8"><title>XanMod ARM64 APT Repository</title>
+          <style>body{font-family:system-ui,sans-serif;max-width:820px;margin:2rem auto;padding:0 1rem;line-height:1.6}pre{background:#f4f4f6;padding:1rem;border-radius:6px;overflow-x:auto}code{font-family:monospace}</style>
+          </head>
+          <body>
+          <h1>XanMod ARM64 APT Repository</h1>
+          <p>Automated ARM64 (<code>aarch64</code>) XanMod kernel repository for Debian and Ubuntu.</p>
+          <h2>Configure APT</h2>
+          <pre>sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL ${base_url}/xanmod-arm64.gpg | sudo tee /etc/apt/keyrings/xanmod-arm64.gpg >/dev/null
+          sudo chmod 0644 /etc/apt/keyrings/xanmod-arm64.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/xanmod-arm64.gpg arch=arm64] ${base_url} stable main" | sudo tee /etc/apt/sources.list.d/xanmod-arm64.list
+          sudo apt update &amp;&amp; sudo apt install -y linux-xanmod-arm64</pre>
+          <h2>Published Packages</h2>
+          <ul>${channel_summary}</ul>
+          </body>
+          </html>
+          EOF
+          sed -i 's/^          //' apt-site/index.html
+
+      - name: Upload Pages artifact
+        if: steps.gpg_check.outputs.has_key == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: apt-site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        if: steps.gpg_check.outputs.has_key == 'true'
+        uses: actions/deploy-pages@v4
