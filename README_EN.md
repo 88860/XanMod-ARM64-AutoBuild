@@ -187,8 +187,8 @@ rm -f /tmp/xanmod-install.sh
 ### Features
 
 1. **Main Menu & Non-Intrusive Execution**:
-   * `1. XanMod 内核安装` (Install / Upgrade): Displays running kernel, system architecture, and CPU tier; checks available **MAIN**, **EDGE**, and **LTS** versions against installed packages and prompts Enter to reboot after installation.
-   * `2. 旧内核清理` (Old Kernel Cleanup): Protects the running kernel along with its dependencies and linked metapackages (covering Debian/Ubuntu, XanMod, Liquorix, Zabbly, Proxmox, and custom `.deb` kernels); compares versions to distinguish older kernels from installed newer kernels awaiting reboot (alerting when a reboot is pending), lists all inactive packages and residual `rc` configs with their versions, updates/verifies GRUB, and prompts Enter to reboot.
+   * `1. 安装 XanMod 内核` (Install / Upgrade): Compact mobile-friendly single-line menu with sequential `1. 2. 3.` numeric choices; displays running kernel, architecture, and CPU tier, checks **MAIN**, **EDGE**, and **LTS** versions against installed packages, configures GRUB, and offers numeric `1`/`2` reboot selection.
+   * `2. 清理旧内核` (Old Kernel Cleanup): Protects the running kernel along with its dependencies and linked metapackages (covering Debian/Ubuntu, XanMod, Liquorix, Zabbly, Proxmox, and custom `.deb` kernels); separates older kernels, pending newer kernels, and residual `rc` configs, unlocks held packages if needed, removes leftover `/lib/modules` and orphan `initrd.img.*.bak`, clears cached kernel `.deb` files from `/var/cache/apt/archives` (`apt-get autoclean`), and updates/verifies GRUB.
    * `3. 退出` (Exit): Exits without altering `/etc/apt` or system packages if no install or cleanup was run.
 2. **Architecture Handling & Built-in Fallbacks**:
    * **Zero-package fallbacks**: Reuses preinstalled `curl`, `wget`, `python3`, or APT's `/usr/lib/apt/apt-helper` for HTTP downloads; parses GitHub Releases JSON via `jq`, `python3`, or a built-in `awk` streaming parser; converts ASCII-armored `amd64` GPG keys via `awk + base64` when `gpg` is absent.

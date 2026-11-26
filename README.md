@@ -188,9 +188,9 @@ rm -f /tmp/xanmod-install.sh
 ### 功能说明
 
 1. **主菜单与无入侵设计**：
-   * `1. XanMod 内核安装`：输出当前运行内核、系统架构与指令集等级，检测 **MAIN**、**EDGE**、**LTS** 在线可用版本及本机安装状态，安装或升级后提示按回车重启。
-   * `2. 旧内核清理`：保护当前运行内核及其依赖与关联元包（兼容 Debian/Ubuntu、XanMod、Liquorix、Zabbly、Proxmox 及自定义 `.deb` 包），按版本号区分低于与高于当前运行内核的版本；若检测到已安装但尚未重启生效的新内核会给出提示，列出所有未启用项及 `rc` 残留配置的包名与版本供选择卸载，更新并校验 GRUB 后提示按回车重启。
-   * `3. 退出`：退出脚本，未安装内核时不对 `/etc/apt` 或系统软件环境作任何改动。
+   * `1. 安装 XanMod 内核`：采用适配手机窄屏的一行一项极简菜单（全部选项为 `1. 2. 3.` 数字选择），自动识别当前内核、系统架构与指令集等级，检测 **MAIN**、**EDGE**、**LTS** 在线版本与安装状态，安装并配置 GRUB 后可选择立即重启或稍后重启。
+   * `2. 清理旧内核`：保护当前运行内核及其依赖与关联元包（兼容 Debian/Ubuntu、XanMod、Liquorix、Zabbly、Proxmox 及自定义 `.deb` 包），区分旧版本、待重启新内核与 `rc` 残留配置，支持一键清理全部旧内核、按编号选择或单独清理，卸载后自动解除锁定包、清理残留 `/lib/modules` 与孤立 `initrd.img.*.bak` 并清除 `/var/cache/apt/archives` 中的 APT 内核缓存，最后更新并校验 GRUB。
+   * `3. 退出`：退出脚本，未安装或清理时不对 `/etc/apt` 或系统软件环境作任何改动。
 2. **架构适配与零额外依赖机制**：
    * **下载与解析回退**：按优先级复用系统已有的 `curl` / `wget` / `python3` / APT 内置 `apt-helper`；解析 GitHub Releases JSON 时优先复用 `jq` / `python3`，缺失时自动回退至内置 `awk` 流式解析器；导入 `amd64` 仓库公钥时若无 `gpg`，使用 `awk + base64` 直接转换 OpenPGP keyring。
    * **`arm64`**：优先检测 GitHub Pages APT 源（`https://88860.github.io/XanMod-ARM64-AutoBuild`），确认安装后写入 `/etc/apt/sources.list.d/xanmod-arm64.list` 与公钥并安装对应通道元包（`linux-xanmod[-edge|-lts]-arm64`）由 `apt` 托管更新；若 APT 源暂未部署或不可达，则自动回退至 GitHub Releases API 下载 `linux-image-*_arm64.deb` 与 `linux-headers-*_arm64.deb` 并校验 `SHA256SUMS` 后安装。

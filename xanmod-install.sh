@@ -70,12 +70,38 @@ ensure_tmp_dir() {
     fi
 }
 
+term_rule_width() {
+    local cols="${COLUMNS:-}"
+    if [ -z "$cols" ] && command -v tput >/dev/null 2>&1; then
+        cols=$(tput cols 2>/dev/null || true)
+    fi
+    if ! [[ "$cols" =~ ^[0-9]+$ ]] || [ "$cols" -le 0 ]; then
+        cols=38
+    fi
+    if [ "$cols" -lt 28 ]; then
+        cols=28
+    elif [ "$cols" -gt 46 ]; then
+        cols=46
+    fi
+    printf '%s' "$cols"
+}
+
+draw_rule() {
+    local color="$1"
+    local ch="$2"
+    local w="" line=""
+    w=$(term_rule_width)
+    printf -v line '%*s' "$w" ''
+    line="${line// /$ch}"
+    echo -e "${color}${line}${C_RESET}"
+}
+
 hr() {
-    echo -e "${C_BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    draw_rule "$C_BLUE" "━"
 }
 
 hr_thin() {
-    echo -e "${C_DIM}──────────────────────────────────────────────────────────────────────${C_RESET}"
+    draw_rule "$C_DIM" "─"
 }
 
 info() {
@@ -99,28 +125,96 @@ die() {
     exit 1
 }
 
-pause_continue() {
-    local msg="${1:-按回车键继续...}"
-    echo ""
-    read -r -p "  ${C_DIM}${msg}${C_RESET} " _
+normalize_input() {
+    local v="$1"
+    v="${v//$'\r'/}"
+    v="${v//０/0}"
+    v="${v//１/1}"
+    v="${v//２/2}"
+    v="${v//３/3}"
+    v="${v//４/4}"
+    v="${v//５/5}"
+    v="${v//６/6}"
+    v="${v//７/7}"
+    v="${v//８/8}"
+    v="${v//９/9}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "$v"
 }
 
-prompt_enter_reboot() {
+read_input() {
+    local out_var="$1"
+    local prompt_str="$2"
+    local raw=""
+    printf '%b' "$prompt_str"
+    if ! IFS= read -r raw; then
+        printf -v "$out_var" '%s' ""
+        return 1
+    fi
+    printf -v "$out_var" '%s' "$(normalize_input "$raw")"
+    return 0
+}
+
+prompt_binary_menu() {
+    local opt1="$1"
+    local opt2="$2"
+    local pick=""
+    echo ""
+    echo -e "  ${C_BOLD}1.${C_RESET} ${opt1}"
+    echo -e "  ${C_BOLD}2.${C_RESET} ${opt2}"
+    while true; do
+        read_input pick "  请选择 1-2: " || return 1
+        case "$pick" in
+            "") continue ;;
+            1)  return 0 ;;
+            2|0) return 1 ;;
+            *)  warn "无效选项: ${pick}，请输入 1 或 2" ;;
+        esac
+    done
+}
+
+pause_continue() {
+    local msg="${1:-按回车继续...}"
+    local dummy=""
+    echo ""
+    read_input dummy "  ${C_DIM}${msg}${C_RESET} " || true
+}
+
+prompt_reboot_choice() {
     local reason="$1"
+    local pick=""
     echo ""
     hr
     ok "$reason"
-    echo -e "  ${C_BYELLOW}提示: 按回车键立即重启系统使更改生效${C_RESET} ${C_DIM}(或按 Ctrl+C 取消并稍后手动重启)${C_RESET}"
-    read -r -p "  > " _
-    cleanup_tmp
-    info "正在重启系统..."
-    reboot || /sbin/reboot || systemctl reboot || die "执行重启失败，请手动执行 reboot"
+    echo -e "  ${C_BOLD}1.${C_RESET} ${C_BYELLOW}立即重启生效${C_RESET}"
+    echo -e "  ${C_BOLD}2.${C_RESET} ${C_DIM}稍后手动重启${C_RESET}"
+    while true; do
+        read_input pick "  请选择 1-2: " || return 0
+        case "$pick" in
+            "")
+                continue
+                ;;
+            1)
+                cleanup_tmp
+                info "正在重启系统..."
+                reboot || /sbin/reboot || systemctl reboot || die "执行重启失败，请手动执行 reboot"
+                return 0
+                ;;
+            2|0)
+                return 0
+                ;;
+            *)
+                warn "无效选项: ${pick}，请输入 1 或 2"
+                ;;
+        esac
+    done
 }
 
 print_banner() {
     echo ""
     hr
-    echo -e "  ${C_BCYAN}XanMod 内核管理脚本${C_RESET}  ${C_DIM}(x86_64 & ARM64)${C_RESET}"
+    echo -e "  ${C_BCYAN}XanMod 内核管理${C_RESET}"
     hr
 }
 
@@ -130,14 +224,9 @@ print_system_summary() {
         kernel_color="$C_BGREEN"
     fi
 
-    local os_line="${OS_PRETTY_NAME}"
-    if [ -n "$OS_CODENAME" ] && [[ "$OS_PRETTY_NAME" != *"(${OS_CODENAME})"* ]]; then
-        os_line="${OS_PRETTY_NAME} (${OS_CODENAME})"
-    fi
-
-    echo -e "  ${C_DIM}当前运行内核 :${C_RESET} ${kernel_color}${CURRENT_KERNEL}${C_RESET}"
-    echo -e "  ${C_DIM}机器系统架构 :${C_RESET} ${C_BCYAN}${ARCH_DISPLAY}${C_RESET}   ${C_DIM}指令集 / 平台 :${C_RESET} ${C_BMAGENTA}${CPU_PSABI}${C_RESET}"
-    echo -e "  ${C_DIM}操作系统环境 :${C_RESET} ${C_BWHITE}${os_line}${C_RESET}"
+    echo -e "  ${C_DIM}内核:${C_RESET} ${kernel_color}${CURRENT_KERNEL}${C_RESET}"
+    echo -e "  ${C_DIM}架构:${C_RESET} ${C_BCYAN}${ARCH_DISPLAY}${C_RESET} / ${C_BMAGENTA}${CPU_PSABI}${C_RESET}"
+    echo -e "  ${C_DIM}系统:${C_RESET} ${C_BWHITE}${OS_PRETTY_NAME}${C_RESET}"
     hr
 }
 
@@ -171,7 +260,7 @@ probe_cpu_isa() {
     CPU_HW_NOTE=""
 
     if [ "$ARCH" = "amd64" ]; then
-        ARCH_DISPLAY="x86_64 (amd64)"
+        ARCH_DISPLAY="x86_64"
         local cpu_flags="" ld_so="" ld_help=""
         if [ -r /proc/cpuinfo ]; then
             CPU_MODEL=$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n1 | tr -s ' ')
@@ -249,31 +338,24 @@ probe_cpu_isa() {
             *)
                 CPU_PSABI="x86-64-v1"
                 XANMOD_TIER="x64v1"
-                CPU_HW_NOTE="仅 LTS 通道提供 x64v1 (MAIN / EDGE 需 >= x86-64-v2)"
+                CPU_HW_NOTE="仅 LTS 支持 x64v1"
                 ;;
         esac
 
         if [ "$verbose" -eq 1 ]; then
-            [ -n "$CPU_MODEL" ] && echo -e "  ${C_DIM}处理器型号   :${C_RESET} ${C_BWHITE}${CPU_MODEL}${C_RESET}"
-            echo -e "  ${C_DIM}检测方式     :${C_RESET} $( [ "$ld_has_hwcaps" -eq 1 ] && echo "glibc ld-linux psABI + /proc/cpuinfo 标志校验" || echo "/proc/cpuinfo ISA 标志校验" )"
-            echo -e "  ${C_DIM}适配指令集   :${C_RESET} ${C_BMAGENTA}${CPU_PSABI}${C_RESET}  ${C_DIM}(对应官方包等级: ${XANMOD_TIER})${C_RESET}"
-            [ -n "$CPU_HW_NOTE" ] && echo -e "  ${C_DIM}补充说明     :${C_RESET} ${C_BCYAN}${CPU_HW_NOTE}${C_RESET}"
+            [ -n "$CPU_MODEL" ] && echo -e "  ${C_DIM}处理器:${C_RESET} ${C_BWHITE}${CPU_MODEL}${C_RESET}"
+            echo -e "  ${C_DIM}指令集:${C_RESET} ${C_BMAGENTA}${CPU_PSABI}${C_RESET} / ${XANMOD_TIER}"
+            [ -n "$CPU_HW_NOTE" ] && echo -e "  ${C_DIM}说明:${C_RESET} ${C_BCYAN}${CPU_HW_NOTE}${C_RESET}"
         fi
     elif [ "$ARCH" = "arm64" ]; then
-        ARCH_DISPLAY="ARM64 (aarch64)"
-        CPU_PSABI="ARM64 (${ARM64_REPO})"
+        ARCH_DISPLAY="arm64"
+        CPU_PSABI="arm64"
         XANMOD_TIER="arm64"
-        local arm_feats=""
-        if [ -r /proc/cpuinfo ]; then
-            arm_feats=$(sed -n 's/^Features[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n1 | tr -s ' ')
-        fi
         if [ "$verbose" -eq 1 ]; then
-            echo -e "  ${C_DIM}机器架构     :${C_RESET} ${C_BCYAN}ARM64 / aarch64${C_RESET}"
-            [ -n "$arm_feats" ] && echo -e "  ${C_DIM}指令集特性   :${C_RESET} ${C_DIM}${arm_feats}${C_RESET}"
-            echo -e "  ${C_DIM}适配目标     :${C_RESET} ${C_BMAGENTA}ARM64${C_RESET}"
+            echo -e "  ${C_DIM}架构:${C_RESET} ${C_BCYAN}arm64${C_RESET}"
         fi
     else
-        ARCH_DISPLAY="不支持的架构 (${ARCH} / ${RAW_ARCH})"
+        ARCH_DISPLAY="$ARCH"
         CPU_PSABI="未知"
         XANMOD_TIER=""
     fi
@@ -334,18 +416,18 @@ http_get() {
 
     if command -v curl >/dev/null 2>&1; then
         if [ "$quiet" -eq 1 ]; then
-            curl -fsSL --connect-timeout 15 --max-time "$max_time" -o "$dest" "$url" 2>/dev/null
+            curl -fsSL --connect-timeout 15 --max-time "$max_time" -o "$dest" "$url" </dev/null 2>/dev/null
         else
-            curl -fSL --connect-timeout 15 --max-time "$max_time" -o "$dest" "$url"
+            curl -fSL --connect-timeout 15 --max-time "$max_time" -o "$dest" "$url" </dev/null
         fi
         return $?
     fi
 
     if command -v wget >/dev/null 2>&1; then
         if [ "$quiet" -eq 1 ]; then
-            wget -q --timeout=30 -O "$dest" "$url" 2>/dev/null
+            wget -q --timeout=30 -O "$dest" "$url" </dev/null 2>/dev/null
         else
-            wget --show-progress --timeout=30 -O "$dest" "$url" || wget -O "$dest" "$url"
+            wget --show-progress --timeout=30 -O "$dest" "$url" </dev/null || wget -O "$dest" "$url" </dev/null
         fi
         return $?
     fi
@@ -613,10 +695,26 @@ get_latest_xanmod_modules() {
 
 channel_label() {
     case "$1" in
-        main) echo "MAIN (主线稳定版)" ;;
-        edge) echo "EDGE (前沿尝鲜版)" ;;
-        lts)  echo "LTS  (长期支持版)" ;;
+        main) echo "MAIN 主线版" ;;
+        edge) echo "EDGE 前沿版" ;;
+        lts)  echo "LTS  长期版" ;;
         *)    echo "$1" ;;
+    esac
+}
+
+short_ver_display() {
+    local v="$1"
+    v="${v%%~*}"
+    v="${v%-0}"
+    printf '%s' "$v"
+}
+
+extract_pkg_krel() {
+    case "$1" in
+        linux-image-[0-9]*)          printf '%s' "${1#linux-image-}" ;;
+        linux-image-unsigned-[0-9]*) printf '%s' "${1#linux-image-unsigned-}" ;;
+        proxmox-kernel-[0-9]*)       printf '%s' "${1#proxmox-kernel-}" ;;
+        pve-kernel-[0-9]*)           printf '%s' "${1#pve-kernel-}" ;;
     esac
 }
 
@@ -689,20 +787,20 @@ configure_grub_for_kernel() {
 
     echo ""
     info "正在更新 GRUB 配置并设置默认启动内核: ${C_BGREEN}${target_kernel}${C_RESET} ..."
-    if ! update-grub; then
+    if ! update-grub </dev/null; then
         err "update-grub 执行失败"
         return 1
     fi
 
     if [ ! -f "$grub_cfg" ]; then
-        err "未找到 GRUB 配置文件 ($grub_cfg)"
+        err "未找到 GRUB 配置文件: $grub_cfg"
         return 1
     fi
 
     local grub_id=""
     grub_id=$(extract_grub_menu_id "$target_kernel" "$grub_cfg")
     if [ -z "$grub_id" ]; then
-        err "未能从 $grub_cfg 提取到内核 ${target_kernel} 的非 recovery 启动项 ID"
+        err "未提取到内核 ${target_kernel} 的启动项 ID"
         return 1
     fi
 
@@ -727,7 +825,7 @@ configure_grub_for_kernel() {
         printf 'GRUB_DEFAULT=saved\nGRUB_SAVEDEFAULT=false\n' > /etc/default/grub.d/99-xanmod-default.cfg
     fi
 
-    if ! grub-set-default "$grub_id"; then
+    if ! grub-set-default "$grub_id" </dev/null; then
         err "grub-set-default 设置失败"
         return 1
     fi
@@ -735,19 +833,19 @@ configure_grub_for_kernel() {
     local saved_entry=""
     saved_entry=$(grub-editenv /boot/grub/grubenv list 2>/dev/null | sed -n 's/^saved_entry=//p')
     if [ "$saved_entry" != "$grub_id" ]; then
-        err "GRUB 默认启动项校验失败 (期望: $grub_id，实际: ${saved_entry:-空})"
+        err "GRUB 默认项校验失败: ${saved_entry:-空}"
         return 1
     fi
 
-    if ! update-grub >/dev/null 2>&1; then
-        warn "最终 update-grub 返回非零状态，请手动复查"
+    if ! update-grub </dev/null >/dev/null 2>&1; then
+        warn "最终 update-grub 返回异常，请检查 GRUB"
     fi
 
     echo ""
     hr_thin
     echo -e "  ${C_BGREEN}GRUB 配置完成${C_RESET}"
-    echo -e "  ${C_DIM}默认启动内核 :${C_RESET} ${C_BGREEN}${target_kernel}${C_RESET}"
-    echo -e "  ${C_DIM}GRUB 启动项ID:${C_RESET} ${C_BCYAN}${grub_id}${C_RESET}"
+    echo -e "  ${C_DIM}默认内核:${C_RESET} ${C_BGREEN}${target_kernel}${C_RESET}"
+    echo -e "  ${C_DIM}启动项ID:${C_RESET} ${C_BCYAN}${grub_id}${C_RESET}"
     hr_thin
     return 0
 }
@@ -1017,7 +1115,7 @@ fetch_arm64_channels() {
 
 print_installed_xanmod_summary() {
     local found_any=0
-    echo -e "  ${C_DIM}本机已安装 XanMod 内核:${C_RESET}"
+    echo -e "  ${C_DIM}已装 XanMod 内核:${C_RESET}"
     local line status pkg ver
     while IFS=$'\t' read -r status pkg ver; do
         [ -n "$pkg" ] || continue
@@ -1026,14 +1124,14 @@ print_installed_xanmod_summary() {
             local krel="${pkg#linux-image-}"
             local tag_run=""
             if [ "$krel" = "$CURRENT_KERNEL" ]; then
-                tag_run=" ${C_BGREEN}[正在运行]${C_RESET}"
+                tag_run=" ${C_BGREEN}[运行中]${C_RESET}"
             fi
-            echo -e "    ${C_GREEN}•${C_RESET} ${C_BWHITE}${pkg}${C_RESET}  ${C_DIM}版本:${C_RESET} ${C_CYAN}${ver}${C_RESET}${tag_run}"
+            echo -e "  ${C_GREEN}•${C_RESET} ${C_BWHITE}${krel}${C_RESET}${tag_run}"
         fi
     done < <(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\t${Version}\n' 'linux-image-*xanmod*' 2>/dev/null || true)
 
     if [ "$found_any" -eq 0 ]; then
-        echo -e "    ${C_DIM}(未检测到已安装的 XanMod 内核包)${C_RESET}"
+        echo -e "  ${C_DIM}无${C_RESET}"
     fi
 }
 
@@ -1047,27 +1145,27 @@ setup_apt_repo() {
     ensure_tmp_dir
     local key_tmp="${TMP_WORK_DIR}/apt-archive.key"
 
-    info "正在配置 ${label} APT 密钥与软件源..."
+    info "正在配置 ${label} APT 源..."
     if ! http_get "$key_url" "$key_tmp" 30 1; then
-        err "下载 ${label} GPG 密钥失败: $key_url"
+        err "下载 GPG 密钥失败: $key_url"
         return 1
     fi
 
     if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$key_tmp" 2>/dev/null; then
-        err "获取的 GPG 公钥格式无效: $key_url"
+        err "GPG 公钥格式无效: $key_url"
         return 1
     fi
 
     install -d -m 0755 /etc/apt/keyrings
     if ! dearmor_pgp_key "$key_tmp" "$keyring"; then
-        err "导入 ${label} GPG 密钥失败"
+        err "导入 GPG 密钥失败"
         return 1
     fi
     chmod 0644 "$keyring"
     printf '%s\n' "$source_line" > "$source_file"
 
-    if ! apt-get update; then
-        err "apt-get update 失败，请检查 ${label} 软件源配置"
+    if ! apt-get update </dev/null; then
+        err "apt-get update 失败，请检查软件源"
         return 1
     fi
     return 0
@@ -1075,7 +1173,7 @@ setup_apt_repo() {
 
 setup_amd64_apt_repo() {
     setup_apt_repo \
-        "XanMod 官方 (${OS_CODENAME})" \
+        "XanMod 官方" \
         "https://dl.xanmod.org/archive.key" \
         "$XANMOD_KEYRING" \
         "deb [signed-by=${XANMOD_KEYRING}] http://deb.xanmod.org ${OS_CODENAME} main" \
@@ -1084,7 +1182,7 @@ setup_amd64_apt_repo() {
 
 setup_arm64_apt_repo() {
     setup_apt_repo \
-        "XanMod ARM64 (GitHub Pages)" \
+        "XanMod ARM64" \
         "${ARM64_APT_URL}/archive.key" \
         "$ARM64_KEYRING" \
         "deb [signed-by=${ARM64_KEYRING} arch=arm64] ${ARM64_APT_URL} stable main" \
@@ -1100,37 +1198,36 @@ install_apt_channel() {
     local meta_installed="${CH_META_INSTALLED[$ch]}"
     local target_k="${CH_TARGET_KERNEL[$ch]}"
 
+    echo ""
+    hr_thin
+    echo -e "  ${C_DIM}通道:${C_RESET} ${C_BCYAN}${ch^^}${C_RESET}"
+    echo -e "  ${C_DIM}元包:${C_RESET} ${C_BWHITE}${pkg}${C_RESET}"
+    echo -e "  ${C_DIM}版本:${C_RESET} ${C_BGREEN}${online_ver}${C_RESET}"
+    [ -n "$target_k" ] && echo -e "  ${C_DIM}内核:${C_RESET} ${C_BGREEN}${target_k}${C_RESET}"
+
     local do_apt_install=1
     if [ -n "$meta_installed" ] && [ "$meta_installed" = "$online_ver" ]; then
         if [ -n "$target_k" ] && [ "$CURRENT_KERNEL" = "$target_k" ]; then
-            ok "通道 ${ch^^} (${pkg}) 已安装最新版本 ${online_ver}，且当前正在运行该内核。"
-            read -r -p "  是否仍要重新配置 GRUB 并确认启动项？[y/N]: " regrub
-            if [[ ! "$regrub" =~ ^[Yy]$ ]]; then
+            echo ""
+            ok "该通道已是最新版本并运行中"
+            if ! prompt_binary_menu "重配 GRUB 启动项" "取消返回"; then
                 return 0
             fi
             do_apt_install=0
         else
-            warn "通道 ${ch^^} (${pkg}) 已安装最新版本 ${online_ver}，但当前运行内核为 ${CURRENT_KERNEL}。"
-            read -r -p "  是否直接将其设为 GRUB 默认启动项并重启生效？[Y/n]: " apply_grub
-            if [[ "$apply_grub" =~ ^[Nn]$ ]]; then
+            echo ""
+            warn "该通道已安装最新版本，当前运行 ${CURRENT_KERNEL}"
+            if ! prompt_binary_menu "设为默认启动并重启" "取消返回"; then
                 return 0
             fi
             do_apt_install=0
         fi
     else
-        echo ""
-        if [ -n "$meta_installed" ]; then
-            info "准备将 ${C_BCYAN}${pkg}${C_RESET} 从 ${C_YELLOW}${meta_installed}${C_RESET} 升级至 ${C_BGREEN}${online_ver}${C_RESET}"
-        elif [ -n "$installed_ver" ] && [ "$installed_ver" = "$target_k" ]; then
-            info "本机已安装内核 ${C_BGREEN}${target_k}${C_RESET}，将配置 APT 源并安装元包 ${C_BCYAN}${pkg}${C_RESET} (${C_BGREEN}${online_ver}${C_RESET}) 纳入 apt 管理"
-        elif [ -n "$installed_ver" ]; then
-            info "准备安装元包 ${C_BCYAN}${pkg}${C_RESET} (${C_BGREEN}${online_ver}${C_RESET})，替换/升级同系内核 ${C_YELLOW}${installed_ver}${C_RESET}"
-        else
-            info "准备安装 ${C_BCYAN}${pkg}${C_RESET} (${C_BGREEN}${online_ver}${C_RESET})"
+        [ -n "$meta_installed" ] && echo -e "  ${C_DIM}当前:${C_RESET} ${C_YELLOW}${meta_installed}${C_RESET}"
+        if [ -z "$meta_installed" ] && [ -n "$installed_ver" ]; then
+            echo -e "  ${C_DIM}当前:${C_RESET} ${C_YELLOW}${installed_ver}${C_RESET}"
         fi
-        read -r -p "  确认开始安装吗？[y/N]: " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            info "已取消安装。"
+        if ! prompt_binary_menu "确认安装" "取消返回"; then
             return 0
         fi
     fi
@@ -1143,7 +1240,7 @@ install_apt_channel() {
         fi
         echo ""
         info "正在安装 ${C_BGREEN}${pkg}${C_RESET} ..."
-        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"; then
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" </dev/null; then
             err "apt-get install $pkg 失败"
             return 1
         fi
@@ -1156,12 +1253,13 @@ install_apt_channel() {
     target_k="${detected_k:-${target_k:-$(get_latest_xanmod_modules)}}"
 
     if [ -z "$target_k" ]; then
-        err "未能确定新安装的 XanMod 内核版本号，无法配置 GRUB"
+        err "未能确定新安装的 XanMod 内核版本号"
         return 1
     fi
 
     configure_grub_for_kernel "$target_k" || return 1
-    prompt_enter_reboot "XanMod ${ch^^} (${target_k}) 安装与 GRUB 配置完成。"
+    INSTALL_CHANGED=1
+    prompt_reboot_choice "XanMod ${ch^^} 安装完成"
 }
 
 install_amd64_channel() {
@@ -1179,34 +1277,39 @@ install_arm64_channel() {
     local installed_ver="${CH_INSTALLED_VER[$ch]}"
     local target_k="${CH_TARGET_KERNEL[$ch]}"
 
+    echo ""
+    hr_thin
+    echo -e "  ${C_DIM}通道:${C_RESET} ${C_BCYAN}${ch^^}${C_RESET}"
+    echo -e "  ${C_DIM}版本:${C_RESET} ${C_BGREEN}${tag}${C_RESET}"
+    echo -e "  ${C_DIM}内核:${C_RESET} ${C_BGREEN}${target_k}${C_RESET}"
+
     local do_deb_install=1
     if [ -n "$installed_ver" ] && [ "$installed_ver" = "$target_k" ]; then
-        if [ "$CURRENT_KERNEL" = "$target_k" ]; then
-            ok "ARM64 ${ch^^} (${target_k}) 已安装并正在运行中。"
-            read -r -p "  是否仍要重新下载校验并重装，或仅刷新 GRUB？[y=重装 / g=仅配置GRUB / N=返回]: " act
-            case "$act" in
-                [Yy]) do_deb_install=1 ;;
-                [Gg]) do_deb_install=0 ;;
-                *)    return 0 ;;
-            esac
-        else
-            warn "ARM64 ${ch^^} (${target_k}) 已安装但当前未启用 (当前运行: ${CURRENT_KERNEL})。"
-            read -r -p "  选择操作 [g=设为GRUB默认启动(推荐) / y=重新下载安装 / N=返回]: " act
-            case "$act" in
-                [Yy])   do_deb_install=1 ;;
-                ""|[Gg]) do_deb_install=0 ;;
-                *)      return 0 ;;
-            esac
-        fi
-    else
         echo ""
-        info "准备下载并安装 ARM64 ${C_BCYAN}${ch^^}${C_RESET} Release: ${C_BGREEN}${tag}${C_RESET}"
-        echo -e "    ${C_DIM}目标内核:${C_RESET} ${C_BGREEN}${target_k}${C_RESET}"
-        echo -e "    ${C_DIM}镜像包  :${C_RESET} ${CH_IMG_NAME[$ch]}"
-        echo -e "    ${C_DIM}头文件包:${C_RESET} ${CH_HDR_NAME[$ch]}"
-        read -r -p "  确认下载并安装吗？[y/N]: " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            info "已取消安装。"
+        if [ "$CURRENT_KERNEL" = "$target_k" ]; then
+            ok "该内核已安装并运行中"
+            echo -e "  ${C_BOLD}1.${C_RESET} 重配 GRUB 启动项"
+        else
+            warn "该内核已安装但当前运行 ${CURRENT_KERNEL}"
+            echo -e "  ${C_BOLD}1.${C_RESET} 设为默认启动并重启"
+        fi
+        echo -e "  ${C_BOLD}2.${C_RESET} 重新下载并重装"
+        echo -e "  ${C_BOLD}3.${C_RESET} 取消返回"
+        local act=""
+        while true; do
+            read_input act "  请选择 1-3: " || return 0
+            case "$act" in
+                "") continue ;;
+                1)  do_deb_install=0; break ;;
+                2)  do_deb_install=1; break ;;
+                3|0) return 0 ;;
+                *)  warn "无效选项: ${act}，请输入 1-3" ;;
+            esac
+        done
+    else
+        echo -e "  ${C_DIM}镜像:${C_RESET} ${CH_IMG_NAME[$ch]}"
+        echo -e "  ${C_DIM}头包:${C_RESET} ${CH_HDR_NAME[$ch]}"
+        if ! prompt_binary_menu "确认下载并安装" "取消返回"; then
             return 0
         fi
     fi
@@ -1235,22 +1338,22 @@ install_arm64_channel() {
 
         if [ -n "${CH_SUM_URL[$ch]}" ]; then
             local sum_file="${dl_dir}/SHA256SUMS"
-            info "正在下载并校验 SHA256SUMS ..."
+            info "正在校验 SHA256SUMS ..."
             if ! http_get "${CH_SUM_URL[$ch]}" "$sum_file" 60 1; then
                 err "下载 SHA256SUMS 失败"
                 return 1
             fi
             if ! grep -Fq "${CH_IMG_NAME[$ch]}" "$sum_file" || ! grep -Fq "${CH_HDR_NAME[$ch]}" "$sum_file"; then
-                err "SHA256SUMS 中缺少目标 deb 文件校验条目，已中止安装"
+                err "SHA256SUMS 缺少目标包校验条目"
                 return 1
             fi
             if ! (cd "$dl_dir" && sha256sum -c --ignore-missing SHA256SUMS); then
-                err "SHA256 校验未通过，安装包可能损坏"
+                err "SHA256 校验失败"
                 return 1
             fi
             ok "SHA256 校验通过"
         else
-            warn "该 Release 未提供 SHA256SUMS，跳过哈希校验"
+            warn "该 Release 无 SHA256SUMS，跳过校验"
         fi
 
         chmod 0644 "$img_file" "$hdr_file"
@@ -1261,8 +1364,8 @@ install_arm64_channel() {
         fi
 
         echo ""
-        info "正在安装 ARM64 内核包 (${target_k}) ..."
-        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$img_file" "$hdr_file"; then
+        info "正在安装 ${target_k} ..."
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "$img_file" "$hdr_file" </dev/null; then
             err "apt-get 安装 deb 包失败"
             return 1
         fi
@@ -1275,21 +1378,21 @@ install_arm64_channel() {
     fi
 
     configure_grub_for_kernel "$target_k" || return 1
-    prompt_enter_reboot "XanMod ARM64 ${ch^^} (${target_k}) 安装与 GRUB 配置完成。"
+    INSTALL_CHANGED=1
+    prompt_reboot_choice "XanMod ARM64 ${ch^^} 安装完成"
 }
 
 install_xanmod_menu() {
-    echo ""
-    probe_cpu_isa 1
+    probe_cpu_isa 0
 
     if [ "$ARCH" != "amd64" ] && [ "$ARCH" != "arm64" ]; then
         echo ""
-        err "当前系统架构 '${ARCH}' (${RAW_ARCH}) 暂不支持自动安装 XanMod 内核。"
-        pause_continue
+        err "当前架构 ${ARCH} 暂不支持自动安装"
+        pause_continue "按回车返回..."
         return 1
     fi
 
-    check_runtime_tools || { pause_continue; return 1; }
+    check_runtime_tools || { pause_continue "按回车返回..."; return 1; }
 
     local need_refresh=1
     while true; do
@@ -1297,97 +1400,91 @@ install_xanmod_menu() {
             echo ""
             reset_channel_cache
             if [ "$ARCH" = "amd64" ]; then
-                fetch_amd64_channels || { pause_continue "按回车键返回主菜单..."; return 1; }
+                fetch_amd64_channels || { pause_continue "按回车返回主菜单..."; return 1; }
             else
-                fetch_arm64_channels || { pause_continue "按回车键返回主菜单..."; return 1; }
+                fetch_arm64_channels || { pause_continue "按回车返回主菜单..."; return 1; }
             fi
             need_refresh=0
         fi
 
-        echo ""
         print_banner
         print_system_summary
         print_installed_xanmod_summary
         hr_thin
-        echo -e "  ${C_BWHITE}可用 XanMod 内核版本 (架构: ${C_BCYAN}${ARCH_DISPLAY}${C_BWHITE} | 等级: ${C_BMAGENTA}${CPU_PSABI}${C_BWHITE})${C_RESET}"
+        echo -e "  ${C_BWHITE}选择安装通道:${C_RESET}"
         echo ""
 
         local idx=1 ch
         for ch in "${CHANNELS[@]}"; do
-            local label color online_v inst_v target_k pkg_tag reason status_text
-            label=$(channel_label "$ch")
+            local color online_v inst_v target_k reason short_v badge=""
             color=$(channel_color "$ch")
             online_v="${CH_ONLINE_VER[$ch]}"
             inst_v="${CH_INSTALLED_VER[$ch]}"
             target_k="${CH_TARGET_KERNEL[$ch]}"
-            pkg_tag="${CH_PKG_OR_TAG[$ch]}"
             reason="${CH_UNAVAIL_REASON[$ch]}"
 
             if [ -n "$reason" ] || [ -z "$online_v" ]; then
-                status_text="${C_RED}[不可用] ${reason:-未获取到版本}${C_RESET}"
-                echo -e "  ${C_BOLD}${idx}.${C_RESET} ${color}${label}${C_RESET}"
-                echo -e "     ${status_text}"
+                badge="${C_RED}[不可用]${C_RESET}"
+                printf "  ${C_BOLD}%d.${C_RESET} ${color}%-4s${C_RESET} %b\n" "$idx" "${ch^^}" "$badge"
             else
-                local state_badge=""
+                short_v=$(short_ver_display "$online_v")
                 local meta_inst="${CH_META_INSTALLED[$ch]}"
                 if [ -n "$inst_v" ] && { [ "$inst_v" = "$online_v" ] || [ "$inst_v" = "$target_k" ]; }; then
                     if [ "$ARCH" = "arm64" ] && [ "$ARM64_USE_APT" -eq 1 ] && [ -z "$meta_inst" ]; then
-                        state_badge="${C_BYELLOW}[已安装·未纳管元包]${C_RESET}"
+                        badge="${C_BYELLOW}[未纳管]${C_RESET}"
                     elif [ -n "$target_k" ] && [ "$CURRENT_KERNEL" = "$target_k" ]; then
-                        state_badge="${C_BGREEN}[已是最新且运行中]${C_RESET}"
+                        badge="${C_BGREEN}[运行中]${C_RESET}"
                     else
-                        state_badge="${C_BCYAN}[已是最新·未重启切换]${C_RESET}"
+                        badge="${C_BCYAN}[待重启]${C_RESET}"
                     fi
                 elif [ -n "$inst_v" ]; then
-                    state_badge="${C_BYELLOW}[可升级: ${inst_v} -> ${online_v}]${C_RESET}"
+                    badge="${C_BYELLOW}[可升级]${C_RESET}"
                 else
-                    state_badge="${C_DIM}[未安装]${C_RESET}"
+                    badge="${C_DIM}[未安装]${C_RESET}"
                 fi
-
-                echo -e "  ${C_BOLD}${idx}.${C_RESET} ${color}${label}${C_RESET}  ${state_badge}"
-                if [ "$ARCH" = "amd64" ] || [ "$ARM64_USE_APT" -eq 1 ]; then
-                    echo -e "     ${C_DIM}在线最新:${C_RESET} ${C_BGREEN}${online_v}${C_RESET}  ${C_DIM}| 元包:${C_RESET} ${pkg_tag}${target_k:+  ${C_DIM}| 内核:${C_RESET} ${target_k}}"
-                else
-                    echo -e "     ${C_DIM}在线最新:${C_RESET} ${C_BGREEN}${online_v}${C_RESET}  ${C_DIM}| Release:${C_RESET} ${pkg_tag}"
-                fi
+                printf "  ${C_BOLD}%d.${C_RESET} ${color}%-4s${C_RESET} ${C_BWHITE}%s${C_RESET} %b\n" "$idx" "${ch^^}" "$short_v" "$badge"
             fi
-            echo ""
             idx=$((idx + 1))
         done
 
-        echo -e "  ${C_BOLD}r.${C_RESET} ${C_CYAN}重新检测在线版本${C_RESET}"
-        echo -e "  ${C_BOLD}0.${C_RESET} ${C_DIM}返回主菜单${C_RESET}"
+        echo -e "  ${C_BOLD}4.${C_RESET} ${C_CYAN}刷新版本${C_RESET}"
+        echo -e "  ${C_BOLD}5.${C_RESET} ${C_DIM}返回主菜单${C_RESET}"
         hr_thin
 
         local choice=""
-        read -r -p "  请选择要安装的版本 [1-3 / r / 0]: " choice
-        case "$choice" in
-            1|2|3)
-                local selected_ch="${CHANNELS[$((choice - 1))]}"
-                if [ -n "${CH_UNAVAIL_REASON[$selected_ch]}" ] || [ -z "${CH_ONLINE_VER[$selected_ch]}" ]; then
-                    warn "通道 ${selected_ch^^} 当前不可安装: ${CH_UNAVAIL_REASON[$selected_ch]:-未获取到在线版本}"
-                    pause_continue "按回车键重新选择..."
+        while true; do
+            read_input choice "  请选择 1-5: " || return 0
+            case "$choice" in
+                "")
                     continue
-                fi
-                if [ "$ARCH" = "amd64" ]; then
-                    install_amd64_channel "$selected_ch"
-                else
-                    install_arm64_channel "$selected_ch"
-                fi
-                pause_continue "按回车键返回通道列表..."
-                need_refresh=1
-                ;;
-            r|R)
-                need_refresh=1
-                ;;
-            0|"")
-                return 0
-                ;;
-            *)
-                warn "无效输入: '$choice'，请输入 1、2、3、r 或 0"
-                pause_continue
-                ;;
-        esac
+                    ;;
+                1|2|3)
+                    local selected_ch="${CHANNELS[$((choice - 1))]}"
+                    if [ -n "${CH_UNAVAIL_REASON[$selected_ch]}" ] || [ -z "${CH_ONLINE_VER[$selected_ch]}" ]; then
+                        warn "通道 ${selected_ch^^} 不可用: ${CH_UNAVAIL_REASON[$selected_ch]:-未获取版本}"
+                        continue
+                    fi
+                    INSTALL_CHANGED=0
+                    if [ "$ARCH" = "amd64" ]; then
+                        install_amd64_channel "$selected_ch" || pause_continue "按回车继续..."
+                    else
+                        install_arm64_channel "$selected_ch" || pause_continue "按回车继续..."
+                    fi
+                    [ "$INSTALL_CHANGED" -eq 1 ] && need_refresh=1
+                    break
+                    ;;
+                4)
+                    need_refresh=1
+                    break
+                    ;;
+                5|0)
+                    return 0
+                    ;;
+                *)
+                    warn "无效选项: ${choice}，请输入 1-5"
+                    ;;
+            esac
+        done
     done
 }
 
@@ -1647,12 +1744,9 @@ scan_installed_kernels() {
         pkg_ver[$pkg]="$ver"
         pkg_deps[$pkg]="$deps"
         if [[ "$st" == ii* || "$st" == hi* ]]; then
-            case "$pkg" in
-                linux-image-[0-9]*)          installed_image_set[${pkg#linux-image-}]=1 ;;
-                linux-image-unsigned-[0-9]*) installed_image_set[${pkg#linux-image-unsigned-}]=1 ;;
-                proxmox-kernel-[0-9]*)       installed_image_set[${pkg#proxmox-kernel-}]=1 ;;
-                pve-kernel-[0-9]*)           installed_image_set[${pkg#pve-kernel-}]=1 ;;
-            esac
+            local img_krel=""
+            img_krel=$(extract_pkg_krel "$pkg")
+            [ -n "$img_krel" ] && installed_image_set[$img_krel]=1
         fi
     done
 
@@ -1719,6 +1813,7 @@ scan_installed_kernels() {
     INACTIVE_VERS=()
     INACTIVE_NOTES=()
     INACTIVE_CLASSES=()
+    INACTIVE_STATUSES=()
     UNMANAGED_NEWER_KERNELS=()
     UNMANAGED_OTHER_KERNELS=()
 
@@ -1729,16 +1824,17 @@ scan_installed_kernels() {
 
         if is_versioned_kernel_pkg "$pkg"; then
             if [ -n "${protected_set[$pkg]:-}" ]; then
-                PROTECTED_RECORDS+=("内核包"$'\t'"${pkg}"$'\t'"${ver}")
+                PROTECTED_RECORDS+=("内核"$'\t'"${pkg}"$'\t'"${ver}")
                 continue
             fi
 
             if [[ "$st" == rc* ]]; then
                 INACTIVE_PKGS+=("$pkg")
-                INACTIVE_TYPES+=("残留配置")
+                INACTIVE_TYPES+=("残留")
                 INACTIVE_VERS+=("$ver")
-                INACTIVE_NOTES+=("仅剩配置残留 (rc) · 可安全清理")
+                INACTIVE_NOTES+=("残留配置")
                 INACTIVE_CLASSES+=("older")
+                INACTIVE_STATUSES+=("rc")
             elif [[ "$st" == ii* || "$st" == hi* ]]; then
                 local pkg_cmp cand_flavor rel_class note grub_hint=""
                 pkg_cmp=$(get_pkg_cmp_version "$pkg" "$ver")
@@ -1746,32 +1842,22 @@ scan_installed_kernels() {
                 rel_class=$(compare_kernel_vs_running "$pkg_cmp" "$cur_cmp_ver" "$cand_flavor" "$cur_flavor")
 
                 local pkg_krel=""
-                case "$pkg" in
-                    linux-image-[0-9]*)          pkg_krel="${pkg#linux-image-}" ;;
-                    linux-image-unsigned-[0-9]*) pkg_krel="${pkg#linux-image-unsigned-}" ;;
-                    proxmox-kernel-[0-9]*)       pkg_krel="${pkg#proxmox-kernel-}" ;;
-                    pve-kernel-[0-9]*)           pkg_krel="${pkg#pve-kernel-}" ;;
-                esac
+                pkg_krel=$(extract_pkg_krel "$pkg")
                 if [ -n "$pkg_krel" ] && [ -n "$GRUB_PENDING_KERNEL" ] && [ "$pkg_krel" = "$GRUB_PENDING_KERNEL" ]; then
-                    grub_hint=" · GRUB默认下次启动"
+                    grub_hint="·默认启动"
                 fi
 
                 case "$rel_class" in
-                    newer)
-                        note="高于当前内核 · 尚未重启生效${grub_hint}"
-                        ;;
-                    older)
-                        note="旧版本内核 · 可清理${grub_hint}"
-                        ;;
-                    *)
-                        note="同版本其它分支/构建${grub_hint}"
-                        ;;
+                    newer) note="待重启新内核${grub_hint}" ;;
+                    older) note="旧内核${grub_hint}" ;;
+                    *)     note="同系分支${grub_hint}" ;;
                 esac
                 INACTIVE_PKGS+=("$pkg")
-                INACTIVE_TYPES+=("内核包")
+                INACTIVE_TYPES+=("内核")
                 INACTIVE_VERS+=("$ver")
                 INACTIVE_NOTES+=("$note")
                 INACTIVE_CLASSES+=("$rel_class")
+                INACTIVE_STATUSES+=("${st:0:2}")
             fi
         elif is_kernel_metapkg "$pkg" "$deps"; then
             if [ -n "${protected_set[$pkg]:-}" ]; then
@@ -1781,10 +1867,11 @@ scan_installed_kernels() {
 
             if [[ "$st" == rc* ]]; then
                 INACTIVE_PKGS+=("$pkg")
-                INACTIVE_TYPES+=("残留元包")
+                INACTIVE_TYPES+=("残留")
                 INACTIVE_VERS+=("$ver")
-                INACTIVE_NOTES+=("元包残留配置 (rc) · 可安全清理")
+                INACTIVE_NOTES+=("元包残留")
                 INACTIVE_CLASSES+=("older")
+                INACTIVE_STATUSES+=("rc")
             elif [[ "$st" == ii* || "$st" == hi* ]]; then
                 local target_ref="" target_pkg="" meta_cmp="" cand_flavor="" rel_class=""
                 target_ref=$(extract_image_krel_from_depends "$deps")
@@ -1806,15 +1893,16 @@ scan_installed_kernels() {
 
                 local note=""
                 case "$rel_class" in
-                    newer) note="未启用元包 · 指向更高版本${target_ref:+ (${target_ref})} (待重启)" ;;
-                    older) note="未启用旧元包${target_ref:+ (指向 ${target_ref})}" ;;
-                    *)     note="未启用元包 · 其它分支${target_ref:+ (${target_ref})}" ;;
+                    newer) note="待重启元包" ;;
+                    older) note="旧元包" ;;
+                    *)     note="同系元包" ;;
                 esac
                 INACTIVE_PKGS+=("$pkg")
                 INACTIVE_TYPES+=("元包")
                 INACTIVE_VERS+=("$ver")
                 INACTIVE_NOTES+=("$note")
                 INACTIVE_CLASSES+=("$rel_class")
+                INACTIVE_STATUSES+=("${st:0:2}")
             fi
         fi
     done
@@ -1839,286 +1927,448 @@ scan_installed_kernels() {
     CLEANUP_PROTECTED_PKGS=("${!protected_set[@]}")
 }
 
-cleanup_old_kernels_menu() {
-    local -a PROTECTED_RECORDS=() CLEANUP_PROTECTED_PKGS=()
-    local -a INACTIVE_PKGS=() INACTIVE_TYPES=() INACTIVE_VERS=() INACTIVE_NOTES=() INACTIVE_CLASSES=()
-    local -a UNMANAGED_NEWER_KERNELS=() UNMANAGED_OTHER_KERNELS=()
-    local CUR_CMP_VER_DISPLAY="" GRUB_PENDING_KERNEL=""
-
-    scan_installed_kernels
-
-    echo ""
-    print_banner
-    print_system_summary
-
-    echo -e "  ${C_BGREEN}▶ 当前运行内核与关联包 (受保护，不可删除)${C_RESET}"
-    echo -e "    ${C_DIM}当前运行内核:${C_RESET} ${C_BGREEN}${CURRENT_KERNEL}${C_RESET}  ${C_DIM}(比较基准: ${CUR_CMP_VER_DISPLAY})${C_RESET}"
-    if [ "${#PROTECTED_RECORDS[@]}" -eq 0 ]; then
-        warn "dpkg 中无当前内核 '${CURRENT_KERNEL}' 的包记录 (可能为手动编译安装或容器内核)"
-    else
-        local rec r_type r_pkg r_ver r_tag
-        for rec in "${PROTECTED_RECORDS[@]}"; do
-            IFS=$'\t' read -r r_type r_pkg r_ver <<< "$rec"
-            if [ "$r_type" = "元包" ]; then
-                r_tag="[受保护·元包  ]"
-            else
-                r_tag="[受保护·内核包]"
-            fi
-            printf "    ${C_GREEN}%s${C_RESET} ${C_BWHITE}%-36s${C_RESET}  ${C_DIM}版本:${C_RESET} ${C_GREEN}%s${C_RESET}\n" \
-                "$r_tag" "$r_pkg" "$r_ver"
-        done
-    fi
-
-    local total="${#INACTIVE_PKGS[@]}"
-    local old_count=0 newer_count=0 same_count=0 i
-    for ((i = 0; i < total; i++)); do
-        case "${INACTIVE_CLASSES[$i]}" in
-            older) old_count=$((old_count + 1)) ;;
-            newer) newer_count=$((newer_count + 1)) ;;
-            *)     same_count=$((same_count + 1)) ;;
-        esac
+list_apt_kernel_cache_files() {
+    local d
+    for d in /var/cache/apt/archives /var/cache/apt/archives/partial; do
+        [ -d "$d" ] || continue
+        find "$d" -maxdepth 1 -type f \( \
+            -name 'linux-image-*.deb*' -o \
+            -name 'linux-headers-*.deb*' -o \
+            -name 'linux-modules-*.deb*' -o \
+            -name 'linux-tools-*.deb*' -o \
+            -name 'linux-cloud-tools-*.deb*' -o \
+            -name 'linux-buildinfo-*.deb*' -o \
+            -name 'linux-kbuild-*.deb*' -o \
+            -name 'linux-libc-dev*.deb*' -o \
+            -name 'linux-xanmod*.deb*' -o \
+            -name 'linux-generic*.deb*' -o \
+            -name 'linux-lowlatency*.deb*' -o \
+            -name 'linux-virtual*.deb*' -o \
+            -name 'linux-oem*.deb*' -o \
+            -name 'proxmox-kernel*.deb*' -o \
+            -name 'proxmox-headers*.deb*' -o \
+            -name 'pve-kernel*.deb*' -o \
+            -name 'pve-headers*.deb*' \
+        \) 2>/dev/null || true
     done
+}
 
-    if [ "$newer_count" -gt 0 ] || [ "${#UNMANAGED_NEWER_KERNELS[@]}" -gt 0 ]; then
-        echo ""
-        echo -e "  ${C_BYELLOW}提醒: 已安装高于当前运行内核 (${CURRENT_KERNEL}) 的版本，尚未重启生效：${C_RESET}"
-        for ((i = 0; i < total; i++)); do
-            if [ "${INACTIVE_CLASSES[$i]}" = "newer" ] && [[ "${INACTIVE_PKGS[$i]}" =~ ^(linux-image|proxmox-kernel|pve-kernel) ]]; then
-                echo -e "    ${C_BCYAN}•${C_RESET} ${C_BWHITE}${INACTIVE_PKGS[$i]}${C_RESET}  ${C_DIM}版本:${C_RESET} ${C_BGREEN}${INACTIVE_VERS[$i]}${C_RESET}"
-            fi
-        done
-        local uk
-        for uk in "${UNMANAGED_NEWER_KERNELS[@]}"; do
-            echo -e "    ${C_BCYAN}•${C_RESET} ${C_BWHITE}/lib/modules/${uk}${C_RESET}  ${C_DIM}(非 dpkg 管理内核，待重启生效)${C_RESET}"
-        done
-        echo -e "    ${C_DIM}建议: 先重启进入新内核，再清理旧内核 (${CURRENT_KERNEL})。${C_RESET}"
-    fi
-
-    echo ""
-    hr_thin
-    echo -e "  ${C_BYELLOW}▶ 其它已安装但当前未启用的内核包与元包${C_RESET}"
-    echo ""
-
-    if [ "$total" -eq 0 ]; then
-        if [ "${#UNMANAGED_OTHER_KERNELS[@]}" -gt 0 ]; then
-            warn "dpkg 中无未启用内核包，但 /lib/modules 下存在未由 dpkg 管理的内核目录: ${UNMANAGED_OTHER_KERNELS[*]}"
-        elif [ "${#UNMANAGED_NEWER_KERNELS[@]}" -gt 0 ]; then
-            info "dpkg 中无旧内核包；可直接重启以切换至上述新内核。"
-        else
-            ok "未检测到可清理的未启用内核包或元包。"
-        fi
-        pause_continue "按回车键返回主菜单..."
+get_apt_kernel_cache_bytes() {
+    local -a files=()
+    mapfile -t files < <(list_apt_kernel_cache_files)
+    if [ "${#files[@]}" -eq 0 ]; then
+        echo "0"
         return 0
     fi
+    stat -c '%s' "${files[@]}" 2>/dev/null | awk '{s+=$1} END{printf "%.0f\n", s+0}'
+}
 
-    printf "  ${C_DIM}%s %s  %-36s %-32s %s${C_RESET}\n" "编号" "类别    " "软件包名称                          " "版本号                          " "状态说明"
+format_bytes() {
+    local b="${1:-0}"
+    awk -v b="$b" 'BEGIN {
+        if (b >= 1073741824) printf "%.2f GB", b/1073741824;
+        else if (b >= 1048576) printf "%.1f MB", b/1048576;
+        else if (b >= 1024) printf "%.0f KB", b/1024;
+        else printf "%d B", b;
+    }'
+}
+
+clear_apt_kernel_cache() {
+    local before_bytes=0
+    local -a cache_files=()
+    mapfile -t cache_files < <(list_apt_kernel_cache_files)
+    if [ "${#cache_files[@]}" -gt 0 ]; then
+        before_bytes=$(stat -c '%s' "${cache_files[@]}" 2>/dev/null | awk '{s+=$1} END{printf "%.0f\n", s+0}')
+        rm -f "${cache_files[@]}"
+    fi
+    rm -rf /tmp/xanmod-arm64 /tmp/xanmod-* 2>/dev/null || true
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get autoclean </dev/null >/dev/null 2>&1 || true
+    fi
+    if [ "$before_bytes" -gt 0 ]; then
+        ok "已清理 APT 内核缓存: $(format_bytes "$before_bytes")"
+    else
+        info "APT 无残留内核缓存"
+    fi
+}
+
+cleanup_orphaned_kernel_artifacts() {
+    local krel=""
+    for krel in "$@"; do
+        [ -n "$krel" ] || continue
+        [ "$krel" = "$CURRENT_KERNEL" ] && continue
+        local still_inst=0 cand="" st=""
+        for cand in "linux-image-${krel}" "linux-image-unsigned-${krel}" "proxmox-kernel-${krel}" "pve-kernel-${krel}"; do
+            st=$(dpkg-query -W -f='${db:Status-Abbrev}\n' "$cand" 2>/dev/null || true)
+            if [[ "$st" == ii* || "$st" == hi* ]]; then
+                still_inst=1
+                break
+            fi
+        done
+        if [ "$still_inst" -eq 0 ]; then
+            [ -d "/lib/modules/${krel}" ] && rm -rf "/lib/modules/${krel}"
+            rm -f "/boot/initrd.img-${krel}.bak"
+        fi
+    done
+}
+
+select_manual_cleanup_indices() {
+    local -n _out_sel="$1"
+    local total="${#INACTIVE_PKGS[@]}"
+    local back_num=$((total + 1))
+
+    echo ""
     hr_thin
-
+    echo -e "  ${C_BWHITE}选择要卸载的软件包:${C_RESET}"
+    echo ""
+    local i
     for ((i = 0; i < total; i++)); do
         local num=$((i + 1))
-        local p_type="${INACTIVE_TYPES[$i]}"
         local p_name="${INACTIVE_PKGS[$i]}"
-        local p_ver="${INACTIVE_VERS[$i]}"
         local p_note="${INACTIVE_NOTES[$i]}"
         local p_class="${INACTIVE_CLASSES[$i]}"
-
-        local type_color="$C_BYELLOW"
-        local note_color="$C_YELLOW"
-        local p_type_col="$p_type"
-        case "$p_type" in
-            "内核包")   p_type_col="内核包  " ;;
-            "元包")     p_type_col="元包    "; type_color="$C_BMAGENTA" ;;
-            "残留元包") p_type_col="残留元包"; type_color="$C_BMAGENTA" ;;
-            "残留配置") p_type_col="残留配置"; type_color="$C_DIM" ;;
-        esac
-        case "$p_class" in
-            newer) note_color="$C_BCYAN" ;;
-            same)  note_color="$C_MAGENTA" ;;
-            older) note_color="$C_BYELLOW" ;;
-        esac
-
-        printf "  ${C_BOLD}[%2d]${C_RESET} ${type_color}%s${C_RESET}  ${C_BWHITE}%-36s${C_RESET} ${C_YELLOW}%-32s${C_RESET} ${note_color}%s${C_RESET}\n" \
-            "$num" "$p_type_col" "$p_name" "$p_ver" "$p_note"
+        local nc="$C_BYELLOW"
+        [ "$p_class" = "newer" ] && nc="$C_BCYAN"
+        [ "$p_class" = "same" ] && nc="$C_MAGENTA"
+        printf "  ${C_BOLD}%d.${C_RESET} ${C_BWHITE}%s${C_RESET}\n" "$num" "$p_name"
+        echo -e "     ${nc}${p_note}${C_RESET}"
     done
-
-    if [ "${#UNMANAGED_OTHER_KERNELS[@]}" -gt 0 ]; then
-        echo ""
-        echo -e "  ${C_DIM}注: 另有未由 dpkg 管理的内核模块目录 (/lib/modules): ${UNMANAGED_OTHER_KERNELS[*]} (脚本不自动移除手动编译内核)${C_RESET}"
-    fi
-
-    echo ""
+    echo -e "  ${C_BOLD}${back_num}.${C_RESET} ${C_DIM}取消返回${C_RESET}"
     hr_thin
-    if [ "$old_count" -gt 0 ]; then
-        echo -e "  ${C_BOLD}o.${C_RESET} ${C_BGREEN}仅清理旧版本与残留配置 (${old_count} 项)${C_RESET} ${C_DIM}(跳过新版本与同版本其它分支)${C_RESET}"
-    else
-        echo -e "  ${C_DIM}说明: 当前无低于运行内核 (${CURRENT_KERNEL}) 的旧版本包。${C_RESET}"
-    fi
-    if [ "$newer_count" -gt 0 ]; then
-        echo -e "  ${C_BOLD}r.${C_RESET} ${C_BCYAN}暂不清理，立即重启以切换至新内核${C_RESET}"
-        echo -e "  ${C_BOLD}a.${C_RESET} ${C_BRED}清理以上全部未启用项 (包含未重启的新版本内核)${C_RESET}"
-    else
-        echo -e "  ${C_BOLD}a.${C_RESET} ${C_BYELLOW}清理以上全部未启用内核包与元包${C_RESET}"
-    fi
-    echo -e "  ${C_BOLD}编号${C_RESET} ${C_DIM}按编号选择清理 (例: 1 3 或 1-4)${C_RESET}"
-    echo -e "  ${C_BOLD}0.${C_RESET} ${C_DIM}取消并返回主菜单${C_RESET}"
-    echo ""
 
-    local sel="" prompt_opts=""
-    if [ "$old_count" -gt 0 ] && [ "$newer_count" -gt 0 ]; then
-        prompt_opts="o / r / a / 序号 / 0"
-    elif [ "$old_count" -gt 0 ]; then
-        prompt_opts="o / a / 序号 / 0"
-    elif [ "$newer_count" -gt 0 ]; then
-        prompt_opts="r / a / 序号 / 0"
-    else
-        prompt_opts="a / 序号 / 0"
-    fi
-
-    local -a selected_indices=()
-    read -r -p "  请选择操作 [${prompt_opts}]: " sel
-    case "$sel" in
-        0|"")
-            info "已取消清理。"
-            return 0
-            ;;
-        r|R)
-            prompt_enter_reboot "已放弃清理操作，准备重启系统以切换内核！"
-            return 0
-            ;;
-        o|O)
-            for ((i = 0; i < total; i++)); do
-                if [ "${INACTIVE_CLASSES[$i]}" = "older" ]; then
-                    selected_indices+=("$((i + 1))")
-                fi
-            done
-            if [ "${#selected_indices[@]}" -eq 0 ]; then
-                warn "没有符合 [旧版本/残留配置] 条件的软件包。"
-                pause_continue "按回车键返回主菜单..."
-                return 0
-            fi
-            ;;
-        a|A)
-            for ((i = 0; i < total; i++)); do
-                selected_indices+=("$((i + 1))")
-            done
-            ;;
-        *)
-            if ! mapfile -t selected_indices < <(parse_index_selection "$sel" "$total"); then
-                err "输入格式无效或编号越界: '$sel'"
-                pause_continue "按回车键返回主菜单..."
+    local sel=""
+    while true; do
+        read_input sel "  输入编号如 1 2 或 1-3，${back_num} 返回: " || return 1
+        case "$sel" in
+            "")
+                continue
+                ;;
+            "$back_num"|0)
                 return 1
-            fi
-            ;;
-    esac
+                ;;
+            *)
+                if mapfile -t _out_sel < <(parse_index_selection "$sel" "$total"); then
+                    return 0
+                fi
+                warn "编号无效: ${sel}，有效范围 1-${total}"
+                ;;
+        esac
+    done
+}
 
-    local -a purge_pkgs=() newer_selected_msgs=()
-    local -A prot_map=()
-    local p s_idx arr_i
+purge_selected_kernels() {
+    local -a selected_indices=("$@")
+    local -a apt_pkgs=() rc_pkgs=() unhold_pkgs=() purged_krels=() newer_selected=()
+    local -A prot_map=() krel_seen=()
+    local p s_idx arr_i st krel
+
     for p in "${CLEANUP_PROTECTED_PKGS[@]}"; do
         prot_map[$p]=1
     done
 
     echo ""
-    echo -e "  ${C_BRED}将执行 apt purge 卸载以下 ${#selected_indices[@]} 个软件包/元包:${C_RESET}"
+    echo -e "  ${C_BRED}即将卸载以下 ${#selected_indices[@]} 项:${C_RESET}"
     for s_idx in "${selected_indices[@]}"; do
         arr_i=$((s_idx - 1))
         p="${INACTIVE_PKGS[$arr_i]}"
+        st="${INACTIVE_STATUSES[$arr_i]}"
         if [ -n "${prot_map[$p]:-}" ]; then
-            err "已拦截: ${p} 为当前运行内核关联包，不可卸载"
+            err "已拦截受保护包: ${p}"
             return 1
         fi
-        purge_pkgs+=("$p")
-        if [ "${INACTIVE_CLASSES[$arr_i]}" = "newer" ]; then
-            newer_selected_msgs+=("${p} (版本: ${INACTIVE_VERS[$arr_i]})")
+        if [ "$st" = "rc" ]; then
+            rc_pkgs+=("$p")
+        else
+            apt_pkgs+=("$p")
+            [ "$st" = "hi" ] && unhold_pkgs+=("$p")
         fi
-        echo -e "    ${C_RED}✖${C_RESET} ${C_BWHITE}${p}${C_RESET}  ${C_DIM}(版本: ${C_YELLOW}${INACTIVE_VERS[$arr_i]}${C_DIM} | ${INACTIVE_TYPES[$arr_i]})${C_RESET}"
+        krel=$(extract_pkg_krel "$p")
+        if [ -n "$krel" ] && [ -z "${krel_seen[$krel]:-}" ]; then
+            krel_seen[$krel]=1
+            purged_krels+=("$krel")
+        fi
+        if [ "${INACTIVE_CLASSES[$arr_i]}" = "newer" ]; then
+            newer_selected+=("$p")
+        fi
+        echo -e "  ${C_RED}✖${C_RESET} ${C_BWHITE}${p}${C_RESET}"
     done
 
-    if [ "${#newer_selected_msgs[@]}" -gt 0 ]; then
+    if [ "${#newer_selected[@]}" -gt 0 ]; then
         echo ""
-        warn "所选列表包含高于当前运行内核 (${CURRENT_KERNEL}) 的版本:"
-        local nm
-        for nm in "${newer_selected_msgs[@]}"; do
-            echo -e "    ${C_BCYAN}• ${nm}${C_RESET}"
-        done
-        read -r -p "  卸载后重启将无法使用以上新内核，确认继续卸载？[y/N]: " confirm_newer
-        if [[ ! "$confirm_newer" =~ ^[Yy]$ ]]; then
-            info "已取消清理。"
-            return 0
-        fi
-    else
-        echo ""
-        read -r -p "  确认卸载以上软件包并执行 autoremove --purge？[y/N]: " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            info "已取消清理。"
-            return 0
-        fi
+        warn "包含未重启的新版内核，卸载后无法切入新内核"
+    fi
+
+    if ! prompt_binary_menu "确认卸载并清缓存" "取消返回"; then
+        return 0
     fi
 
     echo ""
-    info "正在执行 apt purge..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get purge -y "${purge_pkgs[@]}"; then
-        err "apt-get purge 执行失败，请检查依赖或 dpkg 状态"
-        pause_continue
-        return 1
+    if [ "${#unhold_pkgs[@]}" -gt 0 ]; then
+        info "正在解除内核包锁定..."
+        apt-mark unhold "${unhold_pkgs[@]}" </dev/null >/dev/null 2>&1 || true
     fi
 
-    info "正在执行 autoremove --purge..."
-    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || warn "autoremove 返回非零状态"
+    if [ "${#apt_pkgs[@]}" -gt 0 ]; then
+        info "正在卸载旧内核包..."
+        if ! DEBIAN_FRONTEND=noninteractive apt-get purge -y \
+            -o Dpkg::Options::=--force-confdef \
+            -o Dpkg::Options::=--force-confold \
+            "${apt_pkgs[@]}" </dev/null; then
+            err "apt-get purge 执行失败"
+            return 1
+        fi
+        local leftover_rc="" p_st p_nm
+        while IFS=$'\t' read -r p_st p_nm; do
+            [ -n "$p_nm" ] || continue
+            [[ "$p_st" == rc* ]] && rc_pkgs+=("$p_nm")
+        done < <(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' "${apt_pkgs[@]}" 2>/dev/null || true)
+    fi
+
+    if [ "${#rc_pkgs[@]}" -gt 0 ]; then
+        info "正在清理残留配置..."
+        DEBIAN_FRONTEND=noninteractive dpkg --purge "${rc_pkgs[@]}" </dev/null || warn "部分残留配置清理异常"
+    fi
+
+    if [ "${#apt_pkgs[@]}" -gt 0 ]; then
+        info "正在执行 autoremove..."
+        DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y </dev/null || warn "autoremove 返回异常"
+    fi
+
+    if [ "${#purged_krels[@]}" -gt 0 ]; then
+        cleanup_orphaned_kernel_artifacts "${purged_krels[@]}"
+    fi
+
+    clear_apt_kernel_cache
 
     if command -v update-grub >/dev/null 2>&1 && [ -d /boot/grub ]; then
         info "正在更新 GRUB 配置..."
-        if update-grub; then
+        if update-grub </dev/null; then
             if [ -f /boot/grub/grub.cfg ] && [ -f /boot/grub/grubenv ]; then
                 local saved_entry=""
                 saved_entry=$(grub-editenv /boot/grub/grubenv list 2>/dev/null | sed -n 's/^saved_entry=//p')
                 if [ -n "$saved_entry" ] && [[ "$saved_entry" != [0-9]* ]]; then
                     local leaf_id="${saved_entry##*>}"
                     if ! grep -Fq -- "$leaf_id" /boot/grub/grub.cfg; then
-                        warn "原 GRUB 默认启动项已被移除，正在重新指向当前运行内核 (${CURRENT_KERNEL})..."
-                        configure_grub_for_kernel "$CURRENT_KERNEL" || warn "更新 GRUB 默认启动项失败，请手动检查"
+                        warn "原默认启动项已移除，重置为 ${CURRENT_KERNEL}"
+                        configure_grub_for_kernel "$CURRENT_KERNEL" || warn "更新 GRUB 默认项失败"
                     fi
                 fi
             fi
         else
-            warn "update-grub 执行失败，重启前请手动检查 GRUB 配置"
+            warn "update-grub 执行失败，请检查 GRUB"
         fi
     fi
 
-    prompt_enter_reboot "旧内核清理完成。"
+    prompt_reboot_choice "旧内核与缓存清理完成"
+    return 0
+}
+
+cleanup_old_kernels_menu() {
+    while true; do
+        local -a PROTECTED_RECORDS=() CLEANUP_PROTECTED_PKGS=()
+        local -a INACTIVE_PKGS=() INACTIVE_TYPES=() INACTIVE_VERS=() INACTIVE_NOTES=() INACTIVE_CLASSES=() INACTIVE_STATUSES=()
+        local -a UNMANAGED_NEWER_KERNELS=() UNMANAGED_OTHER_KERNELS=()
+        local CUR_CMP_VER_DISPLAY="" GRUB_PENDING_KERNEL=""
+
+        scan_installed_kernels
+
+        local total="${#INACTIVE_PKGS[@]}"
+        local old_count=0 newer_count=0 same_count=0 i
+        for ((i = 0; i < total; i++)); do
+            case "${INACTIVE_CLASSES[$i]}" in
+                older) old_count=$((old_count + 1)) ;;
+                newer) newer_count=$((newer_count + 1)) ;;
+                *)     same_count=$((same_count + 1)) ;;
+            esac
+        done
+
+        local cache_bytes=0
+        cache_bytes=$(get_apt_kernel_cache_bytes)
+
+        print_banner
+        print_system_summary
+
+        echo -e "  ${C_BGREEN}受保护内核:${C_RESET}"
+        if [ "${#PROTECTED_RECORDS[@]}" -eq 0 ]; then
+            echo -e "  ${C_YELLOW}•${C_RESET} ${CURRENT_KERNEL}"
+        else
+            local rec r_type r_pkg r_ver
+            for rec in "${PROTECTED_RECORDS[@]}"; do
+                IFS=$'\t' read -r r_type r_pkg r_ver <<< "$rec"
+                echo -e "  ${C_GREEN}•${C_RESET} ${C_BWHITE}${r_pkg}${C_RESET}"
+            done
+        fi
+
+        if [ "$newer_count" -gt 0 ] || [ "${#UNMANAGED_NEWER_KERNELS[@]}" -gt 0 ]; then
+            echo ""
+            echo -e "  ${C_BCYAN}待重启新内核:${C_RESET}"
+            for ((i = 0; i < total; i++)); do
+                if [ "${INACTIVE_CLASSES[$i]}" = "newer" ] && [[ "${INACTIVE_PKGS[$i]}" =~ ^(linux-image|proxmox-kernel|pve-kernel) ]]; then
+                    echo -e "  ${C_BCYAN}•${C_RESET} ${C_BWHITE}${INACTIVE_PKGS[$i]}${C_RESET}"
+                fi
+            done
+            local uk
+            for uk in "${UNMANAGED_NEWER_KERNELS[@]}"; do
+                echo -e "  ${C_BCYAN}•${C_RESET} /lib/modules/${uk}"
+            done
+        fi
+
+        if [ "$old_count" -gt 0 ]; then
+            echo ""
+            echo -e "  ${C_BYELLOW}可清理旧内核:${C_RESET}"
+            for ((i = 0; i < total; i++)); do
+                if [ "${INACTIVE_CLASSES[$i]}" = "older" ]; then
+                    local suffix=""
+                    [ "${INACTIVE_STATUSES[$i]}" = "rc" ] && suffix=" ${C_DIM}[残留]${C_RESET}"
+                    echo -e "  ${C_YELLOW}•${C_RESET} ${C_BWHITE}${INACTIVE_PKGS[$i]}${C_RESET}${suffix}"
+                fi
+            done
+        fi
+
+        if [ "$same_count" -gt 0 ]; then
+            echo ""
+            echo -e "  ${C_MAGENTA}同系其它分支:${C_RESET}"
+            for ((i = 0; i < total; i++)); do
+                if [ "${INACTIVE_CLASSES[$i]}" != "older" ] && [ "${INACTIVE_CLASSES[$i]}" != "newer" ]; then
+                    echo -e "  ${C_MAGENTA}•${C_RESET} ${C_BWHITE}${INACTIVE_PKGS[$i]}${C_RESET}"
+                fi
+            done
+        fi
+
+        if [ "${#UNMANAGED_OTHER_KERNELS[@]}" -gt 0 ]; then
+            echo ""
+            echo -e "  ${C_DIM}手动编译模块: ${UNMANAGED_OTHER_KERNELS[*]}${C_RESET}"
+        fi
+
+        echo ""
+        echo -e "  ${C_DIM}APT 内核缓存:${C_RESET} ${C_CYAN}$(format_bytes "$cache_bytes")${C_RESET}"
+        hr_thin
+
+        if [ "$total" -eq 0 ] && [ "$cache_bytes" -eq 0 ]; then
+            ok "无需清理的旧内核或缓存"
+            if prompt_binary_menu "刷新检测" "返回主菜单"; then
+                continue
+            fi
+            return 0
+        fi
+
+        local -a act_keys=() act_labels=()
+        if [ "$old_count" -gt 0 ]; then
+            act_keys+=("old")
+            act_labels+=("${C_BGREEN}清理全部旧内核 · ${old_count} 项${C_RESET}")
+        fi
+        if [ "$newer_count" -gt 0 ]; then
+            act_keys+=("reboot")
+            act_labels+=("${C_BCYAN}立即重启切换新内核${C_RESET}")
+        fi
+        if [ "$newer_count" -gt 0 ] || [ "$same_count" -gt 0 ]; then
+            act_keys+=("all")
+            act_labels+=("${C_BRED}清理全部未启用 · ${total} 项${C_RESET}")
+        fi
+        if [ "$total" -gt 0 ]; then
+            act_keys+=("pick")
+            act_labels+=("按编号选择卸载")
+        fi
+        if [ "$cache_bytes" -gt 0 ]; then
+            act_keys+=("cache")
+            act_labels+=("${C_CYAN}仅清 APT 内核缓存${C_RESET}")
+        fi
+        act_keys+=("back")
+        act_labels+=("${C_DIM}返回主菜单${C_RESET}")
+
+        local opt_count="${#act_keys[@]}"
+        for ((i = 0; i < opt_count; i++)); do
+            echo -e "  ${C_BOLD}$((i + 1)).${C_RESET} ${act_labels[$i]}"
+        done
+        hr_thin
+
+        local sel="" chosen_key=""
+        while true; do
+            read_input sel "  请选择 1-${opt_count}: " || return 0
+            case "$sel" in
+                "")
+                    continue
+                    ;;
+                0)
+                    return 0
+                    ;;
+                *)
+                    if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$opt_count" ]; then
+                        chosen_key="${act_keys[$((sel - 1))]}"
+                        break
+                    fi
+                    warn "无效选项: ${sel}，请输入 1-${opt_count}"
+                    ;;
+            esac
+        done
+
+        local -a selected_indices=()
+        case "$chosen_key" in
+            back)
+                return 0
+                ;;
+            reboot)
+                prompt_reboot_choice "准备重启切换至新内核"
+                return 0
+                ;;
+            cache)
+                clear_apt_kernel_cache
+                ;;
+            old)
+                for ((i = 0; i < total; i++)); do
+                    [ "${INACTIVE_CLASSES[$i]}" = "older" ] && selected_indices+=("$((i + 1))")
+                done
+                purge_selected_kernels "${selected_indices[@]}" || pause_continue "按回车继续..."
+                ;;
+            all)
+                for ((i = 0; i < total; i++)); do
+                    selected_indices+=("$((i + 1))")
+                done
+                purge_selected_kernels "${selected_indices[@]}" || pause_continue "按回车继续..."
+                ;;
+            pick)
+                if select_manual_cleanup_indices selected_indices; then
+                    purge_selected_kernels "${selected_indices[@]}" || pause_continue "按回车继续..."
+                fi
+                ;;
+        esac
+    done
 }
 
 main_menu() {
     while true; do
-        echo ""
         print_banner
         print_system_summary
-        echo -e "  ${C_BWHITE}操作菜单:${C_RESET}"
-        echo ""
-        echo -e "    ${C_BOLD}1.${C_RESET} ${C_BGREEN}XanMod 内核安装${C_RESET}   ${C_DIM}(检测架构与可用版本并安装)${C_RESET}"
-        echo -e "    ${C_BOLD}2.${C_RESET} ${C_BYELLOW}旧内核清理${C_RESET}        ${C_DIM}(检测运行内核、新旧内核与元包版本并清理)${C_RESET}"
-        echo -e "    ${C_BOLD}3.${C_RESET} ${C_DIM}退出${C_RESET}"
-        echo ""
+        echo -e "  ${C_BOLD}1.${C_RESET} ${C_BGREEN}安装 XanMod 内核${C_RESET}"
+        echo -e "  ${C_BOLD}2.${C_RESET} ${C_BYELLOW}清理旧内核${C_RESET}"
+        echo -e "  ${C_BOLD}3.${C_RESET} ${C_DIM}退出${C_RESET}"
         hr
 
         local opt=""
-        read -r -p "  请输入选项 [1-3]: " opt
-        case "$opt" in
-            1)
-                install_xanmod_menu
-                ;;
-            2)
-                cleanup_old_kernels_menu
-                ;;
-            3|q|Q|0)
-                echo ""
-                info "已退出。"
-                exit 0
-                ;;
-            *)
-                warn "无效选项: '$opt'，请输入 1、2 或 3"
-                ;;
-        esac
+        while true; do
+            read_input opt "  请选择 1-3: " || return 0
+            case "$opt" in
+                "")
+                    continue
+                    ;;
+                1)
+                    install_xanmod_menu
+                    break
+                    ;;
+                2)
+                    cleanup_old_kernels_menu
+                    break
+                    ;;
+                3|0)
+                    echo ""
+                    info "已退出。"
+                    exit 0
+                    ;;
+                *)
+                    warn "无效选项: ${opt}，请输入 1-3"
+                    ;;
+            esac
+        done
     done
 }
 
