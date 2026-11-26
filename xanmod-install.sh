@@ -907,12 +907,76 @@ lookup_apt_metapkg() {
     ' "$repo_txt" | sort -V | tail -n1
 }
 
+get_metapkg_owned_kernels() {
+    local exclude_pkg="${1:-}"
+    local st="" pkg="" deps="" krel=""
+    while IFS=$'\t' read -r st pkg deps; do
+        [ -n "$pkg" ] || continue
+        [ "$pkg" = "$exclude_pkg" ] && continue
+        if [[ "$st" == ii* || "$st" == hi* ]]; then
+            krel=$(extract_image_krel_from_depends "$deps")
+            [ -n "$krel" ] && printf '%s\n' "$krel"
+        fi
+    done < <(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\t${Depends}\n' 'linux-xanmod*' 2>/dev/null || true)
+}
+
+resolve_unmanaged_channel_install() {
+    local ch="$1"
+    local installed_imgs="$2"
+    local excluded_imgs="$3"
+    local target_k="${CH_TARGET_KERNEL[$ch]:-}"
+    [ -n "$target_k" ] || return 0
+
+    if { grep -Fxq "$target_k" <<< "$installed_imgs" || [ -d "/lib/modules/${target_k}" ]; } && \
+       ! grep -Fxq "$target_k" <<< "$excluded_imgs"; then
+        CH_INSTALLED_VER[$ch]="$target_k"
+        return 0
+    fi
+
+    [ -n "$installed_imgs" ] || return 0
+    local online_mm=""
+    if [[ "$target_k" =~ ^([0-9]+\.[0-9]+)\. ]]; then
+        online_mm="${BASH_REMATCH[1]}"
+    fi
+    [ -n "$online_mm" ] || return 0
+
+    local cand="" rel="" best=""
+    while IFS= read -r cand; do
+        [ -n "$cand" ] || continue
+        grep -Fxq "$cand" <<< "$excluded_imgs" && continue
+        rel=$(compare_kernel_vs_running "$(get_pkg_cmp_version "linux-image-${target_k}" "$target_k")" "$(get_pkg_cmp_version "linux-image-${cand}" "$cand")" "$(extract_pkg_flavor "linux-image-${target_k}")" "$(extract_pkg_flavor "linux-image-${cand}")")
+        if [ "$rel" = "newer" ]; then
+            best="$cand"
+        fi
+    done < <(grep -E "^${online_mm}\." <<< "$installed_imgs" | sort -V || true)
+
+    [ -n "$best" ] && CH_INSTALLED_VER[$ch]="$best"
+    return 0
+}
+
+resolve_all_unmanaged_channels() {
+    local installed_imgs="$1"
+    [ -n "$installed_imgs" ] || return 0
+
+    local meta_owned="" ch
+    meta_owned=$(get_metapkg_owned_kernels)
+    for ch in "${CHANNELS[@]}"; do
+        [ -n "${CH_META_INSTALLED[$ch]:-}" ] && continue
+        [ -n "${CH_TARGET_KERNEL[$ch]:-}" ] || continue
+        local excluded="$meta_owned" other_ch
+        for other_ch in "${CHANNELS[@]}"; do
+            [ "$other_ch" = "$ch" ] && continue
+            [ -n "${CH_TARGET_KERNEL[$other_ch]:-}" ] && excluded="${excluded}"$'\n'"${CH_TARGET_KERNEL[$other_ch]}"
+        done
+        resolve_unmanaged_channel_install "$ch" "$installed_imgs" "$excluded"
+    done
+}
+
 record_apt_metapkg_state() {
     local ch="$1"
     local pkg="$2"
     local repo_txt="$3"
     local missing_msg="$4"
-    local installed_imgs="${5:-}"
 
     CH_PKG_OR_TAG[$ch]="$pkg"
 
@@ -931,19 +995,6 @@ record_apt_metapkg_state() {
     if [[ "$meta_info" == ii* || "$meta_info" == hi* ]]; then
         CH_META_INSTALLED[$ch]="${meta_info#*$'\t'}"
         CH_INSTALLED_VER[$ch]="${CH_META_INSTALLED[$ch]}"
-    elif [ -n "$installed_imgs" ] && [ -n "${CH_TARGET_KERNEL[$ch]}" ]; then
-        local target_k="${CH_TARGET_KERNEL[$ch]}"
-        local online_mm=""
-        if [[ "$target_k" =~ ^([0-9]+\.[0-9]+)\. ]]; then
-            online_mm="${BASH_REMATCH[1]}"
-        fi
-        if grep -Fxq "$target_k" <<< "$installed_imgs" || [ -d "/lib/modules/${target_k}" ]; then
-            CH_INSTALLED_VER[$ch]="$target_k"
-        elif [ -n "$online_mm" ]; then
-            local same_series=""
-            same_series=$(grep -E "^${online_mm}\." <<< "$installed_imgs" | sort -V | tail -n1 || true)
-            [ -n "$same_series" ] && CH_INSTALLED_VER[$ch]="$same_series"
-        fi
     fi
 }
 
@@ -1026,7 +1077,7 @@ fetch_arm64_apt_channels() {
     local ch pkg found_any=0
     for ch in "${CHANNELS[@]}"; do
         pkg=$(arm64_metapkg_name "$ch")
-        record_apt_metapkg_state "$ch" "$pkg" "$repo_txt" "APT 源暂未收录 ${pkg}" "$installed_imgs"
+        record_apt_metapkg_state "$ch" "$pkg" "$repo_txt" "APT 源暂未收录 ${pkg}"
         if [ -n "${CH_ONLINE_VER[$ch]}" ]; then
             found_any=1
         fi
@@ -1035,6 +1086,7 @@ fetch_arm64_apt_channels() {
     if [ "$found_any" -eq 0 ]; then
         return 1
     fi
+    resolve_all_unmanaged_channels "$installed_imgs"
     ARM64_USE_APT=1
     return 0
 }
@@ -1105,26 +1157,12 @@ fetch_arm64_channels() {
         if [ -z "$img_url" ] || [ -z "$hdr_url" ]; then
             CH_UNAVAIL_REASON[$ch]="Release (${tag}) 缺少完整的 image/headers deb 资产"
             CH_ONLINE_VER[$ch]=""
+            CH_TARGET_KERNEL[$ch]=""
             continue
-        fi
-
-        local target_k="${CH_TARGET_KERNEL[$ch]}"
-        local online_mm=""
-        if [[ "$target_k" =~ ^([0-9]+\.[0-9]+)\. ]]; then
-            online_mm="${BASH_REMATCH[1]}"
-        fi
-
-        if grep -Fxq "$target_k" <<< "$installed_imgs" || [ -d "/lib/modules/${target_k}" ]; then
-            CH_INSTALLED_VER[$ch]="$target_k"
-        elif [ -n "$online_mm" ]; then
-            local same_series=""
-            same_series=$(grep -E "^${online_mm}\." <<< "$installed_imgs" | sort -V | tail -n1 || true)
-            if [ -n "$same_series" ]; then
-                CH_INSTALLED_VER[$ch]="$same_series"
-            fi
         fi
     done
 
+    resolve_all_unmanaged_channels "$installed_imgs"
     return 0
 }
 
@@ -1453,7 +1491,15 @@ install_xanmod_menu() {
                         badge="${C_BCYAN}[待重启]${C_RESET}"
                     fi
                 elif [ -n "$inst_v" ]; then
-                    badge="${C_BYELLOW}[可升级]${C_RESET}"
+                    if [ -n "$meta_inst" ] && dpkg --compare-versions "$inst_v" ge "$online_v" 2>/dev/null; then
+                        if [ -n "$target_k" ] && [ "$CURRENT_KERNEL" = "$target_k" ]; then
+                            badge="${C_BGREEN}[运行中]${C_RESET}"
+                        else
+                            badge="${C_BCYAN}[已安装]${C_RESET}"
+                        fi
+                    else
+                        badge="${C_BYELLOW}[可升级]${C_RESET}"
+                    fi
                 else
                     badge="${C_DIM}[未安装]${C_RESET}"
                 fi
