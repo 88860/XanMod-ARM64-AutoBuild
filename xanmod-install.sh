@@ -177,14 +177,14 @@ prompt_binary_menu() {
     local pick=""
     echo ""
     echo -e "  ${C_BOLD}1.${C_RESET} ${opt1}"
-    echo -e "  ${C_BOLD}2.${C_RESET} ${opt2}"
+    echo -e "  ${C_BOLD}0.${C_RESET} ${opt2}"
     while true; do
-        read_input pick "  请选择 1-2: " || return 1
+        read_input pick "  请选择: " || return 1
         case "$pick" in
             "") continue ;;
             1)  return 0 ;;
-            2|0) return 1 ;;
-            *)  warn "无效选项: ${pick}，请输入 1 或 2" ;;
+            0)  return 1 ;;
+            *)  warn "无效选项: ${pick}" ;;
         esac
     done
 }
@@ -196,34 +196,18 @@ pause_continue() {
     read_input dummy "  ${C_DIM}${msg}${C_RESET} " || true
 }
 
-prompt_reboot_choice() {
+prompt_enter_reboot() {
     local reason="$1"
-    local pick=""
+    local dummy=""
     echo ""
     hr
     ok "$reason"
-    echo -e "  ${C_BOLD}1.${C_RESET} ${C_BYELLOW}立即重启生效${C_RESET}"
-    echo -e "  ${C_BOLD}2.${C_RESET} ${C_DIM}稍后手动重启${C_RESET}"
-    while true; do
-        read_input pick "  请选择 1-2: " || return 0
-        case "$pick" in
-            "")
-                continue
-                ;;
-            1)
-                cleanup_tmp
-                info "正在重启系统..."
-                reboot || /sbin/reboot || systemctl reboot || die "执行重启失败，请手动执行 reboot"
-                return 0
-                ;;
-            2|0)
-                return 0
-                ;;
-            *)
-                warn "无效选项: ${pick}，请输入 1 或 2"
-                ;;
-        esac
-    done
+    echo -e "  ${C_BYELLOW}按回车立即重启，Ctrl+C 取消${C_RESET}"
+    flush_tty_input
+    read_input dummy "  > " || return 0
+    cleanup_tmp
+    info "正在重启系统..."
+    reboot || /sbin/reboot || systemctl reboot || die "执行重启失败，请手动执行 reboot"
 }
 
 print_banner() {
@@ -1312,7 +1296,7 @@ install_apt_channel() {
 
     configure_grub_for_kernel "$target_k" || return 1
     INSTALL_CHANGED=1
-    prompt_reboot_choice "XanMod ${ch^^} 安装完成"
+    prompt_enter_reboot "XanMod ${ch^^} 安装完成"
 }
 
 install_amd64_channel() {
@@ -1347,16 +1331,16 @@ install_arm64_channel() {
             echo -e "  ${C_BOLD}1.${C_RESET} 设为默认启动并重启"
         fi
         echo -e "  ${C_BOLD}2.${C_RESET} 重新下载并重装"
-        echo -e "  ${C_BOLD}3.${C_RESET} 取消返回"
+        echo -e "  ${C_BOLD}0.${C_RESET} 取消返回"
         local act=""
         while true; do
-            read_input act "  请选择 1-3: " || return 0
+            read_input act "  请选择: " || return 0
             case "$act" in
                 "") continue ;;
                 1)  do_deb_install=0; break ;;
                 2)  do_deb_install=1; break ;;
-                3|0) return 0 ;;
-                *)  warn "无效选项: ${act}，请输入 1-3" ;;
+                0)  return 0 ;;
+                *)  warn "无效选项: ${act}" ;;
             esac
         done
     else
@@ -1432,7 +1416,7 @@ install_arm64_channel() {
 
     configure_grub_for_kernel "$target_k" || return 1
     INSTALL_CHANGED=1
-    prompt_reboot_choice "XanMod ARM64 ${ch^^} 安装完成"
+    prompt_enter_reboot "XanMod ARM64 ${ch^^} 安装完成"
 }
 
 install_xanmod_menu() {
@@ -1509,12 +1493,12 @@ install_xanmod_menu() {
         done
 
         echo -e "  ${C_BOLD}4.${C_RESET} ${C_CYAN}刷新版本${C_RESET}"
-        echo -e "  ${C_BOLD}5.${C_RESET} ${C_DIM}返回主菜单${C_RESET}"
+        echo -e "  ${C_BOLD}0.${C_RESET} ${C_DIM}返回主菜单${C_RESET}"
         hr_thin
 
         local choice=""
         while true; do
-            read_input choice "  请选择 1-5: " || return 0
+            read_input choice "  请选择: " || return 0
             case "$choice" in
                 "")
                     continue
@@ -1538,11 +1522,11 @@ install_xanmod_menu() {
                     need_refresh=1
                     break
                     ;;
-                5|0)
+                0)
                     return 0
                     ;;
                 *)
-                    warn "无效选项: ${choice}，请输入 1-5"
+                    warn "无效选项: ${choice}"
                     ;;
             esac
         done
@@ -2076,7 +2060,6 @@ cleanup_orphaned_kernel_artifacts() {
 select_manual_cleanup_indices() {
     local -n _out_sel="$1"
     local total="${#INACTIVE_PKGS[@]}"
-    local back_num=$((total + 1))
 
     echo ""
     hr_thin
@@ -2094,24 +2077,24 @@ select_manual_cleanup_indices() {
         printf "  ${C_BOLD}%d.${C_RESET} ${C_BWHITE}%s${C_RESET}\n" "$num" "$p_name"
         echo -e "     ${nc}${p_note}${C_RESET}"
     done
-    echo -e "  ${C_BOLD}${back_num}.${C_RESET} ${C_DIM}取消返回${C_RESET}"
+    echo -e "  ${C_BOLD}0.${C_RESET} ${C_DIM}取消返回${C_RESET}"
     hr_thin
 
     local sel=""
     while true; do
-        read_input sel "  输入编号如 1 2 或 1-3，${back_num} 返回: " || return 1
+        read_input sel "  输入编号，空格分隔，0 返回: " || return 1
         case "$sel" in
             "")
                 continue
                 ;;
-            "$back_num"|0)
+            0)
                 return 1
                 ;;
             *)
                 if mapfile -t _out_sel < <(parse_index_selection "$sel" "$total"); then
                     return 0
                 fi
-                warn "编号无效: ${sel}，有效范围 1-${total}"
+                warn "编号无效: ${sel}"
                 ;;
         esac
     done
@@ -2220,7 +2203,7 @@ purge_selected_kernels() {
         fi
     fi
 
-    prompt_reboot_choice "旧内核与缓存清理完成"
+    prompt_enter_reboot "旧内核与缓存清理完成"
     return 0
 }
 
@@ -2334,18 +2317,17 @@ cleanup_old_kernels_menu() {
             act_keys+=("cache")
             act_labels+=("${C_CYAN}仅清 APT 内核缓存${C_RESET}")
         fi
-        act_keys+=("back")
-        act_labels+=("${C_DIM}返回主菜单${C_RESET}")
 
         local opt_count="${#act_keys[@]}"
         for ((i = 0; i < opt_count; i++)); do
             echo -e "  ${C_BOLD}$((i + 1)).${C_RESET} ${act_labels[$i]}"
         done
+        echo -e "  ${C_BOLD}0.${C_RESET} ${C_DIM}返回主菜单${C_RESET}"
         hr_thin
 
         local sel="" chosen_key=""
         while true; do
-            read_input sel "  请选择 1-${opt_count}: " || return 0
+            read_input sel "  请选择: " || return 0
             case "$sel" in
                 "")
                     continue
@@ -2358,18 +2340,15 @@ cleanup_old_kernels_menu() {
                         chosen_key="${act_keys[$((sel - 1))]}"
                         break
                     fi
-                    warn "无效选项: ${sel}，请输入 1-${opt_count}"
+                    warn "无效选项: ${sel}"
                     ;;
             esac
         done
 
         local -a selected_indices=()
         case "$chosen_key" in
-            back)
-                return 0
-                ;;
             reboot)
-                prompt_reboot_choice "准备重启切换至新内核"
+                prompt_enter_reboot "准备重启切换至新内核"
                 return 0
                 ;;
             cache)
@@ -2413,7 +2392,7 @@ main_menu() {
 
         local opt=""
         while true; do
-            read_input opt "  请选择 1-3: " || return 0
+            read_input opt "  请选择: " || return 0
             case "$opt" in
                 "")
                     continue
@@ -2432,7 +2411,7 @@ main_menu() {
                     exit 0
                     ;;
                 *)
-                    warn "无效选项: ${opt}，请输入 1-3"
+                    warn "无效选项: ${opt}"
                     ;;
             esac
         done
