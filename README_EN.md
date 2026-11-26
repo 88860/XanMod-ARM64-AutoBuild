@@ -177,9 +177,7 @@ reboot
 ### Usage
 
 ```bash
-curl -fsSL -o /tmp/xanmod-install.sh https://raw.githubusercontent.com/88860/XanMod-ARM64-AutoBuild/main/xanmod-install.sh
-bash /tmp/xanmod-install.sh
-rm -f /tmp/xanmod-install.sh
+curl -fsSL -o /tmp/xanmod-install.sh https://raw.githubusercontent.com/88860/XanMod-ARM64-AutoBuild/main/xanmod-install.sh && bash /tmp/xanmod-install.sh; rm -f /tmp/xanmod-install.sh
 ```
 
 > All installation commands above assume `root` privileges; if you are logged in as a non-root user, switch to root first (`su -`) or prepend `sudo`. If `curl` is absent on a minimal system, fetch the script with `wget -qO /tmp/xanmod-install.sh ...` or `/usr/lib/apt/apt-helper download-file ... /tmp/xanmod-install.sh`; temporary download directories are removed automatically before exit or reboot.

@@ -143,6 +143,21 @@ normalize_input() {
     printf '%s' "$v"
 }
 
+flush_tty_input() {
+    [ -t 0 ] || return 0
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import termios; termios.tcflush(0, termios.TCIFLUSH)' 2>/dev/null || true
+        return 0
+    fi
+    local saved_stty=""
+    saved_stty=$(stty -g 2>/dev/null || true)
+    if [ -n "$saved_stty" ]; then
+        stty -icanon -echo min 0 time 0 2>/dev/null || true
+        while IFS= read -r -t 0.01 -n 4096 _ 2>/dev/null; do :; done
+        stty "$saved_stty" 2>/dev/null || true
+    fi
+}
+
 read_input() {
     local out_var="$1"
     local prompt_str="$2"
@@ -2336,6 +2351,7 @@ cleanup_old_kernels_menu() {
 }
 
 main_menu() {
+    local first_prompt=1
     while true; do
         print_banner
         print_system_summary
@@ -2343,6 +2359,11 @@ main_menu() {
         echo -e "  ${C_BOLD}2.${C_RESET} ${C_BYELLOW}清理旧内核${C_RESET}"
         echo -e "  ${C_BOLD}3.${C_RESET} ${C_DIM}退出${C_RESET}"
         hr
+
+        if [ "$first_prompt" -eq 1 ]; then
+            flush_tty_input
+            first_prompt=0
+        fi
 
         local opt=""
         while true; do
