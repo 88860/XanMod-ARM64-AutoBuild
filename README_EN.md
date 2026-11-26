@@ -132,20 +132,20 @@ Workflow file: [`/.github/workflows/xanmod-arm64.yml`](.github/workflows/xanmod-
 ### Option A: Managed via GitHub Pages APT Repository (Recommended)
 
 ```bash
-sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://88860.github.io/XanMod-ARM64-AutoBuild/xanmod-arm64.gpg | sudo tee /etc/apt/keyrings/xanmod-arm64.gpg >/dev/null
-sudo chmod 0644 /etc/apt/keyrings/xanmod-arm64.gpg
-echo "deb [signed-by=/etc/apt/keyrings/xanmod-arm64.gpg arch=arm64] https://88860.github.io/XanMod-ARM64-AutoBuild stable main" | sudo tee /etc/apt/sources.list.d/xanmod-arm64.list
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://88860.github.io/XanMod-ARM64-AutoBuild/xanmod-arm64.gpg -o /etc/apt/keyrings/xanmod-arm64.gpg
+chmod 0644 /etc/apt/keyrings/xanmod-arm64.gpg
+echo "deb [signed-by=/etc/apt/keyrings/xanmod-arm64.gpg arch=arm64] https://88860.github.io/XanMod-ARM64-AutoBuild stable main" > /etc/apt/sources.list.d/xanmod-arm64.list
 
-sudo apt update
+apt update
 # Install one channel metapackage:
-sudo apt install -y linux-xanmod-arm64       # MAIN
-# sudo apt install -y linux-xanmod-edge-arm64  # EDGE
-# sudo apt install -y linux-xanmod-lts-arm64   # LTS
-sudo update-grub && sudo reboot
+apt install -y linux-xanmod-arm64       # MAIN
+# apt install -y linux-xanmod-edge-arm64  # EDGE
+# apt install -y linux-xanmod-lts-arm64   # LTS
+update-grub && reboot
 ```
 
-Future updates are then delivered automatically via `sudo apt update && sudo apt upgrade`.
+Future updates are then delivered automatically via `apt update && apt upgrade`.
 
 ### Option B: Manual Download, Verification & Install (`edge` / `main` / `lts`)
 
@@ -157,12 +157,12 @@ mkdir -p /tmp/xanmod-arm64 && cd /tmp/xanmod-arm64
 sha256sum --ignore-missing -c SHA256SUMS
 
 # 3. Install kernel image and headers
-sudo apt update
-sudo apt install -y ./linux-image-*_arm64.deb ./linux-headers-*_arm64.deb
+apt update
+apt install -y ./linux-image-*_arm64.deb ./linux-headers-*_arm64.deb
 
 # 4. Update GRUB and reboot
-sudo update-grub
-sudo reboot
+update-grub
+reboot
 ```
 
 > [!NOTE]
@@ -178,11 +178,11 @@ sudo reboot
 
 ```bash
 curl -fsSL -o /tmp/xanmod-install.sh https://raw.githubusercontent.com/88860/XanMod-ARM64-AutoBuild/main/xanmod-install.sh
-sudo bash /tmp/xanmod-install.sh
+bash /tmp/xanmod-install.sh
 rm -f /tmp/xanmod-install.sh
 ```
 
-> If `curl` is absent on a minimal system, fetch the script with `wget -qO /tmp/xanmod-install.sh ...` or `/usr/lib/apt/apt-helper download-file ... /tmp/xanmod-install.sh`; temporary download directories are removed automatically before exit or reboot.
+> All installation commands above assume `root` privileges; if you are logged in as a non-root user, switch to root first (`su -`) or prepend `sudo`. If `curl` is absent on a minimal system, fetch the script with `wget -qO /tmp/xanmod-install.sh ...` or `/usr/lib/apt/apt-helper download-file ... /tmp/xanmod-install.sh`; temporary download directories are removed automatically before exit or reboot.
 
 ### Features
 
