@@ -19,6 +19,8 @@ OS_PRETTY_NAME="Unknown Linux"
 OS_CODENAME=""
 TMP_WORK_DIR=""
 ARM64_USE_APT=0
+HTTP_LAST_ERROR=""
+XANMOD_APT_BASE="https://deb.xanmod.org"
 
 declare -A CH_ONLINE_VER
 declare -A CH_TARGET_KERNEL
@@ -411,50 +413,102 @@ http_get() {
     local max_time="${3:-60}"
     local quiet="${4:-1}"
 
+    HTTP_LAST_ERROR=""
     rm -f "$dest"
 
+    local err_file="" rc=1 flag=""
+    err_file=$(mktemp 2>/dev/null || echo "")
+
     if command -v curl >/dev/null 2>&1; then
-        if [ "$quiet" -eq 1 ]; then
-            curl -fsSL --connect-timeout 15 --max-time "$max_time" -o "$dest" "$url" </dev/null 2>/dev/null
-        else
-            curl -fSL --connect-timeout 15 --max-time "$max_time" -o "$dest" "$url" </dev/null
-        fi
-        return $?
+        for flag in "" "-4" "-6"; do
+            rm -f "$dest"
+            local -a curl_opts=(-fL --retry 2 --retry-delay 1 --connect-timeout 12 --max-time "$max_time")
+            [ -n "$flag" ] && curl_opts+=("$flag")
+            if [ "$quiet" -eq 1 ]; then
+                curl_opts+=(-sS)
+                if [ -n "$err_file" ]; then
+                    if curl "${curl_opts[@]}" -o "$dest" "$url" </dev/null 2>"$err_file" && [ -s "$dest" ]; then
+                        rm -f "$err_file"
+                        return 0
+                    fi
+                    rc=$?
+                    HTTP_LAST_ERROR=$(tr '\r\n' ' ' < "$err_file" | sed 's/[[:space:]]*$//')
+                elif curl "${curl_opts[@]}" -o "$dest" "$url" </dev/null 2>/dev/null && [ -s "$dest" ]; then
+                    return 0
+                fi
+            else
+                if curl "${curl_opts[@]}" -o "$dest" "$url" </dev/null && [ -s "$dest" ]; then
+                    [ -n "$err_file" ] && rm -f "$err_file"
+                    return 0
+                fi
+                rc=$?
+            fi
+        done
     fi
 
     if command -v wget >/dev/null 2>&1; then
-        if [ "$quiet" -eq 1 ]; then
-            wget -q --timeout=30 -O "$dest" "$url" </dev/null 2>/dev/null
-        else
-            wget --show-progress --timeout=30 -O "$dest" "$url" </dev/null || wget -O "$dest" "$url" </dev/null
-        fi
-        return $?
+        for flag in "" "-4"; do
+            rm -f "$dest"
+            local -a wget_opts=(--timeout=25 --tries=2 -O "$dest")
+            [ -n "$flag" ] && wget_opts+=("$flag")
+            if [ "$quiet" -eq 1 ]; then
+                if [ -n "$err_file" ]; then
+                    if wget -q "${wget_opts[@]}" "$url" </dev/null 2>"$err_file" && [ -s "$dest" ]; then
+                        rm -f "$err_file"
+                        return 0
+                    fi
+                    [ -s "$err_file" ] && HTTP_LAST_ERROR=$(tail -n1 "$err_file" | tr -d '\r')
+                elif wget -q "${wget_opts[@]}" "$url" </dev/null 2>/dev/null && [ -s "$dest" ]; then
+                    return 0
+                fi
+            else
+                if { wget --show-progress "${wget_opts[@]}" "$url" </dev/null || wget "${wget_opts[@]}" "$url" </dev/null; } && [ -s "$dest" ]; then
+                    [ -n "$err_file" ] && rm -f "$err_file"
+                    return 0
+                fi
+            fi
+        done
     fi
 
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "$url" "$dest" "$max_time" << 'PY_EOF'
+        rm -f "$dest"
+        if python3 - "$url" "$dest" "$max_time" 2>"${err_file:-/dev/null}" << 'PY_EOF' && [ -s "$dest" ]; then
 import sys, urllib.request, shutil
 url, dest, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3])
 req = urllib.request.Request(url, headers={"User-Agent": "xanmod-install"})
 with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
     shutil.copyfileobj(r, f)
 PY_EOF
-        return $?
+            [ -n "$err_file" ] && rm -f "$err_file"
+            return 0
+        fi
+        [ -n "$err_file" ] && [ -s "$err_file" ] && HTTP_LAST_ERROR=$(tail -n1 "$err_file" | tr -d '\r')
     fi
 
     if [ -x /usr/lib/apt/apt-helper ]; then
-        if /usr/lib/apt/apt-helper -q download-file "$url" "$dest" >/dev/null 2>&1; then
+        rm -f "$dest"
+        if /usr/lib/apt/apt-helper -q download-file "$url" "$dest" </dev/null >/dev/null 2>&1 && [ -s "$dest" ]; then
+            [ -n "$err_file" ] && rm -f "$err_file"
             return 0
         fi
+        rm -f "$dest"
         if [ "$quiet" -eq 1 ]; then
-            /usr/lib/apt/apt-helper -q -o APT::Sandbox::User=root download-file "$url" "$dest" >/dev/null 2>&1
+            if /usr/lib/apt/apt-helper -q -o APT::Sandbox::User=root download-file "$url" "$dest" </dev/null >/dev/null 2>"${err_file:-/dev/null}" && [ -s "$dest" ]; then
+                [ -n "$err_file" ] && rm -f "$err_file"
+                return 0
+            fi
+            [ -n "$err_file" ] && [ -s "$err_file" ] && HTTP_LAST_ERROR=$(tail -n1 "$err_file" | tr -d '\r')
         else
-            /usr/lib/apt/apt-helper -o APT::Sandbox::User=root download-file "$url" "$dest"
+            if /usr/lib/apt/apt-helper -o APT::Sandbox::User=root download-file "$url" "$dest" </dev/null && [ -s "$dest" ]; then
+                [ -n "$err_file" ] && rm -f "$err_file"
+                return 0
+            fi
         fi
-        return $?
     fi
 
-    return 1
+    [ -n "$err_file" ] && rm -f "$err_file"
+    rm -f "$dest"
+    return "${rc:-1}"
 }
 
 dearmor_pgp_key() {
@@ -991,19 +1045,31 @@ fetch_amd64_channels() {
     ensure_tmp_dir
     local repo_gz="${TMP_WORK_DIR}/amd64-Packages.gz"
     local repo_txt="${TMP_WORK_DIR}/amd64-Packages"
-    local repo_url="http://deb.xanmod.org/dists/${OS_CODENAME}/main/binary-amd64/Packages.gz"
-
-    info "正在从 XanMod 官方源检测 ${C_BCYAN}${OS_CODENAME}${C_RESET} (${C_BMAGENTA}${CPU_PSABI}${C_RESET}) 最新可用版本..."
-    if ! http_get "$repo_url" "$repo_gz" 30 1; then
-        err "无法获取 XanMod 官方仓库索引: $repo_url"
-        err "提示: 请检查网络连接，或确认官方源是否支持当前发行版代号 '${OS_CODENAME}'"
-        return 1
+    local repo_url="" fetched_base=""
+    local -a base_candidates=()
+    if [ -s /etc/ssl/certs/ca-certificates.crt ]; then
+        base_candidates=("https://deb.xanmod.org" "http://deb.xanmod.org")
+    else
+        base_candidates=("http://deb.xanmod.org" "https://deb.xanmod.org")
     fi
 
-    if ! gzip -dc "$repo_gz" > "$repo_txt" 2>/dev/null; then
-        err "解压 XanMod 仓库 Packages.gz 失败"
+    info "正在检测 XanMod 官方源 (${OS_CODENAME} / ${CPU_PSABI})..."
+    local base_cand=""
+    for base_cand in "${base_candidates[@]}"; do
+        repo_url="${base_cand}/dists/${OS_CODENAME}/main/binary-amd64/Packages.gz"
+        if http_get "$repo_url" "$repo_gz" 30 1 && gzip -dc "$repo_gz" > "$repo_txt" 2>/dev/null && [ -s "$repo_txt" ]; then
+            fetched_base="$base_cand"
+            break
+        fi
+    done
+
+    if [ -z "$fetched_base" ]; then
+        err "无法获取 XanMod 官方源索引 (${OS_CODENAME})"
+        [ -n "$HTTP_LAST_ERROR" ] && err "详情: ${HTTP_LAST_ERROR}"
+        err "提示: 请检查网络或确认支持发行版代号 ${OS_CODENAME}"
         return 1
     fi
+    XANMOD_APT_BASE="$fetched_base"
 
     local ch pkg
     for ch in "${CHANNELS[@]}"; do
@@ -1213,7 +1279,7 @@ setup_amd64_apt_repo() {
         "XanMod 官方" \
         "https://dl.xanmod.org/archive.key" \
         "$XANMOD_KEYRING" \
-        "deb [signed-by=${XANMOD_KEYRING}] http://deb.xanmod.org ${OS_CODENAME} main" \
+        "deb [signed-by=${XANMOD_KEYRING}] ${XANMOD_APT_BASE} ${OS_CODENAME} main" \
         "$XANMOD_SOURCE_LIST"
 }
 

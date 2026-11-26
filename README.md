@@ -181,7 +181,7 @@ reboot
 curl -fsSL -o /tmp/xanmod-install.sh https://raw.githubusercontent.com/88860/XanMod-ARM64-AutoBuild/main/xanmod-install.sh && bash /tmp/xanmod-install.sh; rm -f /tmp/xanmod-install.sh
 ```
 
-> 以上安装命令均默认在 `root` 权限下运行；若为普通用户，请先切换为 `root`（如 `su -`）或自行加上 `sudo`。若系统未安装 `curl`，可改用 `wget -qO /tmp/xanmod-install.sh ...` 或 `/usr/lib/apt/apt-helper download-file ... /tmp/xanmod-install.sh` 获取脚本；临时下载目录在脚本退出或重启前自动清理。
+> 以上安装命令均默认在 `root` 权限下运行；若为普通用户，请先切换为 `root`（如 `su -`）或自行加上 `sudo`。若全新精简系统提示 `curl: command not found`，先执行 `apt update && apt install -y curl` 即可；临时下载目录会在脚本退出或重启前自动清理。
 
 ### 功能说明
 
